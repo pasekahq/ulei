@@ -13,10 +13,10 @@ use common::{
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use ulei_contracts::generated::c1::{Kind, UncertainReason};
+use ulei_contracts::generated::c1::{Kind, ReconcileOutcome, UncertainReason};
 use ulei_core::inbox::{
-    DEFER_SECONDS, Error, EventRow, Guarded, Inbox, Invalid, LEASE_TTL, MAX_OFFERS, RETRY_DELAY,
-    canonical,
+    DEFER_SECONDS, Error, EventRow, Guarded, Inbox, Invalid, LEASE_TTL, MAX_OFFERS, Peer,
+    RETRY_DELAY, canonical,
 };
 
 const NOW: f64 = 1_763_290_000.0;
@@ -1488,10 +1488,42 @@ fn rust_created_database_has_the_python_schema_and_rows() {
 }
 
 /// The live inbox holds `done` rows whose `outcome` an operator tool of the reference wrote
-/// outside the store as free text, which C1 `RowOutcome` does not list and the shadow reports
-/// as `row` divergences (`docs/runbooks/mvp-pilot-cutover.md`, 1.5). The store must open such a
-/// file and serve it unchanged: `counts` ignores the rows, `recover` and `claim` never touch
-/// them, and a new event publishes, claims and acks as on a clean file.
+/// outside the store as free text without an audit line (`docs/runbooks/mvp-pilot-cutover.md`,
+/// 1.5). The store must open such a file and serve it unchanged: `counts` ignores the rows,
+/// `recover` and `claim` never touch them, and a new event publishes, claims and acks as on a
+/// clean file.
+/// The row change and the audit line commit together: a failing audit insert leaves the row
+/// `uncertain` with its outcome.
+#[test]
+fn reconcile_whose_audit_line_fails_leaves_the_row_uncertain() {
+    let scratch = Scratch::new();
+    let root = scratch.root_with_key(&TEST_KEY);
+    let mut inbox = Inbox::open(&root).expect("open");
+    let id = publish_at(&mut inbox, "audit", NOW);
+    let row = processing(&mut inbox, NOW, LEASE_TTL);
+    assert!(inbox.ack(&id, lease(&row), "uncertain", NOW).expect("ack"));
+    let before = stored(&inbox, &id);
+    let db = rusqlite::Connection::open(root.join("events.sqlite3")).expect("db");
+    db.execute(
+        "INSERT INTO reconciled(id, outcome, reason, note, uid, pid, time) \
+         VALUES (?1, 'reconciled-delivered', 'uncertain', 'earlier', 1, 1, 1)",
+        [&id],
+    )
+    .expect("audit line");
+    drop(db);
+    let peer = Peer { uid: 1, pid: 2 };
+    let result = inbox.reconcile(
+        &id,
+        ReconcileOutcome::ReconciledDelivered,
+        "note",
+        peer,
+        NOW,
+    );
+    assert!(matches!(result, Err(Error::Sqlite(_))), "{result:?}");
+    assert_eq!(stored(&inbox, &id), before);
+    assert_eq!(inbox.uncertain(10).expect("uncertain").len(), 1);
+}
+
 #[test]
 fn done_rows_with_free_text_outcomes_are_left_alone() {
     const OPERATOR_OUTCOMES: [&str; 5] = [
@@ -1534,6 +1566,7 @@ fn done_rows_with_free_text_outcomes_are_left_alone() {
         processing: 0,
         deferred: 0,
         uncertain: 0,
+        reconciled: Some(0),
     };
     assert_eq!(inbox.counts().expect("counts"), idle);
 

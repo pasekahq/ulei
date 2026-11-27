@@ -241,10 +241,11 @@ Pass: exit 0 with 0 divergences. Fail: `M divergences` above 0 (read the lines a
 hot journal: take the copy again).
 
 One kind of divergence has a known cause. An operator tool of the reference agent settles rows by
-hand, outside the store, and writes the outcome as free text (`reconciled-delivered`,
+hand, outside the store, and writes the outcome as free text (`reconciled-dismissed`,
 `delivered`, `reconciled manually <time>: <text>`, a receipt id). C1 `RowOutcome` does not list
 such texts, and they cannot be listed, so the shadow reports each such row as a `row` line
-`column outcome is not valid for C1 Row`. When the pass shows `M divergences`, check whether
+`column outcome is not valid for C1 Row`. Its `reconciled-delivered` is the C1 outcome of
+`ulei inbox reconcile` (ADR-0099), which the shadow accepts. When the pass shows `M divergences`, check whether
 every one is of that kind on a `done` row:
 
 ```sh
@@ -253,7 +254,7 @@ jq -c 'select(.check != "row" or .detail != "column outcome is not valid for C1 
 wc -l < <COPY_DIR>/out/divergences.jsonl
 sqlite3 -readonly <COPY_DIR>/live/events.sqlite3 "SELECT status, count(*) FROM events
   WHERE outcome NOT IN ('success', 'silent', 'uncertain', 'deferred', 'expired-processing',
-    'deferred-exhausted') GROUP BY status"
+    'deferred-exhausted', 'reconciled-delivered') GROUP BY status"
 ```
 
 Expected: `jq` prints nothing; the query prints one line, `done|M`, with `M` the line count. Then
@@ -267,7 +268,7 @@ sqlite3 -readonly <LIVE_ROOT>/events.sqlite3 ".backup <COPY_DIR>/norm/live/event
 install -m 0600 <LIVE_ROOT>/producer.key <COPY_DIR>/norm/live/producer.key
 sqlite3 <COPY_DIR>/norm/live/events.sqlite3 "UPDATE events SET outcome = 'success'
   WHERE status = 'done' AND outcome NOT IN ('success', 'silent', 'uncertain', 'deferred',
-    'expired-processing', 'deferred-exhausted'); SELECT changes()"
+    'expired-processing', 'deferred-exhausted', 'reconciled-delivered'); SELECT changes()"
 sqlite3 -readonly <COPY_DIR>/norm/live/events.sqlite3 'SELECT count(*) FROM events'
 ~/.local/bin/ulei-inbox shadow --live-root <COPY_DIR>/norm/live --state <COPY_DIR>/norm/state \
   --out <COPY_DIR>/norm/out/divergences.jsonl; echo "exit $?"
@@ -626,8 +627,22 @@ Expected: exit 0; every event of the day `done` with `success`, `silent` or `def
 `uncertain`. Older `done` rows that an operator tool settled by hand keep their free-text
 outcomes (1.5); the store leaves them alone, so they need no change.
 
-Pass: 7 days so. Fail: an `uncertain` row, an event that did not reach the chat, a restart of a
-unit; record it and decide on part 3.
+An `uncertain` row whose message a later turn did deliver (the owner saw it in the chat) is
+closed by the owner, while `ulei-inbox.service` runs, with the reason on one line:
+
+```sh
+~/.local/bin/ulei inbox reconcile <EVENT_ID> --outcome reconciled-delivered \
+  --note '<why, e.g. answered in the turn of <time>>'; echo "exit $?"
+```
+
+Expected: `reconciled <EVENT_ID>: done, reconciled-delivered (was <reason>), by uid <uid> pid
+<pid> at <time>` and `exit 0`; `ulei status` then reads one `uncertain` fewer and one
+`reconciled` more, and the uncertain alerter no longer names the event. Exit 1 with `409
+conflict: event is <status>, not uncertain` or `404 not_found` changed nothing: check the id.
+Exit 2 names the wrong argument. An event that did not reach the chat stays `uncertain`.
+
+Pass: 7 days so. Fail: an `uncertain` row not delivered later, an event that did not reach the
+chat, a restart of a unit; record it and decide on part 3.
 
 ## Part 3. Rollback
 

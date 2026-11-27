@@ -15,7 +15,9 @@ use std::time::Duration;
 use hmac::KeyInit;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
-use ulei_contracts::generated::c1::{AckOutcome, Counts, UncertainEvent};
+use ulei_contracts::generated::c1::{
+    AckOutcome, Counts, ReconcileAudit, ReconcileOutcome, UncertainEvent, UncertainReason,
+};
 
 pub use packet::{Invalid, canonical};
 use packet::{PacketMac, lower_hex};
@@ -29,6 +31,8 @@ pub const MAX_OFFERS: i64 = 3;
 pub const LEASE_TTL: f64 = 120.0;
 /// Delay of `retry` when the caller has no other.
 pub const RETRY_DELAY: f64 = 15.0;
+/// Most characters of a `reconcile` note (C1 `ReconcileNote`).
+pub const MAX_NOTE_CHARS: usize = 500;
 
 const KEY_FILE: &str = "producer.key";
 const KEY_LEN: usize = 32;
@@ -43,6 +47,10 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS events (
                 status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                 lease TEXT, lease_until REAL, available REAL NOT NULL DEFAULT 0,
                 session_id TEXT, outcome TEXT, created REAL NOT NULL)";
+// One audit line per event closed by `reconcile`, beside the Python table, which it never reads.
+const AUDIT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS reconciled (
+    id TEXT PRIMARY KEY, outcome TEXT NOT NULL, reason TEXT NOT NULL, note TEXT NOT NULL,
+    uid INTEGER NOT NULL, pid INTEGER NOT NULL, time REAL NOT NULL)";
 const ROW_COLUMNS: &str = "id, packet, digest, status, attempts, lease, lease_until, available, session_id, outcome, created";
 const LEASE_LEN: usize = 16;
 const ACK_OUTCOMES: [AckOutcome; 4] = [
@@ -91,6 +99,15 @@ pub enum Error {
     InvalidOutcome,
     /// A stored `status` is not a C1 `Status`.
     UnknownStatus,
+    /// `reconcile` met an event that is not `uncertain`: its stored status and outcome.
+    NotUncertain {
+        /// The stored `status`.
+        status: String,
+        /// The stored `outcome`.
+        outcome: Option<String>,
+    },
+    /// A `reconcile` note is blank, has a control character or is over [`MAX_NOTE_CHARS`].
+    InvalidNote,
     /// Filesystem failure.
     Io(io::Error),
     /// `SQLite` failure.
@@ -113,6 +130,14 @@ impl fmt::Display for Error {
             Self::StoredPacket => f.write_str("stored packet lacks a field of the right type"),
             Self::InvalidOutcome => f.write_str("ack outcome is not a C1 AckOutcome"),
             Self::UnknownStatus => f.write_str("stored status is not a C1 Status"),
+            Self::NotUncertain { status, outcome } => match outcome {
+                Some(outcome) => write!(f, "event is {status} ({outcome}), not uncertain"),
+                None => write!(f, "event is {status}, not uncertain"),
+            },
+            Self::InvalidNote => write!(
+                f,
+                "note must be 1 to {MAX_NOTE_CHARS} characters, not blank, without control characters"
+            ),
             Self::Io(e) => write!(f, "inbox I/O: {e}"),
             Self::Sqlite(e) => write!(f, "inbox SQLite: {e}"),
         }
@@ -168,6 +193,15 @@ pub struct EventRow {
     pub created: f64,
 }
 
+/// The caller of a write, as the socket peer's credentials name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Peer {
+    /// Peer uid.
+    pub uid: u32,
+    /// Peer pid.
+    pub pid: u32,
+}
+
 /// The inbox store over one root directory, holding one `SQLite` connection.
 pub struct Inbox {
     mac: PacketMac,
@@ -207,6 +241,7 @@ impl Inbox {
         }
         let conn = connect(&db_path)?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(AUDIT_SCHEMA)?;
         fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600))?;
         Ok(Self { mac, conn })
     }
@@ -269,36 +304,110 @@ impl Inbox {
             .ok_or(Error::StoredPacket)
     }
 
-    /// The number of events in each status except `done`, from one read that changes no row.
+    /// The number of events in each status except `done` and of `reconcile` audit lines, from
+    /// one read that changes no row.
     ///
     /// # Errors
     /// [`Error::UnknownStatus`] or [`Error::Sqlite`].
     pub fn counts(&self) -> Result<Counts, Error> {
+        let mut reconciled = 0;
         let mut counts = Counts {
             pending: 0,
             leased: 0,
             processing: 0,
             deferred: 0,
             uncertain: 0,
+            reconciled: None,
         };
         let mut query = self.conn.prepare(
-            "SELECT status, COUNT(*) FROM events WHERE status != 'done' GROUP BY status",
+            "SELECT status, COUNT(*) FROM events WHERE status != 'done' GROUP BY status \
+             UNION ALL SELECT NULL, COUNT(*) FROM reconciled",
         )?;
         let mut rows = query.query([])?;
         while let Some(row) = rows.next()? {
-            let status: String = row.get(0)?;
+            let status: Option<String> = row.get(0)?;
             let count: i64 = row.get(1)?;
-            let slot = match status.as_str() {
-                "pending" => &mut counts.pending,
-                "leased" => &mut counts.leased,
-                "processing" => &mut counts.processing,
-                "deferred" => &mut counts.deferred,
-                "uncertain" => &mut counts.uncertain,
-                _ => return Err(Error::UnknownStatus),
+            let slot = match status.as_deref() {
+                None => &mut reconciled,
+                Some("pending") => &mut counts.pending,
+                Some("leased") => &mut counts.leased,
+                Some("processing") => &mut counts.processing,
+                Some("deferred") => &mut counts.deferred,
+                Some("uncertain") => &mut counts.uncertain,
+                Some(_) => return Err(Error::UnknownStatus),
             };
             *slot = count.unsigned_abs();
         }
+        counts.reconciled = Some(reconciled);
         Ok(counts)
+    }
+
+    /// Closes the `uncertain` event `id` for `by` at `now` in one `BEGIN IMMEDIATE`
+    /// transaction: the row becomes `done` with `outcome` and its audit line is stored; an
+    /// error changes nothing.
+    ///
+    /// # Errors
+    /// [`Error::InvalidNote`], [`Error::NotFound`], [`Error::NotUncertain`],
+    /// [`Error::StoredPacket`] for an `uncertain` row without an `UncertainReason`, or
+    /// [`Error::Sqlite`].
+    pub fn reconcile(
+        &mut self,
+        id: &str,
+        outcome: ReconcileOutcome,
+        note: &str,
+        by: Peer,
+        now: f64,
+    ) -> Result<ReconcileAudit, Error> {
+        if !valid_note(note) {
+            return Err(Error::InvalidNote);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (status, stored): (String, Option<String>) = tx
+            .query_row(
+                "SELECT status, outcome FROM events WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or(Error::NotFound)?;
+        if status != "uncertain" {
+            return Err(Error::NotUncertain {
+                status,
+                outcome: stored,
+            });
+        }
+        let reason: UncertainReason = stored
+            .and_then(|o| serde_json::from_value(Value::from(o)).ok())
+            .ok_or(Error::StoredPacket)?;
+        tx.execute(
+            "UPDATE events SET status='done',outcome=?1 WHERE id=?2 AND status='uncertain'",
+            params![outcome.as_str(), id],
+        )?;
+        tx.execute(
+            "INSERT INTO reconciled(id, outcome, reason, note, uid, pid, time) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                outcome.as_str(),
+                reason.as_str(),
+                note,
+                by.uid,
+                by.pid,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ReconcileAudit {
+            id: id.to_owned(),
+            outcome,
+            reason,
+            note: note.to_owned(),
+            uid: by.uid.into(),
+            pid: by.pid.into(),
+            time: now,
+        })
     }
 
     /// At most `limit` events with status `uncertain`, oldest first (by `created`, then `id`),
@@ -481,7 +590,7 @@ impl Inbox {
             .find(|o| o.as_str() == outcome)
             .ok_or(Error::InvalidOutcome)?;
         // Python writes the claimed row's `available`; while this lease is held it equals the
-        // stored column, because only `retry` and `ack` change it and both end the lease.
+        // stored column, because only `retry`, `ack` and `defer` change it and each ends the lease.
         let deferred_until = (outcome == AckOutcome::Deferred).then_some(now + DEFER_SECONDS);
         self.settle(id, lease, outcome, deferred_until)
     }
@@ -579,6 +688,15 @@ fn create_key(path: &Path) -> Result<(), Error> {
     file.write_all(&random_bytes::<KEY_LEN>()?)?;
     file.sync_all()?;
     Ok(())
+}
+
+/// Whether `note` is a C1 `ReconcileNote`: not blank, no control character, at most
+/// [`MAX_NOTE_CHARS`] characters.
+#[must_use]
+pub fn valid_note(note: &str) -> bool {
+    !note.trim().is_empty()
+        && !note.chars().any(char::is_control)
+        && note.chars().count() <= MAX_NOTE_CHARS
 }
 
 fn random_bytes<const N: usize>() -> Result<[u8; N], Error> {

@@ -1,5 +1,6 @@
 //! `ulei-inbox`: everything that opens `events.sqlite3` (ADR-0007): the `serve` daemon and
-//! the `shadow` pass; and `status`, which opens no database (ADR-0040 section 5).
+//! the `shadow` pass; and `status` and `reconcile`, which open no database and talk C1 to the
+//! daemon (ADR-0040 section 5, ADR-0099).
 
 #![forbid(unsafe_code)]
 
@@ -19,6 +20,7 @@ use ulei_core::config::string;
 use ulei_core::deliver::{self, Consumer, Pace};
 use ulei_core::inbox::shadow::{self, Failure};
 use ulei_core::inbox::{Inbox, own_uid};
+use ulei_core::reconcile;
 use ulei_core::serve::{READ_TIMEOUT, Server, bind};
 use ulei_core::status;
 
@@ -27,6 +29,7 @@ const USAGE: &str =
 [--retry-delay-ms N]
        ulei-inbox shadow --live-root DIR --state DIR --out FILE.jsonl
        ulei-inbox status [--config PATH]
+       ulei-inbox reconcile ID --outcome reconciled-delivered --note TEXT [--config PATH]
 ";
 /// Exit status of a usage error or of a config `status` cannot use.
 const USAGE_ERROR: u8 = 2;
@@ -65,6 +68,15 @@ fn main() -> ExitCode {
             Some([config]) => status(config.as_deref()),
             None => usage(),
         },
+        Some("reconcile") => {
+            let id = args.next();
+            match (id, flags(args, ["--config", "--outcome", "--note"])) {
+                (Some(id), Some([config, outcome, note])) => {
+                    run_reconcile(&id, config.as_deref(), outcome.as_deref(), note.as_deref())
+                }
+                _ => usage(),
+            }
+        }
         Some("shadow") => match flags(args, ["--live-root", "--state", "--out"]) {
             Some([Some(live_root), Some(state), Some(out)]) => run_shadow(&live_root, &state, &out),
             _ => usage(),
@@ -146,6 +158,54 @@ fn status(flag: Option<&Path>) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+/// Closes the `uncertain` event `id` through the daemon of the config `flag` names: exit 0 and
+/// the confirmation line; 2 with one stderr line and nothing sent when an argument or the config
+/// is unusable; 1 with one stderr line when the inbox refused or could not be reached.
+fn run_reconcile(
+    id: &OsStr,
+    flag: Option<&Path>,
+    outcome: Option<&Path>,
+    note: Option<&Path>,
+) -> ExitCode {
+    let refuse = |reason: &str| {
+        let _ = writeln!(std::io::stderr(), "ulei-inbox reconcile: {reason}");
+        ExitCode::from(USAGE_ERROR)
+    };
+    let (Some(outcome), Some(note)) = (outcome, note) else {
+        return refuse("--outcome reconciled-delivered and --note TEXT are required");
+    };
+    let (Some(id), Some(outcome), Some(note)) = (id.to_str(), outcome.to_str(), note.to_str())
+    else {
+        return refuse("the id, --outcome and --note must be UTF-8");
+    };
+    let request = match reconcile::request(id, outcome, note) {
+        Ok(request) => request,
+        Err(reason) => return refuse(&reason),
+    };
+    let socket = match Config::read(flag)
+        .map_err(|e| e.to_string())
+        .and_then(|config| string(&config, "inbox.socket"))
+    {
+        Ok(socket) => PathBuf::from(socket),
+        Err(e) => return refuse(&e),
+    };
+    let audit = match own_uid()
+        .map_err(|e| format!("effective uid: {e}"))
+        .and_then(|uid| reconcile::send(&socket, &request, uid))
+    {
+        Ok(audit) => audit,
+        Err(reason) => {
+            let _ = writeln!(std::io::stderr(), "ulei-inbox reconcile: {id}: {reason}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut out = std::io::stdout().lock();
+    match writeln!(out, "{}", reconcile::confirmation(&audit)).and_then(|()| out.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&format!("stdout: {e}")),
     }
 }
 

@@ -12,6 +12,7 @@ pub mod connectors;
 pub mod deliver;
 pub mod inbox;
 pub mod prompt;
+pub mod reconcile;
 #[cfg(test)]
 mod scratch;
 pub mod serve;

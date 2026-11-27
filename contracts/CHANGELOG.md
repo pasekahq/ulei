@@ -5,6 +5,16 @@ enum value or operation; a field becoming required; a type or validation keyword
 `additionalProperties` becoming `false`) needs a major bump (minor while `0.x`), an entry
 here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <rev>` enforces it.
 
+## C1 1.4.0
+- Inbox wire operation `reconcile` (additive; the packet is unchanged): `ReconcileRequest` (`id`,
+  `outcome` a `ReconcileOutcome`, the one value `reconciled-delivered`, and `note` a
+  `ReconcileNote`, 1 to 500 characters, not blank, no control character) answered by
+  `ReconcileAudit` (`id`, `outcome`, `reason` the former `UncertainReason`, `note`, the caller's
+  `uid` and `pid`, `time`). Only an `uncertain` event is closed: its row becomes `done` with that
+  outcome and the audit line is stored in the same transaction; an unknown id is `not_found`,
+  any other status `conflict`. `RowOutcome` gains `reconciled-delivered`; `Counts` gains the
+  optional `reconciled`, the number of audit lines (ADR-0099).
+
 ## C1 1.3.0
 - Inbox wire operation `uncertain` (additive; the packet is unchanged): `UncertainRequest`
   (optional `limit`, 1 to 100, 20 when absent) answered by `UncertainList`, at most `limit`

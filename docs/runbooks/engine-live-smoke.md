@@ -443,7 +443,7 @@ Expected (ADR-0040 section 5, ADR-0042 sections 4 and 7, ADR-0074):
 
 ```text
 inbox: up <RUNTIME_DIR>/ulei/inbox.sock (ulei-inbox <version>)
-queue: pending 0, leased 0, processing 0, deferred 0, uncertain 0
+queue: pending 0, leased 0, processing 0, deferred 0, uncertain 0, reconciled 0
 engine: up <RUNTIME_DIR>/ulei/c6.sock
 channel: up
 session: agent:main:telegram:dm:<OWNER_CHAT_ID> idle since <time>, queue 0, route <ROUTE_MAIN>

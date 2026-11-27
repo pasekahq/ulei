@@ -103,6 +103,11 @@
       "name": "uncertain",
       "input": "#/$defs/UncertainRequest",
       "output": "#/$defs/UncertainList"
+    },
+    {
+      "name": "reconcile",
+      "input": "#/$defs/ReconcileRequest",
+      "output": "#/$defs/ReconcileAudit"
     }
   ],
   "x-error": "#/$defs/Error",
@@ -157,14 +162,15 @@
     },
     "RowOutcome": {
       "type": "string",
-      "description": "`outcome` of a stored event: the acknowledged `AckOutcome`, or a recovery outcome: `expired-processing` (the lease of a processing event expired) or `deferred-exhausted` (a deferred event was offered 3 times).",
+      "description": "`outcome` of a stored event: the acknowledged `AckOutcome`, a recovery outcome: `expired-processing` (the lease of a processing event expired) or `deferred-exhausted` (a deferred event was offered 3 times), or `reconciled-delivered` (the owner closed an `uncertain` event through `reconcile`).",
       "enum": [
         "success",
         "silent",
         "uncertain",
         "deferred",
         "expired-processing",
-        "deferred-exhausted"
+        "deferred-exhausted",
+        "reconciled-delivered"
       ]
     },
     "Row": {
@@ -441,7 +447,7 @@
     },
     "Counts": {
       "type": "object",
-      "description": "Number of stored events in each `Status` except `done`, read in one query that changes nothing.",
+      "description": "Number of stored events in each `Status` except `done`, and of the events closed through `reconcile`, read in one query that changes nothing.",
       "properties": {
         "pending": {
           "type": "integer",
@@ -466,6 +472,11 @@
         "uncertain": {
           "type": "integer",
           "description": "Events with status `uncertain`.",
+          "minimum": 0
+        },
+        "reconciled": {
+          "type": "integer",
+          "description": "Events closed through `reconcile`: one per audit line. Absent when the inbox does not report it.",
           "minimum": 0
         }
       },
@@ -551,6 +562,85 @@
       },
       "required": [
         "events"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileOutcome": {
+      "type": "string",
+      "description": "Outcome the owner gives an `uncertain` event through `reconcile`: `reconciled-delivered`, a later turn delivered its message.",
+      "enum": [
+        "reconciled-delivered"
+      ]
+    },
+    "ReconcileNote": {
+      "type": "string",
+      "description": "Why the owner closes the event: at most 500 characters, at least one of them not whitespace, none a control character.",
+      "minLength": 1,
+      "maxLength": 500,
+      "pattern": "^[^\\x00-\\x1f\\x7f-\\x9f]*[^\\s\\x00-\\x1f\\x7f-\\x9f][^\\x00-\\x1f\\x7f-\\x9f]*$"
+    },
+    "ReconcileRequest": {
+      "type": "object",
+      "description": "Close an `uncertain` event as the owner: in one transaction its row becomes `done` with `outcome` and one audit line is stored. An unknown id is `not_found`; an event in any other status, a reconciled one included, is a `conflict` and changes nothing.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/EventId"
+        },
+        "outcome": {
+          "$ref": "#/$defs/ReconcileOutcome"
+        },
+        "note": {
+          "$ref": "#/$defs/ReconcileNote"
+        }
+      },
+      "required": [
+        "id",
+        "outcome",
+        "note"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileAudit": {
+      "type": "object",
+      "description": "The audit line `reconcile` stored: the event, its outcome and former reason, the note, who and when.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/EventId"
+        },
+        "outcome": {
+          "$ref": "#/$defs/ReconcileOutcome"
+        },
+        "reason": {
+          "$ref": "#/$defs/UncertainReason",
+          "description": "The row `outcome` while it was `uncertain`."
+        },
+        "note": {
+          "$ref": "#/$defs/ReconcileNote"
+        },
+        "uid": {
+          "type": "integer",
+          "description": "`SO_PEERCRED` uid of the caller.",
+          "minimum": 0
+        },
+        "pid": {
+          "type": "integer",
+          "description": "`SO_PEERCRED` pid of the caller.",
+          "minimum": 0
+        },
+        "time": {
+          "type": "number",
+          "description": "Unix time the inbox stored the line.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "outcome",
+        "reason",
+        "note",
+        "uid",
+        "pid",
+        "time"
       ],
       "additionalProperties": false
     },

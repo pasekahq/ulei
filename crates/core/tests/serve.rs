@@ -254,6 +254,7 @@ fn counts_answers_every_status_but_done_and_changes_no_row() {
             processing: 1,
             deferred: 1,
             uncertain: 1,
+            reconciled: Some(0),
         }
     );
     let after: Vec<Row> = names.iter().map(|id| get(s, id)).collect();

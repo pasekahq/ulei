@@ -14,13 +14,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c1::{
-    AckRequest, ClaimRequest, CountsRequest, ErrorCode, GetRequest, HealthRequest, RenewRequest,
-    RetryRequest, StartRequest, UncertainList, UncertainRequest,
+    AckRequest, ClaimRequest, CountsRequest, ErrorCode, GetRequest, HealthRequest,
+    ReconcileRequest, RenewRequest, RetryRequest, StartRequest, UncertainList, UncertainRequest,
 };
 
 use crate::inbox::{
-    self, EventRow, Inbox, LEASE_TTL, RETRY_DELAY, canonical, fixed_notation, lower_hex_of_len,
-    valid_id,
+    self, EventRow, Inbox, LEASE_TTL, Peer, RETRY_DELAY, canonical, fixed_notation,
+    lower_hex_of_len, valid_id,
 };
 
 /// Longest `inbox.socket` path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
@@ -52,6 +52,7 @@ enum Op {
     Health,
     Counts,
     Uncertain,
+    Reconcile,
 }
 
 impl Op {
@@ -67,6 +68,7 @@ impl Op {
             "health" => Self::Health,
             "counts" => Self::Counts,
             "uncertain" => Self::Uncertain,
+            "reconcile" => Self::Reconcile,
             _ => return None,
         })
     }
@@ -178,7 +180,13 @@ impl Server {
     /// times out is closed without an answer.
     pub fn serve(&mut self, mut stream: UnixStream) {
         let answer = match rustix::net::sockopt::socket_peercred(&stream) {
-            Ok(cred) if cred.uid.as_raw() == self.uid => self.answer(&mut stream),
+            Ok(cred) if cred.uid.as_raw() == self.uid => {
+                let peer = Peer {
+                    uid: self.uid,
+                    pid: cred.pid.as_raw_nonzero().get().unsigned_abs(),
+                };
+                self.answer(&mut stream, peer)
+            }
             Ok(_) => Some(error(
                 ErrorCode::Forbidden,
                 "peer uid differs from the daemon",
@@ -197,10 +205,10 @@ impl Server {
         }
     }
 
-    fn answer(&mut self, stream: &mut UnixStream) -> Option<Reply> {
+    fn answer(&mut self, stream: &mut UnixStream, peer: Peer) -> Option<Reply> {
         let deadline = Instant::now() + self.timeout;
         match read_request(stream, deadline) {
-            Ok((op, body)) => Some(self.dispatch(op, &body).unwrap_or_else(|e| e)),
+            Ok((op, body)) => Some(self.dispatch(op, &body, peer).unwrap_or_else(|e| e)),
             Err(Refused::Answer(code, message)) => Some(error(code, message)),
             Err(Refused::TooLarge(unread)) => {
                 // Closing with the body unread would reset the client's read of the answer,
@@ -214,8 +222,8 @@ impl Server {
         }
     }
 
-    /// Runs `op` on the store with the server clock; `Err` is a C1 `Error` reply.
-    fn dispatch(&mut self, op: Op, body: &[u8]) -> Result<Reply, Reply> {
+    /// Runs `op` of `peer` on the store with the server clock; `Err` is a C1 `Error` reply.
+    fn dispatch(&mut self, op: Op, body: &[u8], peer: Peer) -> Result<Reply, Reply> {
         let Ok(Value::Object(mut fields)) = serde_json::from_slice::<Value>(body) else {
             return Err(error(ErrorCode::BadRequest, "body is not a JSON object"));
         };
@@ -287,6 +295,17 @@ impl Server {
                 };
                 let events = inbox.uncertain(limit).map_err(|e| store_error(&e))?;
                 serde_json::to_value(UncertainList { events })
+                    .map_err(|_| error(ErrorCode::Internal, "answer does not serialize"))?
+            }
+            Op::Reconcile => {
+                let req: ReconcileRequest = input(fields)?;
+                if !valid_id(&req.id) {
+                    return Err(invalid_body());
+                }
+                let audit = inbox
+                    .reconcile(&req.id, req.outcome, &req.note, peer, now)
+                    .map_err(|e| store_error(&e))?;
+                serde_json::to_value(audit)
                     .map_err(|_| error(ErrorCode::Internal, "answer does not serialize"))?
             }
         };
@@ -511,6 +530,9 @@ fn store_error(e: &inbox::Error) -> Reply {
             "packet fields or values are invalid",
         ),
         inbox::Error::Conflict => error(ErrorCode::Conflict, "event id has different content"),
+        inbox::Error::NotFound => error(ErrorCode::NotFound, "event not found"),
+        inbox::Error::NotUncertain { .. } => error(ErrorCode::Conflict, &e.to_string()),
+        inbox::Error::InvalidNote => error(ErrorCode::BadRequest, &e.to_string()),
         _ => error(ErrorCode::Internal, "store failure"),
     }
 }

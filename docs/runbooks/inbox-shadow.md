@@ -191,9 +191,10 @@ signature for the stored bytes. To see the packet behind a record, open the live
 read-only as `<user>`.
 
 Operator outcomes. An operator tool of the reference settles rows by hand, outside the store,
-and writes their `outcome` as free text (`reconciled-delivered`, `reconciled-dismissed`,
-`delivered`, `reconciled manually <time>: <text>`, a receipt id). C1 `RowOutcome` does not list
-them and cannot, so each such row gives a `row` line `column outcome is not valid for C1 Row`.
+and writes their `outcome` as free text (`reconciled-dismissed`, `delivered`, `reconciled
+manually <time>: <text>`, a receipt id). C1 `RowOutcome` does not list them and cannot, so each
+such row gives a `row` line `column outcome is not valid for C1 Row`. Its `reconciled-delivered`
+is the C1 outcome of `ulei inbox reconcile` (ADR-0099) and gives no line.
 The ulei store never reads an outcome back and leaves `done` rows alone, so such rows need no
 change in `<live-root>`. When every line is of this kind on a `done` row, normalize the outcomes
 on a fresh copy only, never on `<live-root>`, and run a pass on it with a fresh state directory:
@@ -205,7 +206,7 @@ sqlite3 -readonly <live-root>/events.sqlite3 ".backup <copy>/live/events.sqlite3
 install -m 0600 <live-root>/producer.key <copy>/live/producer.key
 sqlite3 <copy>/live/events.sqlite3 "UPDATE events SET outcome = 'success'
   WHERE status = 'done' AND outcome NOT IN ('success', 'silent', 'uncertain', 'deferred',
-    'expired-processing', 'deferred-exhausted'); SELECT changes()"
+    'expired-processing', 'deferred-exhausted', 'reconciled-delivered'); SELECT changes()"
 <bin-dir>/ulei-inbox shadow --live-root <copy>/live --state <copy>/state \
   --out <copy>/out/divergences.jsonl
 ```

@@ -9,7 +9,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - The `ulei` binary is measured by `ci/budgets.sh`; keep it small and free of startup I/O.
 - Everything that opens `events.sqlite3` lives in the `ulei-inbox` binary; `ulei` links no SQLite and
   forwards `ulei inbox ...` and `ulei status ...` to its sibling (ADR-0007, ADR-0040 section 6).
-  `ulei-inbox status` opens no database.
+  `ulei-inbox status` and `ulei-inbox reconcile` open no database: they are C1 clients of
+  `ulei-inbox serve`, the one writer of the store.
+- `uncertain` is final for delivery; only the owner's C1 `reconcile` (ADR-0099) leaves it, and
+  `Inbox::reconcile` changes the row and stores its audit line in table `reconciled` in one
+  transaction. The caller is the socket peer's credentials, never an argument.
 - Config comes from a file; no personal ids or paths in code. `ulei-inbox serve` and `status` read
   `ulei.toml` only through `ulei_contracts::config`; this crate holds no TOML reader.
 - `ulei-connectors` (module `connectors`, ADR-0056) reads `ulei.toml` only through
