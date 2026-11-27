@@ -1132,11 +1132,11 @@
         },
         "open_now": {
           "type": "boolean",
-          "description": "Keep the places that may be open at `local_time`: fresh `hours` that say closed drop a place, while stale, missing or unread `hours` keep it with `open` `probably_open` or `unknown`. Needs `local_time`; absent = false."
+          "description": "Keep the places that may be open at `local_time`: fresh `hours` that say closed or a fresh `operating_status` `temporarily_closed` drop a place, while stale, missing or unread `hours` keep it with `open` `probably_open` or `unknown`; a place whose `open` is not `open` ranks as if one more attribute were stale and gets the mark `open_unconfirmed`. Needs `local_time`; absent = false."
         },
         "local_time": {
           "type": "string",
-          "description": "Wall-clock time at the places, `YYYY-MM-DDTHH:MM`, against which `open_now` reads `hours`.",
+          "description": "Wall-clock time at the places, `YYYY-MM-DDTHH:MM` on a real date from 1970, against which `open_now` reads `hours`.",
           "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]$"
         },
         "vibe": {
@@ -1407,14 +1407,14 @@
     },
     "PlaceMark": {
       "type": "object",
-      "description": "A mark on a place: `stale` with `key` and `age_days`, one per stale attribute that demotes the place; `ban_risk` with `terms`, the bans of the bed profile its `warnings` name; `possible_duplicate` with `other`, the other place of an unsettled pair the bed's dedup wrote: within 75 m with another name, or of a similar name where either has no location.",
+      "description": "A mark on a place: `stale` with `key` and `age_days`, one per stale attribute that demotes the place; `open_unconfirmed` in a search with `open_now` when `open` is not `open`, with `key` `hours` and its `age_days` when the place has `hours`; `ban_risk` with `terms`, the bans of the bed profile its `warnings` name; `possible_duplicate` with `other`, the other place of an unsettled pair the bed's dedup wrote: within 75 m with another name, or of a similar name where either has no location.",
       "properties": {
         "kind": {
           "$ref": "#/$defs/PlaceMarkKind"
         },
         "key": {
           "type": "string",
-          "description": "The stale attribute.",
+          "description": "The attribute of a `stale` or `open_unconfirmed` mark.",
           "pattern": "^[a-z][a-z0-9_]*$"
         },
         "age_days": {
@@ -1447,6 +1447,7 @@
       "description": "Kind of a `PlaceMark`.",
       "enum": [
         "stale",
+        "open_unconfirmed",
         "ban_risk",
         "possible_duplicate"
       ]
@@ -1810,7 +1811,7 @@
     },
     "ErrorCode": {
       "type": "string",
-      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, a `places_search` with `open_now` and no `local_time` or with `max_distance_m` and no point, a `places_write` place with both or neither of `id` and `name`, a refused `places_verdict` or a refused `places_profile`), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row, a `places_verdict` of a `place` or `better_than` that is no place of the bed), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, a `places_search` with `open_now` and no `local_time` or with a `local_time` on no real date from 1970 or with `max_distance_m` and no point, a `places_write` place with both or neither of `id` and `name`, a refused `places_verdict` or a refused `places_profile`), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row, a `places_verdict` of a `place` or `better_than` that is no place of the bed), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
       "enum": [
         "invalid_request",
         "forbidden",

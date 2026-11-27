@@ -58,7 +58,7 @@
   "C7": {
     "file": "c7-garden.schema.json",
     "kind": "json-schema",
-    "version": "0.12.1",
+    "version": "0.13.0",
     "status": "draft",
     "title": "Garden",
     "source": "product shape §2.3, ADR-0046, ADR-0047, ADR-0051, ADR-0055, ADR-0078, ADR-0080, ADR-0087"

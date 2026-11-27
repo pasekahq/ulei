@@ -12,6 +12,7 @@ use ulei_garden::places_import;
 use ulei_garden::rerank::NoReranker;
 use ulei_garden::store::Store;
 use ulei_garden::wire::c7;
+use ulei_garden::wire::c7::OpenState::{Open, ProbablyOpen, Unknown};
 
 use bed::Wire;
 
@@ -374,11 +375,13 @@ fn status_limit_open_now_and_unsettled_duplicates_shape_the_answer() {
     let hits = search(&g, req);
     assert_eq!(
         names(&hits),
-        ["Lantern Noodle Bar", "Brass Bowl", "Copper Wok"]
+        ["Lantern Noodle Bar", "Copper Wok", "Brass Bowl"],
+        "without hours each is unknown and halved, so 4.9 and 4.7 floor alike and distance decides"
     );
     assert!(
-        hits.iter().all(|h| h.open == Some(c7::OpenState::Unknown)),
-        "no hours read: open is unknown"
+        hits.iter()
+            .all(|h| h.open == Some(Unknown) && h.marks.contains(&unconfirmed(None))),
+        "no hours: open is unknown"
     );
 
     let (brass, copper, lantern) = (
@@ -410,11 +413,153 @@ fn status_limit_open_now_and_unsettled_duplicates_shape_the_answer() {
     );
 }
 
+/// The `open_unconfirmed` mark, with the `age_days` of `hours` when the place has them.
+fn unconfirmed(hours_age: Option<u64>) -> c7::PlaceMark {
+    c7::PlaceMark {
+        kind: c7::PlaceMarkKind::OpenUnconfirmed,
+        key: hours_age.map(|_| "hours".into()),
+        age_days: hours_age,
+        terms: None,
+        other: None,
+    }
+}
+
+/// An attribute as its key, value and age in days.
+type Obs<'a> = (&'a str, &'a str, i64);
+
+/// A bed at [`NOW`], a Thursday, of places alike but for `hours` and `operating_status`: the
+/// name, then each attribute as its value and age in days.
+fn hours_bed(places: &[(&str, &[Obs<'_>])]) -> Garden {
+    let mut g = garden();
+    let places: Vec<Value> = places
+        .iter()
+        .map(|(name, attrs)| {
+            let mut all = vec![obs("rating", "4.5", 1), obs("review_count", "100", 1)];
+            all.extend(attrs.iter().map(|(k, v, age)| obs(k, v, *age)));
+            json!({"name": name, "status": "active", "source": "fixture", "attrs": all})
+        })
+        .collect();
+    write(&mut g, Value::Array(places));
+    g
+}
+
+fn open_now_at(local_time: &str) -> Value {
+    json!({"open_now": true, "local_time": local_time})
+}
+
+#[test]
+fn open_now_reads_hours_and_operating_status_at_local_time() {
+    let open = "Mo-Su 11:00-22:00";
+    let g = hours_bed(&[
+        ("Fresh Open", &[("hours", open, 1)]),
+        ("Stale Open", &[("hours", open, 10)]),
+        ("No Hours", &[]),
+        ("Unread Hours", &[("hours", "by appointment", 1)]),
+        ("Stale Closed", &[("hours", "Mo-We 11:00-22:00", 10)]),
+        ("Fresh Closed", &[("hours", "Mo-Su 11:00-15:00", 1)]),
+        (
+            "Paused",
+            &[
+                ("hours", open, 1),
+                ("operating_status", "temporarily_closed", 1),
+            ],
+        ),
+        (
+            "Stale Paused",
+            &[
+                ("hours", open, 1),
+                ("operating_status", "temporarily_closed", 20),
+            ],
+        ),
+        ("Late Bar", &[("hours", "Th 20:00-02:00", 1)]),
+    ]);
+    let answers =
+        |hits: &[c7::PlaceHit]| -> Vec<(String, Option<c7::OpenState>, Vec<c7::PlaceMark>)> {
+            let mut out: Vec<_> = hits
+                .iter()
+                .map(|h| (h.name.clone(), h.open, h.marks.clone()))
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        };
+    let stale_status = c7::PlaceMark {
+        kind: c7::PlaceMarkKind::Stale,
+        key: Some("operating_status".into()),
+        age_days: Some(20),
+        terms: None,
+        other: None,
+    };
+    let row = |name: &str, open, marks: Vec<c7::PlaceMark>| (name.to_owned(), Some(open), marks);
+    assert_eq!(
+        answers(&search(&g, open_now_at("2031-03-20T19:30"))),
+        [
+            row("Fresh Open", Open, vec![]),
+            row("No Hours", Unknown, vec![unconfirmed(None)]),
+            row("Stale Closed", Unknown, vec![unconfirmed(Some(10))]),
+            row("Stale Open", ProbablyOpen, vec![unconfirmed(Some(10))]),
+            row("Stale Paused", Open, vec![stale_status]),
+            row("Unread Hours", Unknown, vec![unconfirmed(Some(1))]),
+        ],
+        "fresh closed hours, a fresh temporary closure and Thursday's bar before 20:00 dropped"
+    );
+    let late = search(&g, open_now_at("2031-03-21T01:30"));
+    let late_bar = late.iter().find(|h| h.name == "Late Bar").unwrap();
+    assert_eq!(
+        late_bar.open,
+        Some(Open),
+        "Thursday's interval past midnight is open early on Friday"
+    );
+    assert!(
+        late.iter().all(|h| h.name != "Fresh Open"),
+        "fresh hours closed at 01:30 drop the place"
+    );
+
+    let all = search(&g, json!({"limit": 50}));
+    assert_eq!(all.len(), 9, "without open_now no place is dropped");
+    for h in &all {
+        assert_eq!(h.open, None, "{}", h.name);
+        let kinds: Vec<_> = h.marks.iter().map(|m| m.kind).collect();
+        let expected = if h.name == "Stale Paused" {
+            vec![c7::PlaceMarkKind::Stale]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            kinds, expected,
+            "stale hours mark nothing without open_now: {}",
+            h.name
+        );
+    }
+}
+
+#[test]
+fn an_open_place_ranks_above_an_otherwise_equal_probably_open_and_unknown_one() {
+    let open = "Mo-Su 11:00-22:00";
+    let g = hours_bed(&[
+        ("Alder Probably", &[("hours", open, 10)]),
+        ("Birch Unknown", &[]),
+        ("Zinc Open", &[("hours", open, 1)]),
+    ]);
+    assert_eq!(
+        names(&search(&g, open_now_at("2031-03-20T19:30"))),
+        ["Zinc Open", "Alder Probably", "Birch Unknown"],
+        "open first though its id sorts last; the halved two tie and go by id"
+    );
+    assert_eq!(
+        names(&search(&g, json!({}))),
+        ["Alder Probably", "Birch Unknown", "Zinc Open"],
+        "without open_now stale hours demote nothing and the ids decide"
+    );
+}
+
 #[test]
 fn requests_outside_the_c7_rules_are_invalid() {
     let g = garden();
     assert!(invalid(&g, json!({"filters": {"max_distance_m": 2000}})).contains("max_distance_m"));
     assert!(invalid(&g, json!({"open_now": true})).contains("local_time"));
+    for t in ["2031-02-30T19:30", "1969-12-31T19:30"] {
+        assert!(invalid(&g, open_now_at(t)).contains("local_time"), "{t}");
+    }
     assert!(invalid(&g, json!({"limit": 0})).contains("limit"));
     let long = "n".repeat(101);
     let eleven: Vec<String> = (0..11).map(|n| format!("cuisine{n}")).collect();

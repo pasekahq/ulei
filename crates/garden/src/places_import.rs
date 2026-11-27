@@ -636,7 +636,7 @@ fn read_date(date: &str, as_of: i64) -> Option<i64> {
 }
 
 /// `YYYY-MM-DD` as the Unix time of its 00:00 UTC.
-fn full_date(date: &str) -> Option<i64> {
+pub(crate) fn full_date(date: &str) -> Option<i64> {
     let mut parts = date.split('-');
     let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
     let ok = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_digit());

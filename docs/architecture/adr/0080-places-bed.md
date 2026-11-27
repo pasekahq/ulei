@@ -223,9 +223,9 @@ free text. A value that does not fit its form is refused.
 
 `on_stale`: `demote` keeps the stale value as the place's value for the filters and marks and
 demotes the place (section 5); `distrust` (only `hours`) makes `open_now` not trust the value, and
-marks and demotes the place only in a search with `open_now`; `show` only answers `stale` and
-`age_days` for the attribute. The `verdict` row has no `bed_attr` rows: it routes the key to
-`bed_verdict`, which never goes stale.
+marks and demotes the place only in a search with `open_now` (section 5 items 4 to 6); `show`
+only answers `stale` and `age_days` for the attribute. The `verdict` row has no `bed_attr` rows:
+it routes the key to `bed_verdict`, which never goes stale.
 
 `operating_status` is 14 days, the upper end of the range: a permanent closure also arrives
 through grooming as a closing date that sets `gone` (section 6), and hours, rechecked every 7 days,
@@ -332,26 +332,31 @@ is served by the garden daemon on its socket like the rest of C7.
    phrase when the phrase's words (runs of letters and digits after `edge::normalise`) appear in
    it in order, so `rice noodles` names `Noodles`. These run in Rust because SQLite's trigonometric
    functions depend on a build flag and the normalisation is the crate's own code.
-4. `open_now`: `hours` and `operating_status` are read at `local_time`. Fresh `hours` that say
-   closed, or a fresh `temporarily_closed`, drop the place; fresh `hours` that say open answer
-   `open`; stale `hours` that say open answer `probably_open`; missing, unread or stale closed
-   `hours` answer `unknown`. Open now is never stored.
+4. `open_now`: `hours` and `operating_status` are read at `local_time`, its date giving the
+   weekday. Fresh `hours` that say closed, or a fresh `temporarily_closed`, drop the place; fresh
+   `hours` that say open answer `open`; stale `hours` that say open answer `probably_open`;
+   missing, unread or stale closed `hours` answer `unknown`. Open now is never stored.
 5. Order, best first, by this key compared term by term:
    1. verdict: 1 above 0 and none;
    2. vibe: the number of distinct `morph` stems of the request's `vibe` words found among the
       stems of the place's `vibe`, `cuisine` and verdict note;
    3. quality: `floor(rating * ln(2 + review_count) * 0.5^s)`, a missing rating counting 0 and a
       missing count 0, where `s` is the number of stale `demote` attributes plus 1 in a search with
-      `open_now` when `open` is not `open`;
+      `open_now` when `open` is not `open`; this term is how the `distrust` key `hours` demotes,
+      since stale `hours` never answer `open`, and it counts once whether `hours` are missing,
+      unread or stale;
    4. distance, nearest first, a place without one last;
    5. the id, so the order is total.
    The order is lexicographic because the owner set a strict precedence; a weighted sum would need
    weights tuned on a gold set the bed does not have. The quality is floored so that near ties go
    to distance.
 6. The answer has at most `limit` places, each with every attribute, its `age_days` and `stale`,
-   the latest verdict, `open` in a search with `open_now`, and marks: `stale` with `key` and
-   `age_days` for each attribute counted in `s`, `ban_risk`, and `possible_duplicate` for an
-   unsettled `bed_dup_pair`. `maps_url` is on every place: the `maps_url` attribute, else
+   the latest verdict, `open` in a search with `open_now`, and marks in this order: one for each
+   unit of `s`, `stale` with `key` and `age_days` for each stale `demote` attribute and
+   `open_unconfirmed` for the `open_now` term, with `key` `hours` and its `age_days` when the place
+   has `hours` and without them when it has none, so a stale `hours` is never a `stale` mark; then
+   `ban_risk`, and `possible_duplicate` for an unsettled `bed_dup_pair`. `maps_url` is on every
+   place: the `maps_url` attribute, else
    `https://www.google.com/maps/search/?api=1&query=<lat>%2C<lon>` from the location, else the
    same URL with the name and the `address` as the query.
 

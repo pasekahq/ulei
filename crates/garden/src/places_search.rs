@@ -1,6 +1,6 @@
 //! `places_search` over the places bed (ADR-0080 section 5): one SQL query for the status, the
 //! bounding box, the rating and price thresholds and the latest verdict, then the distance,
-//! cuisine and bans in Rust, the lexicographic order and the answer with its marks.
+//! cuisine, bans and `open_now` in Rust, the lexicographic order and the answer with its marks.
 
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
@@ -11,7 +11,8 @@ use rusqlite::{Connection, params};
 use crate::edge::normalise;
 use crate::model::UnixTime;
 use crate::morph;
-use crate::places::{PLACE, decimal, point, range};
+use crate::places::{PLACE, clock, decimal, hours, point, range};
+use crate::places_import::full_date;
 use crate::search;
 use crate::store::StoreError;
 use crate::translit;
@@ -105,6 +106,8 @@ struct Candidate {
     verdict: Option<c7::PlaceVerdict>,
     attrs: Vec<Attr>,
     distance: Option<f64>,
+    /// The answer of `open_now`, absent in a search without it.
+    open: Option<c7::OpenState>,
 }
 
 impl Candidate {
@@ -131,10 +134,7 @@ pub fn search(
     req: &c7::PlacesSearchRequest,
     now: UnixTime,
 ) -> Result<c7::PlacesSearchResponse, FindError> {
-    let open_now = req.open_now.unwrap_or(false);
-    if open_now && req.local_time.is_none() {
-        return Err(FindError::Invalid("`open_now` needs `local_time`"));
-    }
+    let local = open_now(req)?;
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT);
     if !(1..=MAX_LIMIT).contains(&limit) {
         return Err(FindError::Invalid("`limit` is 1 to 50"));
@@ -208,7 +208,16 @@ pub fn search(
         if !cuisine.is_empty() && !cuisine.iter().any(|w| terms.iter().any(|t| names(t, w))) {
             return false;
         }
-        !bans.iter().any(|(_, w)| terms.iter().any(|t| names(t, w)))
+        if bans.iter().any(|(_, w)| terms.iter().any(|t| names(t, w))) {
+            return false;
+        }
+        match local {
+            Some(at) => {
+                p.open = open_at(p, at, now);
+                p.open.is_some()
+            }
+            None => true,
+        }
     });
 
     let vibe: BTreeSet<String> = req.vibe.as_deref().map(stems).unwrap_or_default();
@@ -223,7 +232,7 @@ pub fn search(
     let mut places = Vec::with_capacity(ranked.len());
     for (_, p) in ranked {
         let others = duplicates(c, &p.id)?;
-        places.push(hit(p, &bans, others, open_now, now));
+        places.push(hit(p, &bans, others, now));
     }
     Ok(c7::PlacesSearchResponse { places })
 }
@@ -269,6 +278,56 @@ fn in_bounds(f: &c7::PlacesFilters) -> Result<(), FindError> {
     Ok(())
 }
 
+/// The weekday and minute `open_now` reads at, `None` in a search without it.
+fn open_now(req: &c7::PlacesSearchRequest) -> Result<Option<(usize, u16)>, FindError> {
+    match (req.open_now.unwrap_or(false), &req.local_time) {
+        (false, _) => Ok(None),
+        (true, None) => Err(FindError::Invalid("`open_now` needs `local_time`")),
+        (true, Some(t)) => local_time(t).map(Some).ok_or(FindError::Invalid(
+            "`local_time` is not a time `YYYY-MM-DDTHH:MM` from 1970",
+        )),
+    }
+}
+
+/// The weekday from Monday 0 and the minute of the day of a `local_time`.
+fn local_time(t: &str) -> Option<(usize, u16)> {
+    let (date, time) = t.split_once('T')?;
+    let days = full_date(date)? / DAY;
+    let minute = clock(time).filter(|&m| m < 24 * 60)?;
+    // 1970-01-01 was a Thursday.
+    let weekday = usize::try_from((days + 3).rem_euclid(7)).ok()?;
+    Some((weekday, minute))
+}
+
+/// The answer of `open_now` for `p` at `at` (section 5 item 4), `None` when fresh values say
+/// it is closed.
+fn open_at(p: &Candidate, (weekday, minute): (usize, u16), now: UnixTime) -> Option<c7::OpenState> {
+    let fresh = |a: &&Attr| !a.stale(now);
+    if p.attr("operating_status")
+        .filter(fresh)
+        .is_some_and(|a| a.value == "temporarily_closed")
+    {
+        return None;
+    }
+    let Some(h) = p.attr("hours") else {
+        return Some(c7::OpenState::Unknown);
+    };
+    let Some(read) = hours(&h.value) else {
+        return Some(c7::OpenState::Unknown);
+    };
+    match (read.open_at(weekday, minute), h.stale(now)) {
+        (true, false) => Some(c7::OpenState::Open),
+        (true, true) => Some(c7::OpenState::ProbablyOpen),
+        (false, false) => None,
+        (false, true) => Some(c7::OpenState::Unknown),
+    }
+}
+
+/// Whether the place's `open_now` answer demotes it: any answer but `open`.
+fn unconfirmed(p: &Candidate) -> bool {
+    p.open.is_some_and(|o| o != c7::OpenState::Open)
+}
+
 /// The order of section 5 item 5, best first under `Ord`: a liked verdict, the vibe count,
 /// the floored quality, the distance with none last, the id. A distance is never negative, so
 /// its bits order as its value.
@@ -297,7 +356,8 @@ fn key(p: &Candidate, vibe: &BTreeSet<String>, now: UnixTime) -> Key {
         vibe.intersection(&own).count()
     };
     let num = |k: &str| p.attr(k).and_then(|a| a.num).unwrap_or(0.0);
-    let s = p.attrs.iter().filter(|a| a.demotes && a.stale(now)).count();
+    let s =
+        p.attrs.iter().filter(|a| a.demotes && a.stale(now)).count() + usize::from(unconfirmed(p));
     let quality = num("rating") * (2.0 + num("review_count")).ln() * 0.5_f64.powi(exponent(s));
     #[allow(clippy::cast_possible_truncation)]
     let quality = quality.floor() as i64;
@@ -315,12 +375,12 @@ fn exponent(s: usize) -> i32 {
 }
 
 /// The answer of one place: its attributes by key, the `stale` marks of the attributes that
-/// demote it, `ban_risk` with the bans its `warnings` name and `possible_duplicate`.
+/// demote it, `open_unconfirmed` when its `open` demotes it, `ban_risk` with the bans its
+/// `warnings` name and `possible_duplicate`.
 fn hit(
     p: Candidate,
     bans: &[(&str, Vec<String>)],
     others: Vec<String>,
-    open_now: bool,
     now: UnixTime,
 ) -> c7::PlaceHit {
     let mut marks: Vec<c7::PlaceMark> = p
@@ -335,6 +395,16 @@ fn hit(
             other: None,
         })
         .collect();
+    if unconfirmed(&p) {
+        let hours = p.attr("hours");
+        marks.push(c7::PlaceMark {
+            kind: c7::PlaceMarkKind::OpenUnconfirmed,
+            key: hours.map(|a| a.key.clone()),
+            age_days: hours.map(|a| a.age_days(now).unsigned_abs()),
+            terms: None,
+            other: None,
+        });
+    }
     let warnings: Vec<Vec<String>> = p
         .list("warnings")
         .into_iter()
@@ -386,7 +456,7 @@ fn hit(
         maps_url,
         attrs,
         verdict: p.verdict,
-        open: open_now.then_some(c7::OpenState::Unknown),
+        open: p.open,
         marks,
     }
 }
@@ -608,6 +678,7 @@ fn candidate(r: &rusqlite::Row<'_>, id: String) -> Result<Candidate, FindError> 
         verdict,
         attrs: Vec::new(),
         distance: None,
+        open: None,
     })
 }
 
