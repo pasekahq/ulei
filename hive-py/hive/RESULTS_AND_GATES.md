@@ -70,8 +70,9 @@ details, acceptance command, `judge_criteria`), the worker report of the round, 
 and the reviewer's verdict and text. The first `VERDICT:` line of the answer decides: `done`
 finishes the card (a steer that arrived meanwhile queues a steer round instead); `rework`
 followed by a reason fails the round through the normal retry path with the reason as the next
-worker's feedback, spending `max_rounds` and taking backoff. A failed turn is no verdict, and
-nothing else is tried: no other route, vendor or CLI, and never the request without its tag. A
+worker's feedback, spending `max_rounds`; it takes no backoff, so the next round starts on the
+next tick (a failed worker round or gate still waits `[retry_backoff]`). A failed turn is no
+verdict, and nothing else is tried: no other route, vendor or CLI, and never the request without its tag. A
 retryable class keeps the card in `check` with `retry_at` at the gateway's `resets_at`, else
 now + `retry_after`, else now + `[judge] retry_s`, and the judge runs again from then with the same
 route and tag. A non-retryable class (among them `no_login_for_tag`, and `bad_request` from a qb
