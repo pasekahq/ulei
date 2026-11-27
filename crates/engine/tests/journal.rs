@@ -1653,7 +1653,7 @@ fn compaction_rows_are_never_found_and_archived_turn_rows_are() {
 fn downgrade_to_version_6(path: &Path) {
     rusqlite::Connection::open(path)
         .unwrap()
-        .execute_batch("DROP TABLE marks; DROP TABLE messages_fts; PRAGMA user_version=6;")
+        .execute_batch("DROP TABLE marks; DROP TABLE settings; DROP TABLE messages_fts; PRAGMA user_version=6;")
         .unwrap();
 }
 
@@ -1736,7 +1736,7 @@ fn a_version_6_file_that_fails_its_migration_keeps_its_version_and_has_no_index(
 fn downgrade_to_version_7(path: &Path) {
     rusqlite::Connection::open(path)
         .unwrap()
-        .execute_batch("DROP TABLE marks; PRAGMA user_version=7;")
+        .execute_batch("DROP TABLE marks; DROP TABLE settings; PRAGMA user_version=7;")
         .unwrap();
 }
 
