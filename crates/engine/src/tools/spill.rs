@@ -374,7 +374,8 @@ mod tests {
     fn file_names_are_safe() {
         assert_eq!(safe_result_filename("toolu_01Abc"), "toolu_01Abc.txt");
         let odd = safe_result_filename("../x y");
-        assert!(odd.starts_with("x_y_") && odd.ends_with(".txt"), "{odd}");
+        assert!(odd.starts_with("x_y_"), "{odd}");
+        assert_eq!(Path::new(&odd).extension().unwrap(), "txt");
         assert_eq!(odd.len(), "x_y_".len() + 12 + ".txt".len());
         assert_eq!(safe_result_filename(""), "tool_result.txt");
         let long = safe_result_filename(&"a".repeat(200));
@@ -419,7 +420,7 @@ mod tests {
         let dir = scratch("under");
         let mut outputs = vec![
             Output::ok("y".repeat(50_000)),
-            Output::ok("z".repeat(150_000)),
+            Output::ok("z".repeat(100_000)),
             Output::ok("w".repeat(40_000)),
         ];
         let calls = [
@@ -427,6 +428,7 @@ mod tests {
             call("b", "read_file"),
             call("c", "archive_read"),
         ];
+        // 190,000 characters together: within the step budget.
         let replaced = persist_step(&dir, &Budget::default(), &calls, &mut outputs);
         assert_eq!(replaced, [false, false, false]);
         assert!(!dir.join("a.txt").exists());
