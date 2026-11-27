@@ -1,11 +1,11 @@
 //! The judge of stage d (ADR-0096): the new facts the garden hinted, grouped by entity into
-//! calls, rendered as JSON lines under the system prompt `judge.txt`, and the strict reading of
-//! the model's answer into the verdicts `reconcile_done` applies. The garden decides nothing by
-//! itself and calls no model; the night is the only judge.
+//! calls, rendered as JSON lines under the system prompt `judge.txt`, and the reading of the
+//! model's answer, fact by fact, into the verdicts `reconcile_done` applies. The garden decides
+//! nothing by itself and calls no model; the night is the only judge.
 
 use std::collections::HashSet;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::night::extract::{Malformed, object, only};
 use crate::night::spend::estimate_tokens;
@@ -16,7 +16,7 @@ use crate::zone;
 pub const JUDGE_SYSTEM: &str = include_str!("judge.txt");
 
 /// The version of [`JUDGE_SYSTEM`], kept with every verdict the garden records.
-pub const PROMPT_VERSION: &str = "judge-v1";
+pub const PROMPT_VERSION: &str = "judge-v2";
 
 /// Characters of a verdict's note kept at most (C7 `ReconcileVerdict.note`).
 pub const MAX_NOTE_CHARS: usize = 500;
@@ -131,87 +131,126 @@ pub fn batches(items: &[ReconcileItem], per_call: usize, budget: u64) -> Vec<Vec
     calls
 }
 
-/// The verdicts of an answer to `batch`, in the batch's order. The answer names every new fact
-/// of the batch once, with verdicts only on its own hints, at most one per hint, each a
+/// What [`parse`] reads from an answer: the verdicts of the new facts it decided, and how many
+/// of the batch it left undecided.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answer {
+    /// The decided new facts, in the batch's order.
+    pub judged: Vec<ReconcileJudged>,
+    /// New facts of the batch left waiting: named by no well-formed item, or by a defective one.
+    pub dropped: u64,
+}
+
+/// The JSON object of an answer: the whole text, a code fence around it, else the span from its
+/// first `{` to its last `}` (prose or a fence around the object).
+fn answer_object(text: &str) -> Result<Map<String, Value>, Malformed> {
+    object(text).or_else(|why| {
+        let (Some(from), Some(to)) = (text.find('{'), text.rfind('}')) else {
+            return Err(why);
+        };
+        if from < to {
+            object(&text[from..=to]).map_err(|_| why)
+        } else {
+            Err(why)
+        }
+    })
+}
+
+/// The verdicts of one item for `fact`: only on its own hints, at most one per hint, each a
 /// relation `duplicate`, `supersedes` or `contradiction` (a `compatible` one is dropped) and an
-/// optional note, cut at [`MAX_NOTE_CHARS`]; any other key, ref or relation is malformed.
+/// optional note, cut at [`MAX_NOTE_CHARS`]; `None` for any other key, hint or relation.
+fn verdicts_of(item: &Map<String, Value>, fact: &ReconcileItem) -> Option<Vec<ReconcileVerdict>> {
+    only(item, &["ref", "verdicts"], "").ok()?;
+    let Some(Value::Array(list)) = item.get("verdicts") else {
+        return None;
+    };
+    let mut verdicts = Vec::new();
+    let mut named = HashSet::new();
+    for v in list {
+        let Value::Object(v) = v else { return None };
+        only(v, &["hint", "relation", "note"], "").ok()?;
+        let Some(Value::String(hint)) = v.get("hint") else {
+            return None;
+        };
+        if !fact.hints.iter().any(|h| id(h) == hint) || !named.insert(hint.clone()) {
+            return None;
+        }
+        let relation = match v.get("relation").and_then(Value::as_str) {
+            Some("duplicate") => ReconcileRelation::Duplicate,
+            Some("supersedes") => ReconcileRelation::Supersedes,
+            Some("contradiction") => ReconcileRelation::Contradiction,
+            Some("compatible") => continue,
+            _ => return None,
+        };
+        let note = match v.get("note") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if s.trim().is_empty() => None,
+            Some(Value::String(s)) => Some(cut(s.trim(), MAX_NOTE_CHARS)),
+            Some(_) => return None,
+        };
+        verdicts.push(ReconcileVerdict {
+            hint: hint.clone(),
+            relation,
+            note,
+        });
+    }
+    Some(verdicts)
+}
+
+/// The verdicts of an answer to `batch`. The answer is one JSON object `{"items": [...]}`,
+/// alone, in a code fence or within prose. Each item names one new fact of the batch by its
+/// `ref` with its `verdicts` (see [`verdicts_of`]). The answer is read per new fact: a fact
+/// named by a defective item (another key, a hint that is not one of its own, a hint twice, an
+/// unknown relation or a note that is no text), named twice, or not named stays undecided and
+/// waits, with none of its verdicts applied; the other facts are decided. An item naming no new
+/// fact of the batch is ignored.
 ///
 /// # Errors
 ///
-/// [`Malformed`] naming how the answer breaks the output schema.
-pub fn parse(text: &str, batch: &[&ReconcileItem]) -> Result<Vec<ReconcileJudged>, Malformed> {
-    let root = object(text)?;
+/// [`Malformed`] when the answer holds no such object, or decides no new fact of the batch.
+pub fn parse(text: &str, batch: &[&ReconcileItem]) -> Result<Answer, Malformed> {
+    let root = answer_object(text)?;
     only(&root, &["items"], "answer has keys other than items")?;
     let Some(Value::Array(items)) = root.get("items") else {
         return Err("answer lacks the items list");
     };
     let mut judged: Vec<Option<ReconcileJudged>> = vec![None; batch.len()];
+    let mut named = vec![false; batch.len()];
+    let mut defective = vec![false; batch.len()];
     for value in items {
-        let Value::Object(item) = value else {
-            return Err("an item is not an object");
-        };
-        only(
-            item,
-            &["ref", "verdicts"],
-            "an item has keys other than ref and verdicts",
-        )?;
+        let Value::Object(item) = value else { continue };
         let Some(Value::String(r)) = item.get("ref") else {
-            return Err("an item lacks its ref");
+            continue;
         };
-        let at = batch
-            .iter()
-            .position(|i| id(&i.fact) == r)
-            .ok_or("an item names a ref that is no new fact of the input")?;
-        if judged[at].is_some() {
-            return Err("an item names a new fact twice");
-        }
-        let Some(Value::Array(list)) = item.get("verdicts") else {
-            return Err("an item lacks its verdicts list");
+        let Some(at) = batch.iter().position(|i| id(&i.fact) == r) else {
+            continue;
         };
-        let mut verdicts = Vec::new();
-        let mut named = HashSet::new();
-        for v in list {
-            let Value::Object(v) = v else {
-                return Err("a verdict is not an object");
-            };
-            only(v, &["hint", "relation", "note"], "a verdict has other keys")?;
-            let Some(Value::String(hint)) = v.get("hint") else {
-                return Err("a verdict lacks its hint");
-            };
-            if !batch[at].hints.iter().any(|h| id(h) == hint) {
-                return Err("a verdict names a hint that is not one of its fact's");
-            }
-            if !named.insert(hint.clone()) {
-                return Err("a hint has two verdicts");
-            }
-            let relation = match v.get("relation").and_then(Value::as_str) {
-                Some("duplicate") => ReconcileRelation::Duplicate,
-                Some("supersedes") => ReconcileRelation::Supersedes,
-                Some("contradiction") => ReconcileRelation::Contradiction,
-                Some("compatible") => continue,
-                _ => return Err("a verdict has an unknown relation"),
-            };
-            let note = match v.get("note") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(s)) if s.trim().is_empty() => None,
-                Some(Value::String(s)) => Some(cut(s.trim(), MAX_NOTE_CHARS)),
-                Some(_) => return Err("a note is not a string"),
-            };
-            verdicts.push(ReconcileVerdict {
-                hint: hint.clone(),
-                relation,
-                note,
-            });
+        if std::mem::replace(&mut named[at], true) {
+            defective[at] = true;
+            continue;
         }
-        judged[at] = Some(ReconcileJudged {
-            fact_id: r.clone(),
-            verdicts,
-        });
+        match verdicts_of(item, batch[at]) {
+            Some(verdicts) => {
+                judged[at] = Some(ReconcileJudged {
+                    fact_id: r.clone(),
+                    verdicts,
+                });
+            }
+            None => defective[at] = true,
+        }
     }
-    judged
+    let judged: Vec<ReconcileJudged> = judged
         .into_iter()
-        .map(|j| j.ok_or("the answer leaves out a new fact"))
-        .collect()
+        .zip(defective)
+        .filter_map(|(j, bad)| j.filter(|_| !bad))
+        .collect();
+    if judged.is_empty() {
+        return Err("the answer decides no new fact");
+    }
+    Ok(Answer {
+        dropped: (batch.len() - judged.len()) as u64,
+        judged,
+    })
 }
 
 fn cut(s: &str, max: usize) -> String {
@@ -350,7 +389,9 @@ mod tests {
  {"ref":"f9","verdicts":[{"hint":"f2","relation":"contradiction","note":" tea vs coffee "},
   {"hint":"f1","relation":"compatible"}]}]}
 ```"#;
-        let judged = parse(answer, &batch).unwrap();
+        let read = parse(answer, &batch).unwrap();
+        assert_eq!(read.dropped, 0);
+        let judged = read.judged;
         assert_eq!(judged[0].fact_id, "f9");
         assert_eq!(
             judged[0].verdicts,
@@ -366,49 +407,160 @@ mod tests {
             r#"{{"items":[{{"ref":"f9","verdicts":[{{"hint":"f1","relation":"duplicate","note":"{}"}}]}},{{"ref":"f10","verdicts":[]}}]}}"#,
             "x".repeat(600)
         );
-        let judged = parse(&long, &batch).unwrap();
+        let judged = parse(&long, &batch).unwrap().judged;
         assert_eq!(
             judged[0].verdicts[0].note.as_ref().unwrap().len(),
             MAX_NOTE_CHARS
         );
     }
 
+    /// The facts `parse` decides, by ref, and how many it left.
+    fn decided(answer: &str, batch: &[&ReconcileItem]) -> (Vec<String>, u64) {
+        let read = parse(answer, batch).unwrap();
+        let refs = read.judged.iter().map(|j| j.fact_id.clone()).collect();
+        (refs, read.dropped)
+    }
+
     #[test]
-    fn a_malformed_answer_is_refused() {
+    fn a_defective_item_leaves_only_its_own_fact_undecided() {
+        let a = item(1, "ada", "f9", &["f1", "f2"]);
+        let b = item(2, "ada", "f10", &["f1"]);
+        let batch = [&a, &b];
+        let ok = r#"{"ref":"f9","verdicts":[{"hint":"f1","relation":"duplicate"}]}"#;
+        for (bad, why) in [
+            (
+                r#"{"ref":"f10","verdicts":[{"hint":"f2","relation":"duplicate"}]}"#,
+                "a hint of another fact of the call",
+            ),
+            (
+                r#"{"ref":"f10","verdicts":[{"hint":"f7","relation":"supersedes"}]}"#,
+                "a hint of no fact",
+            ),
+            (
+                r#"{"ref":"f10","verdicts":[{"hint":"f1","relation":"same"}]}"#,
+                "an unknown relation",
+            ),
+            (r#"{"ref":"f10","verdicts":[{"hint":"f1"}]}"#, "no relation"),
+            (
+                r#"{"ref":"f10","verdicts":[{"hint":"f1","relation":"duplicate"},{"hint":"f1","relation":"supersedes"}]}"#,
+                "a hint twice",
+            ),
+            (
+                r#"{"ref":"f10","verdicts":[{"hint":"f1","relation":"contradiction","note":7}]}"#,
+                "a note that is no text",
+            ),
+            (
+                r#"{"ref":"f10","verdicts":[{"hint":"f1","relation":"duplicate","why":"x"}]}"#,
+                "a verdict with another key",
+            ),
+            (
+                r#"{"ref":"f10","verdicts":[],"why":"x"}"#,
+                "an item with another key",
+            ),
+            (r#"{"ref":"f10","verdicts":"none"}"#, "verdicts not a list"),
+            (
+                r#"{"ref":"f10","verdicts":["f1"]}"#,
+                "a verdict not an object",
+            ),
+        ] {
+            let answer = format!(r#"{{"items":[{ok},{bad}]}}"#);
+            assert_eq!(
+                decided(&answer, &batch),
+                (vec!["f9".to_owned()], 1),
+                "{why}"
+            );
+            let answer = format!(r#"{{"items":[{bad},{ok}]}}"#);
+            assert_eq!(decided(&answer, &batch).1, 1, "{why}, first");
+        }
+        let read = parse(
+            &format!(
+                r#"{{"items":[{ok},{{"ref":"f10","verdicts":[{{"hint":"f1","relation":"duplicate"}},{{"hint":"f2","relation":"duplicate"}}]}}]}}"#
+            ),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(
+            read.judged.len(),
+            1,
+            "a good verdict beside a stray one waits too"
+        );
+        assert_eq!(read.judged[0].verdicts[0].hint, "f1");
+    }
+
+    #[test]
+    fn a_fact_left_out_or_named_twice_waits_and_an_unknown_ref_is_ignored() {
+        let a = item(1, "ada", "f9", &["f1", "f2"]);
+        let b = item(2, "ada", "f10", &["f1"]);
+        let batch = [&a, &b];
+        let ok = r#"{"ref":"f9","verdicts":[]}"#;
+        assert_eq!(
+            decided(&format!(r#"{{"items":[{ok}]}}"#), &batch),
+            (vec!["f9".to_owned()], 1),
+            "a fact left out"
+        );
+        assert_eq!(
+            decided(
+                &format!(
+                    r#"{{"items":[{ok},{{"ref":"f10","verdicts":[]}},{{"ref":"f10","verdicts":[{{"hint":"f1","relation":"duplicate"}}]}}]}}"#
+                ),
+                &batch
+            ),
+            (vec!["f9".to_owned()], 1),
+            "a fact named twice decides neither"
+        );
+        assert_eq!(
+            decided(
+                &format!(
+                    r#"{{"items":[{{"ref":"f7","verdicts":[]}},{ok},"f10",{{"ref":10}},{{"ref":"f10","verdicts":[]}}]}}"#
+                ),
+                &batch
+            ),
+            (vec!["f9".to_owned(), "f10".to_owned()], 0),
+            "an unknown ref or a stray value"
+        );
+    }
+
+    #[test]
+    fn the_object_is_found_in_a_fence_or_prose() {
+        let a = item(1, "ada", "f9", &["f1"]);
+        let batch = [&a];
+        let body = r#"{"items":[{"ref":"f9","verdicts":[{"hint":"f1","relation":"duplicate"}]}]}"#;
+        for answer in [
+            format!("```json\n{body}\n```"),
+            format!("Here are the verdicts:\n```json\n{body}\n```\nDone."),
+            format!("Sure. {body} Hope this helps."),
+            format!("  {body}\n"),
+        ] {
+            assert_eq!(
+                decided(&answer, &batch),
+                (vec!["f9".to_owned()], 0),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_that_decides_nothing_is_refused() {
         let a = item(1, "ada", "f9", &["f1", "f2"]);
         let b = item(2, "ada", "f10", &["f1"]);
         let batch = [&a, &b];
         for (answer, why) in [
             ("not json", "not json"),
-            (
-                r#"{"items":[{"ref":"f9","verdicts":[]}]}"#,
-                "a missing fact",
-            ),
-            (
-                r#"{"items":[{"ref":"f9","verdicts":[]},{"ref":"f9","verdicts":[]},{"ref":"f10","verdicts":[]}]}"#,
-                "a fact twice",
-            ),
-            (
-                r#"{"items":[{"ref":"f7","verdicts":[]},{"ref":"f9","verdicts":[]},{"ref":"f10","verdicts":[]}]}"#,
-                "an unknown ref",
-            ),
-            (
-                r#"{"items":[{"ref":"f9","verdicts":[]},{"ref":"f10","verdicts":[{"hint":"f2","relation":"duplicate"}]}]}"#,
-                "a hint of another fact",
-            ),
-            (
-                r#"{"items":[{"ref":"f9","verdicts":[{"hint":"f1","relation":"same"}]},{"ref":"f10","verdicts":[]}]}"#,
-                "an unknown relation",
-            ),
-            (
-                r#"{"items":[{"ref":"f9","verdicts":[{"hint":"f1","relation":"duplicate"},{"hint":"f1","relation":"supersedes"}]},{"ref":"f10","verdicts":[]}]}"#,
-                "a hint twice",
-            ),
-            (
-                r#"{"items":[{"ref":"f9","verdicts":[],"why":"x"},{"ref":"f10","verdicts":[]}]}"#,
-                "an unknown key",
-            ),
+            ("I cannot judge these facts.", "prose only"),
+            ("{\"items\": [", "cut off"),
+            ("[]", "not an object"),
+            (r#"{"items":[]}"#, "no item"),
+            (r#"{"items":{}}"#, "items not a list"),
+            (r#"{"verdicts":[]}"#, "no items"),
             (r#"{"items":[],"extra":1}"#, "an unknown top key"),
+            (
+                r#"{"items":[{"ref":"f7","verdicts":[]}]}"#,
+                "only an unknown ref",
+            ),
+            (
+                r#"{"items":[{"ref":"f9","verdicts":[{"hint":"f9","relation":"duplicate"}]},{"ref":"f10","verdicts":[{"hint":"f2","relation":"duplicate"}]}]}"#,
+                "every item defective",
+            ),
         ] {
             assert!(parse(answer, &batch).is_err(), "{why}");
         }

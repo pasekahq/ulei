@@ -173,6 +173,9 @@ pub struct Totals {
     pub stale: u64,
     /// Judge calls whose answer was malformed twice, refused or too long; their facts wait.
     pub judge_failures: u64,
+    /// New facts a judge answer otherwise read left undecided (not named, or named by a
+    /// malformed item); they wait, none of their verdicts applied.
+    pub judge_dropped: u64,
     /// Judge calls that timed out.
     pub judge_timeouts: u64,
     /// Of `usd`, what the judge spent.
@@ -247,6 +250,7 @@ impl Totals {
             "contradictions": self.contradictions,
             "stale": self.stale,
             "judge_failures": self.judge_failures,
+            "judge_dropped": self.judge_dropped,
             "judge_timeouts": self.judge_timeouts,
             "judge_usd": self.judge_usd,
             "seconds": seconds,
@@ -829,7 +833,8 @@ impl Night<'_> {
 
     /// The judge: takes the facts the garden hinted page by page, sends them in calls of whole
     /// entities, and hands the verdicts to `reconcile_done`, from a budget of its own. A batch
-    /// whose answer is malformed twice is left for the next night; facts left when the budget
+    /// whose answer is malformed twice is left for the next night, and so is a fact an answer
+    /// leaves undecided while it decides the others; facts left when the budget
     /// is spent wait too. The judge's counts reach the garden with each `reconcile_done`, and a
     /// last one carries what is left when the stage ends.
     fn judge(&mut self) -> Result<Stop, Fail> {
@@ -888,7 +893,7 @@ impl Night<'_> {
         let last = batch.last().map_or(0, |i| i.seq);
         let mut line = json!({"type": "judge", "facts": batch.len(), "first": first, "last": last,
             "attempts": attempts, "tokens_in": usage.0, "tokens_out": usage.1, "usd": usage.2});
-        let judged = match answer {
+        let answer = match answer {
             Extracted::Failed(MAX_TOKENS) if batch.len() > 1 => {
                 line["outcome"] = "split".into();
                 self.line(&line)?;
@@ -909,9 +914,11 @@ impl Night<'_> {
                 self.line(&line)?;
                 return Ok(None);
             }
-            Extracted::Answer(judged) => judged,
+            Extracted::Answer(answer) => answer,
         };
-        let done = self.judge_done(garden, judged)?;
+        self.totals.judge_dropped += answer.dropped;
+        line["dropped"] = answer.dropped.into();
+        let done = self.judge_done(garden, answer.judged)?;
         let count = |what: ReconcileApplied| {
             done.iter()
                 .flat_map(|i| &i.outcomes)

@@ -444,7 +444,7 @@ def judge(bed: Bed) -> str:
         raise Failure(f"search does not mark the contradiction: {coffee}")
     changes = bed.garden("reconcile_review", {})["changes"]
     kinds = sorted(c["applied"] for c in changes)
-    if kinds != ["contradiction", "merged"] or not all(c["judge"].endswith("judge-v1")
+    if kinds != ["contradiction", "merged"] or not all(c["judge"].endswith("judge-v2")
                                                        for c in changes):
         raise Failure(f"review: {changes}")
     merge = next(c for c in changes if c["applied"] == "merged")

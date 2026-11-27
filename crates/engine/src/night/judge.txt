@@ -6,6 +6,6 @@ For every new fact, decide for each of its hints one relation:
 - contradiction: both cannot be true at the same time, and the new fact does not say that anything changed.
 - compatible: anything else, including the same topic with different facts that can both hold (two hobbies, two trips, two allergies). If unsure, it is compatible.
 
-Answer with one JSON object and nothing else. Name every new fact exactly once, by its ref, and list only the hints that are not compatible, using no other keys:
+Answer with one JSON object and nothing else. Name every new fact exactly once, by its ref, and list only the hints that are not compatible, using no other keys. A verdict of a new fact names only a ref from that fact's own "hints", never another earlier fact of the entity:
 {"items":[{"ref":"f812","verdicts":[{"hint":"f17","relation":"duplicate"}]},{"ref":"f813","verdicts":[{"hint":"f40","relation":"contradiction","note":"lives in Riga vs lives in Porto"}]},{"ref":"f814","verdicts":[]}]}
 A note says in one line, at most 200 characters, in the new fact's language, why; it is required for a contradiction and optional otherwise. Never write a secret value.
