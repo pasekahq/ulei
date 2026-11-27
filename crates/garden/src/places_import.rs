@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::api::{MAX_PLACE_ATTRS, MAX_PLACES_BATCH, as_f64};
 use crate::edge::normalise;
 use crate::model::UnixTime;
-use crate::places_wire::{BedWire, CallError, Rehearsal};
+use crate::places_wire::{BedWire, CallError, Rehearsal, write_refusal};
 use crate::wire::c7;
 
 const DAY: i64 = 86_400;
@@ -254,11 +254,10 @@ pub fn write(plan: &Plan, wire: &mut impl BedWire) -> Result<Written, ImportErro
     Ok(out)
 }
 
-/// The line of a refused `places_write` answer; only a daemon that breaks C7 leaves out its rule
-/// or message.
+/// The line of a refused place or attribute of a `places_write` answer.
 fn refusal(line: usize, rule: Option<c7::PlaceRefusal>, message: Option<&str>) -> RefusedLine {
-    let rule = rule.map_or("refused", c7::PlaceRefusal::as_str);
-    RefusedLine::new(line, rule, message.unwrap_or(rule))
+    let (rule, message) = write_refusal(rule, message);
+    RefusedLine::new(line, rule, message)
 }
 
 /// Where the parser is in the file.

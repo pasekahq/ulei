@@ -564,6 +564,11 @@ fn refused_commands(harbour: &str) -> Vec<(Vec<&str>, i32, Value)> {
             1,
             rule("invalid_request"),
         ),
+        (vec!["search", "--near", "NaN, -25.0032"], 2, usage()),
+        (vec!["search", "--near", "0.5041, inf"], 2, usage()),
+        (vec!["search", "--near", "5e-1, -25.0032"], 2, usage()),
+        (vec!["search", "--near", "90.5, -25.0032"], 2, usage()),
+        (vec!["search", "--near", "0.5041, -180.5"], 2, usage()),
         (vec!["add-candidate", "Saltmarsh Grill"], 2, usage()),
         (
             vec!["add-candidate", " ", "--source", "fixture-maps"],
@@ -661,5 +666,22 @@ fn every_refused_command_exits_non_zero_with_one_json_error_and_writes_nothing()
         }
         assert_eq!(answer, want, "{args:?}");
         assert_eq!(rows(&scratch.store()), before, "{args:?} wrote");
+    }
+}
+
+#[test]
+fn help_of_each_places_command_prints_the_usage_and_exits_zero() {
+    for sub in ["search", "add-candidate", "verdict"] {
+        let out = Command::new(GARDEN)
+            .args(["places", sub, "--help"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(out.status.code(), Some(0), "{sub}: {stdout}");
+        assert!(stdout.starts_with("usage: "), "{sub}: {stdout}");
+        assert!(
+            stdout.contains(&format!("ulei-garden places {sub} ")),
+            "{sub}: {stdout}"
+        );
     }
 }

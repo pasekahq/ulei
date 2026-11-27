@@ -65,6 +65,9 @@ fn main() -> ExitCode {
         && places == "places"
         && let Some(sub @ ("search" | "add-candidate" | "verdict")) = sub.to_str()
     {
+        if rest.iter().any(|a| a == "--help" || a == "-h") {
+            return help();
+        }
         return places_command(sub, rest);
     }
     let flag = match args.as_slice() {
@@ -72,12 +75,7 @@ fn main() -> ExitCode {
         [command, flag, path] if command == "serve" && flag == "--config" => {
             Some(PathBuf::from(path))
         }
-        [help] if help == "--help" || help == "-h" => {
-            return match std::io::stdout().lock().write_all(USAGE.as_bytes()) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(_) => ExitCode::from(1),
-            };
-        }
+        [flag] if flag == "--help" || flag == "-h" => return help(),
         _ => {
             let _ = std::io::stderr().write_all(USAGE.as_bytes());
             return ExitCode::from(2);
@@ -95,6 +93,14 @@ fn main() -> ExitCode {
     let line = serve(&settings);
     let _ = writeln!(std::io::stderr(), "garden: {line}");
     ExitCode::from(1)
+}
+
+/// Prints the usage on stdout.
+fn help() -> ExitCode {
+    match std::io::stdout().lock().write_all(USAGE.as_bytes()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(1),
+    }
 }
 
 /// The file, `--dry-run` and the `--config` path of `places import`, in any order.

@@ -27,6 +27,16 @@ pub enum CallError {
     Failed(String),
 }
 
+/// The rule and message of a refused place or attribute of a `places_write` answer; only a
+/// daemon that breaks C7 leaves out the rule or the message.
+pub(crate) fn write_refusal(
+    rule: Option<c7::PlaceRefusal>,
+    message: Option<&str>,
+) -> (&'static str, &str) {
+    let rule = rule.map_or("refused", c7::PlaceRefusal::as_str);
+    (rule, message.unwrap_or(rule))
+}
+
 /// The bed's C7 writes, served by the daemon or rehearsed in process.
 pub trait BedWire {
     /// C7 `places_write`.

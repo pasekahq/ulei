@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 
 use crate::api::as_f64;
 use crate::model::UnixTime;
-use crate::places_wire::{BedWire, CallError, Rehearsal, Socket};
+use crate::places::point;
+use crate::places_wire::{BedWire, CallError, Rehearsal, Socket, write_refusal};
 use crate::serve::socket;
 use crate::wire::c7;
 
@@ -189,16 +190,6 @@ fn parsed<T: std::str::FromStr>(flag: &str, value: Option<String>) -> Result<Opt
         .transpose()
 }
 
-/// A point `lat, lon` in degrees.
-fn point(value: &str) -> Result<c7::GeoPoint, CliError> {
-    let bad = || CliError::Usage(format!("--near {value:?} is not `lat, lon`"));
-    let (lat, lon) = value.split_once(',').ok_or_else(bad)?;
-    Ok(c7::GeoPoint {
-        lat: lat.trim().parse().map_err(|_| bad())?,
-        lon: lon.trim().parse().map_err(|_| bad())?,
-    })
-}
-
 /// The `PlacesSearchRequest` of `--request`, else of the filter flags.
 fn search_request(flags: &mut Flags) -> Result<c7::PlacesSearchRequest, CliError> {
     if let Some(json) = flags.one("--request")? {
@@ -230,7 +221,14 @@ fn search_request(flags: &mut Flags) -> Result<c7::PlacesSearchRequest, CliError
     };
     let req = c7::PlacesSearchRequest {
         filters: (filters != empty).then_some(filters),
-        near: flags.one("--near")?.as_deref().map(point).transpose()?,
+        near: flags
+            .one("--near")?
+            .map(|v| {
+                point(&v)
+                    .map(|(lat, lon)| c7::GeoPoint { lat, lon })
+                    .ok_or_else(|| CliError::Usage(format!("--near {v:?} is not a point")))
+            })
+            .transpose()?,
         open_now: flags.switch("--open-now")?.then_some(true),
         local_time: flags.one("--local-time")?,
         vibe: flags.one("--vibe")?,
@@ -256,11 +254,11 @@ fn one_place(answer: c7::PlacesWriteResponse) -> Result<c7::PlaceWritten, CliErr
     let [place] = <[c7::PlaceWritten; 1]>::try_from(answer.places)
         .map_err(|_| CliError::Failed("places_write: answer of another length".into()))?;
     let refused = |key: Option<&str>, rule: Option<c7::PlaceRefusal>, message: &Option<String>| {
-        let rule = rule.map_or("refused", c7::PlaceRefusal::as_str);
+        let (rule, message) = write_refusal(rule, message.as_deref());
         Refused {
             key: key.map(str::to_owned),
             rule: rule.to_owned(),
-            message: message.clone().unwrap_or_else(|| rule.to_owned()),
+            message: message.to_owned(),
         }
     };
     if place.outcome == c7::PlaceOutcome::Refused {

@@ -126,7 +126,8 @@ ulei-garden places verdict (--id ID | --name NAME) --verdict -1|0|+1 --source-re
 
 Clients of the daemon's socket (`garden.socket`), each printing one JSON object on stdout: the
 answer with exit 0, or an error with exit 1 (exit 2 for arguments that form no command; the
-import prints its usage on stderr then). `ulei-garden --help` lists every flag.
+import prints its usage on stderr then). `ulei-garden --help`, or `--help` after a places
+command, prints every flag on stdout.
 
 - `import` checks every line of a places file in the format of ADR-0080 section 4, rehearsing
   its writes on a scratch in-memory garden, and writes a file without a refused line through
