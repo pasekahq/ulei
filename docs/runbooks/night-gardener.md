@@ -210,6 +210,14 @@ runs after stage a or c met their limit; facts it leaves wait for the next night
 python3 ci/judge_eval.py --gateway <RUNTIME_DIR>/qb.sock --route small
 ```
 
+Without a qb route, the same eval runs through the Claude Code CLI on the account it is logged
+in to (each call a context-free headless session: empty working directory, the judge prompt as
+the whole system prompt, no tools; `--limit 6` is a cheap smoke run):
+
+```sh
+python3 ci/judge_eval.py --claude --model sonnet --out judge-eval.json
+```
+
 ## 7. The first full pass over an imported history
 
 Raise `max_usd` to `<BUDGET>` and run by hand, or let the timer do it night by night:

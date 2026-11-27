@@ -12,6 +12,16 @@ It calls a model, so it never runs in CI. Give it one endpoint:
 - ``--gateway SOCKET --route ALIAS``: the qb gateway (C4G) the night uses; qb holds the keys.
 - ``--openai-url URL --model NAME``: any OpenAI-compatible chat completions endpoint, the key
   in the environment variable ``JUDGE_EVAL_API_KEY``.
+- ``--claude [--model ALIAS] [--claude-bin PATH]``: the Claude Code CLI in headless mode, on
+  the account the CLI is logged in to (a subscription needs no key). Each call is a fresh,
+  context-free session: the CLI runs in an empty temporary directory (no CLAUDE.md, no
+  project memory), with the judge's prompt as the whole system prompt, no tools, no skills,
+  no MCP servers, no settings files and no saved session; the prompt goes in on stdin and the
+  answer is read from the JSON envelope. ``--timeout`` bounds each call; a timeout, a failed
+  exit or an unreadable envelope counts as a malformed answer (asked once more, then a failed
+  call). The cost the envelope reports is summed into ``usage.cost_usd``. Example:
+  ``python3 ci/judge_eval.py --claude --model sonnet --out judge-eval.json``; add
+  ``--limit 6`` for a cheap smoke run.
 
 and it prints, and writes as JSON to ``--out``:
 
@@ -34,7 +44,9 @@ import argparse
 import json
 import os
 import socket
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from collections import Counter
@@ -153,8 +165,10 @@ def parse(text: str, batch: list[dict]) -> dict[str, dict[str, tuple[str, str | 
 # Endpoints.
 
 class Reply:
-    def __init__(self, text: str, tokens_in: int, tokens_out: int, model: str | None) -> None:
+    def __init__(self, text: str, tokens_in: int, tokens_out: int, model: str | None,
+                 cost_usd: float = 0.0) -> None:
         self.text, self.tokens_in, self.tokens_out, self.model = text, tokens_in, tokens_out, model
+        self.cost_usd = cost_usd
 
 
 def c4g_call(path: str, route: str, system: str, prompt: str, max_tokens: int,
@@ -218,6 +232,38 @@ def openai_call(url: str, model: str, key: str, system: str, prompt: str, max_to
                  data.get("model", model))
 
 
+def claude_call(binary: str, model: str | None, system: str, prompt: str,
+                timeout: float) -> Reply:
+    """One headless Claude Code turn: an empty working directory, the judge's prompt as the
+    whole system prompt, no tools, skills, MCP servers, settings or saved session, the prompt
+    on stdin and the answer in the JSON envelope. A call that fails in any way returns an
+    empty answer, which the caller counts as malformed."""
+    argv = [binary, "-p", "--output-format", "json", "--system-prompt", system, "--tools", "",
+            "--disable-slash-commands", "--strict-mcp-config", "--setting-sources", "",
+            "--no-session-persistence"]
+    if model:
+        argv += ["--model", model]
+    try:
+        with tempfile.TemporaryDirectory(prefix="judge-eval-") as empty:
+            done = subprocess.run(argv, input=prompt, capture_output=True, text=True,
+                                  encoding="utf-8", cwd=empty, timeout=timeout)
+        if done.returncode != 0:
+            raise RuntimeError(f"exit {done.returncode}: {done.stderr.strip()[:200]}")
+        envelope = json.loads(done.stdout)
+        if envelope.get("is_error") or not isinstance(envelope.get("result"), str):
+            raise RuntimeError(f"error envelope: {str(envelope.get('result'))[:200]}")
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+        print(f"judge eval: claude call failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return Reply("", 0, 0, None)
+    u = envelope.get("usage") or {}
+    models = envelope.get("modelUsage") or {}
+    return Reply(envelope["result"],
+                 u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                 + u.get("cache_creation_input_tokens", 0),
+                 u.get("output_tokens", 0), next(iter(models), None),
+                 float(envelope.get("total_cost_usd") or 0.0))
+
+
 # Scoring.
 
 def score(cases: list[dict], said: dict[str, dict[str, tuple[str, str | None]] | None]) -> dict:
@@ -277,7 +323,8 @@ def run(cases: list[dict], call, per_call: int) -> tuple[dict, list[dict], dict]
     system = SYSTEM.read_text(encoding="utf-8")
     said: dict[str, dict | None] = {}
     records: list[dict] = []
-    usage = {"calls": 0, "failed_calls": 0, "tokens_in": 0, "tokens_out": 0, "model": None}
+    usage = {"calls": 0, "failed_calls": 0, "tokens_in": 0, "tokens_out": 0,
+             "cost_usd": 0.0, "model": None}
     for batch in batches(cases, per_call):
         prompt = render(batch)
         verdicts, why = None, None
@@ -286,6 +333,7 @@ def run(cases: list[dict], call, per_call: int) -> tuple[dict, list[dict], dict]
             usage["calls"] += 1
             usage["tokens_in"] += reply.tokens_in
             usage["tokens_out"] += reply.tokens_out
+            usage["cost_usd"] = round(usage["cost_usd"] + reply.cost_usd, 6)
             usage["model"] = reply.model or usage["model"]
             try:
                 verdicts = parse(reply.text, batch)
@@ -384,7 +432,9 @@ def main(argv: list[str]) -> int:
     p.add_argument("--gateway", help="the qb gateway's C4G socket")
     p.add_argument("--route", default="small", help="the C4G route alias (default small)")
     p.add_argument("--openai-url", help="an OpenAI-compatible chat completions URL")
-    p.add_argument("--model", help="the model name for --openai-url")
+    p.add_argument("--model", help="the model name for --openai-url, the alias for --claude")
+    p.add_argument("--claude", action="store_true", help="the Claude Code CLI, headless")
+    p.add_argument("--claude-bin", default="claude", help="the CLI binary (default claude)")
     p.add_argument("--batch", type=int, default=25, help="new facts per call (default 25)")
     p.add_argument("--max-tokens", type=int, default=8192)
     p.add_argument("--timeout", type=float, default=600)
@@ -393,9 +443,13 @@ def main(argv: list[str]) -> int:
     args = p.parse_args(argv)
     if args.self_test:
         return self_test()
-    if bool(args.gateway) == bool(args.openai_url):
-        p.error("give exactly one of --gateway and --openai-url")
-    if args.gateway:
+    if bool(args.gateway) + bool(args.openai_url) + args.claude != 1:
+        p.error("give exactly one of --gateway, --openai-url and --claude")
+    if args.claude:
+        def call(system: str, prompt: str) -> Reply:
+            return claude_call(args.claude_bin, args.model, system, prompt, args.timeout)
+        judge = args.model or "claude"
+    elif args.gateway:
         def call(system: str, prompt: str) -> Reply:
             return c4g_call(args.gateway, args.route, system, prompt, args.max_tokens,
                             args.timeout)
