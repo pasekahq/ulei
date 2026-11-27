@@ -38,7 +38,7 @@ Like the night gardener (ADR-0078), it is an owner-designed addition, not a port
    | `context` | at the start of the loop | `origin`, `text`: exactly what the sent copy of the input carries after the stored input (the whole turn context), `chars`, `images` |
    | `tools` | the first request of a tool set in this process | `hash` (16 hex digits of the SHA-256 of the set's JSON), `count`, `bytes`, `tools`: the C4G definitions as sent |
    | `request` | each model request, the summary request included | `request_id`, `start`, `end`, `ms` (the overloaded retries and the resend without thinking blocks inside), `messages`, `tools_hash`, `usage`, `route`, `stop` or `error` (debug text, at most 300 characters) |
-   | `tool` | each tool call, after its batch | `request_id` of its step, `id`, `name`, `start`, `end`, `ms`, `result_chars`, `is_error` |
+   | `tool` | each tool call, after its batch | `request_id` of its step, `id`, `name`, `start`, `end`, `ms`, `result_chars` (what the model gets), `is_error`, `spilled` (the result was saved to a file and the model got its preview, ADR-0016 section 3) |
    | `compaction` | each compaction | `trigger` (`threshold` or `context_too_long`), `start`, `end`, `ms`, `messages_before`, `messages_after`, `ok` |
    | `turn_end` | after the loop, before the journal append | `steps`, `ended` (debug text, at most 300 characters) |
 

@@ -23,7 +23,7 @@ use ulei_contracts::generated::c4g::{
 use crate::compress::{self, Compaction, Compression, MAX_COMPRESSION_ATTEMPTS};
 use crate::gateway::{Client, Error, Turn};
 use crate::policy::{Chain, Origin, StopDecision};
-use crate::tools::{Context, Interrupt, Registry, py_strip, squeeze, thousands};
+use crate::tools::{Context, Interrupt, Output, Registry, py_strip, squeeze, thousands};
 use crate::trace::{self, Trace};
 use empty::{EMPTY_REPLY, EMPTY_TOOL_RESPONSE_NUDGE, Guard, Recovery};
 
@@ -730,9 +730,20 @@ impl Agent<'_> {
             cwd: self.cwd,
             interrupt,
         };
-        let outputs = dispatch::run_calls(self.chain, self.tools, calls, ctx, self.batch_timeout);
+        let (mut outputs, spans): (Vec<Output>, Vec<dispatch::Span>) =
+            dispatch::run_calls(self.chain, self.tools, calls, ctx, self.batch_timeout)
+                .into_iter()
+                .unzip();
+        let window = self
+            .compaction
+            .as_ref()
+            .and_then(|c| c.window)
+            .map(|w| w.context_length);
+        let spilled = self.tools.persist_step(calls, &mut outputs, window);
         if let Some(trace) = self.trace {
-            for (call, (output, (start, end))) in calls.iter().zip(&outputs) {
+            for (((call, output), (start, end)), spilled) in
+                calls.iter().zip(&outputs).zip(&spans).zip(&spilled)
+            {
                 trace.record(
                     "tool",
                     serde_json::json!({
@@ -744,6 +755,7 @@ impl Agent<'_> {
                         "ms": trace::millis(*start, *end),
                         "result_chars": output.content.chars().count(),
                         "is_error": output.is_error,
+                        "spilled": spilled,
                     }),
                 );
             }
@@ -751,7 +763,7 @@ impl Agent<'_> {
         let results = calls
             .iter()
             .zip(outputs)
-            .map(|(call, (output, _))| Block {
+            .map(|(call, output)| Block {
                 id: Some(call.id.clone()),
                 content: Some(output.content),
                 is_error: Some(output.is_error),

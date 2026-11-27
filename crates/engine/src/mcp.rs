@@ -22,6 +22,7 @@ use ulei_contracts::generated::c4g;
 pub use client::Endpoint;
 pub use recovery::{Clock, SystemClock};
 use recovery::{Link, MAX_INITIAL_CONNECT_RETRIES};
+pub(crate) use tools::ELISION_NOTICE;
 use tools::Utility;
 
 use crate::config::{self, Config, Fault, ItemSetting};
