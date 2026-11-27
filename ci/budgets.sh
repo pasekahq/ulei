@@ -406,7 +406,6 @@ if [ "$crowded_bytes" -gt "$garden_max_write_bytes" ]; then echo "::error::ulei-
 places=$(measured places_search_p95_us)
 places_line="ulei-garden places_search p95 over $(measured places_search_calls) connections on $(measured places_count) places: ${places} us, $(measured places_search_hits) answered with a place (budget ${garden_max_places_us} us)"
 echo "$places_line"
-notice ulei-garden-places "$places_line"
 if [ "$places" -gt "$garden_max_places_us" ]; then echo "::error::ulei-garden places_search p95 ${places} us > ${garden_max_places_us} us"; fail=1; fi
 
 hwm=$(measured vmhwm_kb)
@@ -416,7 +415,7 @@ if [ "$hwm" -gt "$garden_max_rss_kb" ]; then echo "::error::ulei-garden peak RSS
 wakeups=$(measured idle_wakeups)
 echo "ulei-garden voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle after $(measured published_misses) misses published: ${wakeups} (budget ${garden_max_idle_wakeups})"
 if [ "$wakeups" -gt "$garden_max_idle_wakeups" ]; then echo "::error::ulei-garden woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
-notice ulei-garden "binary $size B (budget $garden_max_bytes B); VmHWM after $requests requests $hwm kB (budget $garden_max_rss_kb kB); ready median $ready us (budget $garden_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $garden_max_idle_wakeups); pointers p50 $pointers us (budget $garden_max_pointers_us us); search p50 $search us (budget $garden_max_search_us us); write $seeded B per seedbed write and $processed B per processed record (budget $garden_max_write_bytes B each); propose p50 $propose us (no budget); crowded night of $night_records records on one person $crowded_bytes B per processed record and seedbed_done p50 $crowded_done us per batch, control night on $(measured control_entities) people $control_bytes B and $control_done us (budget $garden_max_write_bytes B each, p50 no budget)"
+notice ulei-garden "binary $size B (budget $garden_max_bytes B); VmHWM after $requests requests $hwm kB (budget $garden_max_rss_kb kB); ready median $ready us (budget $garden_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $garden_max_idle_wakeups); pointers p50 $pointers us (budget $garden_max_pointers_us us); search p50 $search us (budget $garden_max_search_us us); write $seeded B per seedbed write and $processed B per processed record (budget $garden_max_write_bytes B each); propose p50 $propose us (no budget); crowded night of $night_records records on one person $crowded_bytes B per processed record and seedbed_done p50 $crowded_done us per batch, control night on $(measured control_entities) people $control_bytes B and $control_done us (budget $garden_max_write_bytes B each, p50 no budget); places_search p95 $places us over $(measured places_search_calls) calls on $(measured places_count) places, $(measured places_search_hits) answered with a place (budget $garden_max_places_us us)"
 
 embed="${8:-target/x86_64-unknown-linux-gnu/release/ulei-garden-embed}"
 embed_max_bytes="${ULEI_GARDEN_EMBED_MAX_BINARY_BYTES:-2097152}"
