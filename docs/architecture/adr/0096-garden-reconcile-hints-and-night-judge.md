@@ -200,7 +200,8 @@ and correct on their own initiative, and an agent may offer it, but no routine m
   (a `duplicate` or `supersedes` on a compatible pair), recall per relation on cases whose gold
   fact is among the hints, and the supersedes/contradiction confusion. It calls a model, so it
   runs only by hand with a qb gateway socket or an OpenAI-compatible endpoint and key from the
-  environment, never in CI.
+  environment, never in CI. Its provisional pass thresholds (`--gate`) are in
+  `docs/runbooks/night-gardener.md` section 6.
 
 ## Consequences
 
