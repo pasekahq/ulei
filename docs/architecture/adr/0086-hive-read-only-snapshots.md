@@ -20,7 +20,7 @@ everything the owner asks about the hive's work:
 - the history of a card: every round's report, start and end, who ran it (worker or reviewer,
   model, effort);
 - which run and unit belong to which card;
-- why a queued card does not start: the slot limit and its urgent reserve, who holds each slot
+- why a queued card does not start: the slot limit of its class, who holds each slot
   (series runs and reviewers too, which the board does not show), the queue position, holds,
   backoff, blockers and budget waits;
 - series: their rules, next starts, runs, and whether one holds a slot;

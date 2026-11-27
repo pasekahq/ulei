@@ -513,10 +513,13 @@ jobs:
           cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
       # The checks below run even after an earlier one failed, so one run shows every result as
       # an annotation; any failed check fails the job.
+      # The passed checks of each of these two steps fold into one notice, one line per unit: GitHub
+      # keeps at most 10 notices per step and 50 annotations per job. A failure is an error of its own.
       - name: Exposure of every unit within its threshold
         if: ${{ !cancelled() }}
         run: |
           status=0
+          passed=""
           for unit in deploy/systemd/*.service; do
             name="${unit##*/}"
             case "$name" in
@@ -536,17 +539,20 @@ jobs:
               status=1
               continue
             fi
-            echo "::notice title=exposure $name::measured $measured, threshold $limit"
             if [ "${measured/./}" -gt "$threshold" ]; then
               echo "::error title=exposure $name::measured $measured is above the threshold $limit"
               status=1
+            else
+              passed="$passed${passed:+%0A}$name: measured $measured, threshold $limit"
             fi
           done
+          if [ -n "$passed" ]; then echo "::notice title=exposure within threshold::$passed"; fi
           exit "$status"
       - name: Verify the units
         if: ${{ !cancelled() }}
         run: |
           status=0
+          passed=""
           for unit in deploy/systemd/*.service deploy/systemd/*.timer deploy/systemd/*.slice; do
             name="${unit##*/}"
             out=$(systemd-analyze --user verify "$unit" 2>&1) && rc=0 || rc=$?
@@ -555,9 +561,12 @@ jobs:
               echo "::error title=verify $name::exit $rc: $(grep -F "$name" <<<"$out" | tail -n 1)"
               status=1
             else
-              echo "::notice title=verify $name::systemd-analyze --user verify passed"
+              passed="$passed${passed:+%0A}$name"
             fi
           done
+          if [ -n "$passed" ]; then
+            echo "::notice title=verify passed::systemd-analyze --user verify passed:%0A$passed"
+          fi
           exit "$status"
       - name: Load the installed units
         if: ${{ !cancelled() }}
