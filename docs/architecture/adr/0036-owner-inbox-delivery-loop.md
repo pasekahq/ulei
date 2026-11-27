@@ -211,12 +211,18 @@ The ack, as `Receipt.invoke` and `Receipt.complete`, with `kind` from the claime
 |---|---|
 | `inject` not accepted, or failed before an accept (PLUGIN.md section 6) | `retry`, 15 s |
 | `status` turn `dropped` or `unknown` | `ack` `uncertain` |
-| `ended`, `delivery` `no_answer` or `send_failed` | `ack` `uncertain` |
+| `ended`, `delivery` `no_answer`, `outcome` `quota_exhausted`, `tools_ran` false | `ack` `deferred`, re-offered at `resets_at`, else after 3,600 s (`deferred-exhausted` after 3 offers) |
+| `ended`, `delivery` `no_answer` or `send_failed`, any other report | `ack` `uncertain` |
 | `ended`, `delivery` `sent` | `ack` `success` |
 | `ended`, `delivery` `silent_done`, kind not `weekly` | `ack` `silent` |
 | `ended`, `delivery` `silent`, kind not `weekly` | `ack` `deferred` (re-offered after 3,600 s, `deferred-exhausted` after 3 offers) |
 | `ended`, `delivery` `silent` or `silent_done`, kind `weekly` | `ack` `silent` |
 | `ended`, no `delivery` before the lease runs out | None; `recover` marks it `uncertain` (`expired-processing`) |
+
+The quota row departs from the reference, which acks every unconsumed turn `uncertain`: a turn
+that ran no tool and sent no answer did nothing the owner could see, so offering its event again
+once the quota resets cannot act twice. A report without `tools_ran` or `outcome`, such as a
+`last_turn` read back from the journal, may hide an action and acks `uncertain`.
 
 `success` therefore needs a send that Telegram confirmed; every other path is `silent`,
 `deferred` or `uncertain`. The reference's `uncertain` for a blank consumed weekly answer has no

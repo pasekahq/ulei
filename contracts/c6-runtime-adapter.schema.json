@@ -299,6 +299,15 @@
           "type": "string",
           "description": "The one line an ended turn reports instead of an answer: for `quota_exhausted` the route and its nearest reset in UTC, for `context_exhausted` and `failed` the reason. Absent for the other outcomes."
         },
+        "resets_at": {
+          "type": "integer",
+          "description": "Unix time of the nearest quota reset the model gateway named for a `quota_exhausted` turn; absent for the other outcomes and when the reset is unknown.",
+          "minimum": 0
+        },
+        "tools_ran": {
+          "type": "boolean",
+          "description": "Whether the turn ran any tool call; present only on an `ended` turn whose runtime knows it. Absent means unknown, so the turn may have acted."
+        },
         "delivery": {
           "$ref": "#/$defs/Delivery",
           "description": "What the channel did with the answer; present only on an `ended` inbox turn the channel reported."

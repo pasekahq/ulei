@@ -17,7 +17,7 @@ use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
 use serde_json::Value;
 use ulei_contracts::generated::c1::AckOutcome;
 use ulei_contracts::generated::c6::{
-    Delivery, InjectRequest, InjectResponse, StatusRequest, TurnState,
+    Delivery, InjectRequest, InjectResponse, StatusRequest, TurnOutcome, TurnReport, TurnState,
 };
 
 use crate::c6::{self, Client};
@@ -346,17 +346,21 @@ impl Consumer {
         else {
             return Ok(Wait::Tick);
         };
-        let outcome = match (report.state, report.delivery) {
+        let (outcome, until) = match (report.state, report.delivery) {
             (TurnState::Queued | TurnState::Running, _) => return Ok(Wait::Tick),
             (TurnState::Ended, None) => {
                 flight.ended = true;
                 return Ok(Wait::Tick);
             }
-            (TurnState::Ended, Some(delivery)) => ack_outcome(delivery, &flight.kind),
-            (TurnState::Dropped | TurnState::Unknown, _) => AckOutcome::Uncertain,
+            (TurnState::Ended, Some(delivery)) => settle(&report, delivery, &flight.kind),
+            (TurnState::Dropped | TurnState::Unknown, _) => (AckOutcome::Uncertain, None),
         };
-        self.inbox
-            .ack(&flight.id, &flight.lease, outcome.as_str(), now()?)?;
+        match until {
+            Some(until) => self.inbox.defer(&flight.id, &flight.lease, until)?,
+            None => self
+                .inbox
+                .ack(&flight.id, &flight.lease, outcome.as_str(), now()?)?,
+        };
         self.flight = None;
         Ok(Wait::Now)
     }
@@ -466,6 +470,21 @@ fn replays(e: &c6::Error) -> bool {
             false
         }
     }
+}
+
+/// The ack of the ended turn `report` the channel settled as `delivery`, for an event of `kind`,
+/// with the time a `deferred` one is available again when it is not the default. A
+/// `quota_exhausted` turn that ran no tool and consumed nothing waits for its quota's reset.
+fn settle(report: &TurnReport, delivery: Delivery, kind: &str) -> (AckOutcome, Option<f64>) {
+    let quota_wait = delivery == Delivery::NoAnswer
+        && report.outcome == Some(TurnOutcome::QuotaExhausted)
+        && report.tools_ran == Some(false);
+    if !quota_wait {
+        return (ack_outcome(delivery, kind), None);
+    }
+    #[allow(clippy::cast_precision_loss, reason = "a Unix time is exact in f64")]
+    let until = report.resets_at.map(|at| at as f64);
+    (AckOutcome::Deferred, until)
 }
 
 /// The ack of an ended turn's `delivery` for an event of `kind` (`Receipt.complete`).

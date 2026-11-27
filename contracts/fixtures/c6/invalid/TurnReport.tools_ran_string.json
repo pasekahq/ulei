@@ -1,0 +1,7 @@
+{
+  "turn": "owner:9",
+  "state": "ended",
+  "outcome": "quota_exhausted",
+  "ended": 1893456100.25,
+  "tools_ran": "no"
+}

@@ -166,6 +166,15 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
 
+## C6 0.13.0
+- The facts behind the ack of a quota-exhausted inbox turn (additive, ADR-0036 section 7):
+  `TurnReport` gains optional `resets_at`, the Unix time of the nearest quota reset the model
+  gateway named for a `quota_exhausted` turn, and optional `tools_ran`, whether the turn ran any
+  tool call. The engine sets `tools_ran` on every turn its loop ran and `resets_at` when the
+  gateway named one; a `last_turn` read back from the journal holds neither, and an absent field
+  means unknown. `TurnReport` is closed, so `ulei-inbox`, `ulei-tg` and `ulei-engine` deploy
+  together for C6 0.13.0.
+
 ## C6 0.12.0
 - A global `set_route` (additive, ADR-0094): `SetRouteRequest` gains optional `global`. With it
   the runtime stores the alias with the session as before and also as its default route, which

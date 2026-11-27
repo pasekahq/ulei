@@ -258,6 +258,7 @@ fn c6_fixtures_match_the_types() {
     roundtrip::<c::TurnOutcome>("c6/valid/TurnOutcome.quota_exhausted.json");
     roundtrip::<c::TurnReport>("c6/valid/TurnReport.completed.json");
     roundtrip::<c::TurnReport>("c6/valid/TurnReport.delivered.json");
+    roundtrip::<c::TurnReport>("c6/valid/TurnReport.quota_exhausted.json");
     roundtrip::<c::TurnReport>("c6/valid/TurnReport.running.json");
     roundtrip::<c::TurnReport>("c6/valid/TurnReport.unknown.json");
     roundtrip::<c::TurnState>("c6/valid/TurnState.dropped.json");

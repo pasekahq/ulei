@@ -685,7 +685,8 @@ Pass: one message and `success`. Fail, by the row: `pending` with `attempts` 0 (
 `journalctl --user -u ulei-inbox`; or `channel: down`); `uncertain` (the turn gave no answer or
 the send failed: `no_answer`, `send_failed`); `done` with `silent`, or `deferred` (the model
 answered with a silence marker: republish under a new id with a payload that asks for an
-owner-facing line).
+owner-facing line; or the route ran out of quota before any tool ran: the event is offered again
+at the reset).
 
 Roll back: none; C1 keeps the settled row, and its id cannot be published again with other
 content (`conflict`).
