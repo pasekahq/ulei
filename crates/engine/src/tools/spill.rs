@@ -100,6 +100,7 @@ impl Budget {
     /// This budget on a route of `context_length` tokens: unchanged for an unknown window or
     /// one large enough, else the thresholds of one result and of the step cut to their share
     /// of the window, never below the floors nor above this budget's own values.
+    #[must_use]
     pub fn for_window(&self, context_length: Option<u64>) -> Self {
         let Some(tokens) = context_length.filter(|&t| t > 0) else {
             return *self;
