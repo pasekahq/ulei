@@ -11,6 +11,7 @@ mod support {
     pub(crate) mod fake_clock;
     pub(crate) mod files;
     pub(crate) mod process;
+    pub(crate) mod scratch;
 }
 
 use std::fs;
@@ -18,7 +19,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -27,6 +27,7 @@ use support::fake_c6::{Answer, FakeC6, Gate};
 use support::fake_clock::FakeClock;
 use support::files::saved;
 use support::process::{finish, sigterm, stderr};
+use support::scratch::Scratch;
 use ulei_channels::bot_api::{Client, Config, Sender, Stop};
 use ulei_channels::ingress::{
     FileSource, Ingress, IngressConfig, Output as IngressOutput, Ports, ReactionConfig, RemoteFile,
@@ -43,36 +44,6 @@ const OTHER_CHAT: i64 = 1002;
 const WAIT: Duration = Duration::from_secs(5);
 const JPEG: &[u8] = b"\xff\xd8\xff\xe0jpeg";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\npng";
-
-/// A private scratch directory and an engine socket path beside it, removed on drop.
-struct Scratch {
-    dir: PathBuf,
-    socket: PathBuf,
-}
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("ulei-tg-{pid}-{n}-{tag}"));
-        fs::create_dir_all(&dir).expect("scratch dir");
-        // Outside `dir`: a Unix socket path has at most 107 bytes.
-        let socket = std::env::temp_dir().join(format!("tg-{pid}-{n}.sock"));
-        Self { dir, socket }
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-        let _ = fs::remove_file(&self.socket);
-    }
-}
 
 /// Writes the token file (mode `token_mode`) and `ulei.toml` pointing at `fake`; `owner_ids`
 /// goes in only when `with_owner` holds, `extra` lines close the `[telegram]` section.
@@ -95,7 +66,7 @@ fn write_config(
         "[engine]\nc6_socket = \"{socket}\"\n\n[telegram]\n\
          token_file = \"{token}\"\n{owner}attachments_dir = \"{inbox}\"\n\
          base_url = \"{base}\"\nfile_base_url = \"{files}\"\npoll_timeout = 1\nread_timeout = 2\n{extra}",
-        socket = dir.socket.display(),
+        socket = dir.socket("c6").display(),
         token = token.display(),
         inbox = dir.path("inbox").display(),
         base = fake.base_url(),
@@ -154,7 +125,7 @@ fn wait_for_offset(fake: &FakeBotApi, offset: i64) {
 /// A fake engine on the socket of `dir`'s config that accepts the next `turns` turns, each of
 /// which ends completed without an answer.
 fn engine_taking(dir: &Scratch, turns: usize) -> FakeC6 {
-    let engine = FakeC6::start(&dir.socket);
+    let engine = FakeC6::start(&dir.socket("c6"));
     for n in 0..turns {
         engine.script(
             "submit_turn",
@@ -900,7 +871,7 @@ fn sigterm_while_a_turn_is_followed_exits_zero() {
     let dir = Scratch::new("followed");
     let config = write_config(&dir, &fake, 0o600, true, "coalesce_quiet = 0\n");
     bot_user(&fake);
-    let engine = FakeC6::start(&dir.socket);
+    let engine = FakeC6::start(&dir.socket("c6"));
     engine.script(
         "submit_turn",
         support::fake_c6::ok(
@@ -1365,7 +1336,7 @@ fn voice_run(tag: &str, transcriptions: Vec<Reply>, extra: &str) -> VoiceRun {
     for id in [100, 101, 102] {
         fake.script("sendMessage", ok(json!({ "message_id": id })));
     }
-    let engine = FakeC6::start(&dir.socket);
+    let engine = FakeC6::start(&dir.socket("c6"));
     let submitted = Gate::new();
     engine.script("submit_turn", Answer::Held(submitted.clone()));
     engine.script(

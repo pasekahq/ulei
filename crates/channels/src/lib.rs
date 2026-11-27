@@ -8,6 +8,7 @@
 pub mod bot_api;
 pub mod c6;
 pub mod ingress;
+pub mod notify;
 pub mod render;
 pub mod stt;
 pub mod tg;

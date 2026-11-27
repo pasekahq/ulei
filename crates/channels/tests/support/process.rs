@@ -60,3 +60,7 @@ pub(crate) fn dead(pid: &str) -> bool {
         thread::sleep(Duration::from_millis(10));
     }
 }
+
+pub(crate) fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}

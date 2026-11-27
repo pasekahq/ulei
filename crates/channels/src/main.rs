@@ -1,10 +1,12 @@
 //! `ulei-tg`: the owner's Telegram channel (ADR-0032). SIGTERM and SIGINT stop it after the
 //! pending work is handed on, the offset is confirmed, the queued engine calls are made, the
 //! readers of the turns and the inbox thread stop and the queued messages are sent.
+//! `ulei-tg notify` sends one technical notice from stdin or a file (ADR-0097) and exits.
 
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -12,17 +14,27 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use signal_hook::consts::{SIGINT, SIGTERM};
+use ulei_channels::bot_api::Client;
 use ulei_channels::bot_api::{Sender, Stop, SystemClock};
 use ulei_channels::c6;
-use ulei_channels::tg::{Channel, Inbox, Link, Outbound, SentTexts, Settings};
+use ulei_channels::notify::{self, MAX_TEXT_BYTES};
+use ulei_channels::tg::{Channel, Inbox, Link, Outbound, SentTexts, Settings, Transport};
 
-const USAGE: &str = "usage: ulei-tg [--config PATH] | ulei-tg --version\n";
+const USAGE: &str = "usage: ulei-tg [--config PATH] | ulei-tg --version\n       \
+                     ulei-tg notify [--config PATH] [--file PATH]\n";
 
 const EXIT_FAILURE: u8 = 1;
 const EXIT_USAGE: u8 = 2;
+/// `notify` refused the config or the text before any message went out.
+const EXIT_REFUSED: u8 = 3;
+/// Largest input `notify` reads; room for whitespace around a text of `MAX_TEXT_BYTES`.
+const MAX_INPUT_BYTES: usize = 2 * MAX_TEXT_BYTES;
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "notify") {
+        return notify_main(&args[1..]);
+    }
     let path = match args.as_slice() {
         [] => None,
         [flag] if flag == "--version" => {
@@ -32,10 +44,7 @@ fn main() -> ExitCode {
             };
         }
         [flag, path] if flag == "--config" => Some(Path::new(path)),
-        _ => {
-            let _ = io::stderr().write_all(USAGE.as_bytes());
-            return ExitCode::from(EXIT_USAGE);
-        }
+        _ => return usage(),
     };
     match serve(path) {
         Ok(()) => ExitCode::SUCCESS,
@@ -44,6 +53,73 @@ fn main() -> ExitCode {
             ExitCode::from(EXIT_FAILURE)
         }
     }
+}
+
+/// `ulei-tg notify [--config PATH] [--file PATH]`: the receipt on stdout and exit 0, else one
+/// stderr line and `EXIT_REFUSED` before any send or `EXIT_FAILURE` after one may have gone out.
+fn notify_main(args: &[OsString]) -> ExitCode {
+    let (mut config, mut file) = (None, None);
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let slot = match flag.to_str() {
+            Some("--config") => &mut config,
+            Some("--file") => &mut file,
+            _ => return usage(),
+        };
+        match rest.next() {
+            Some(value) if slot.is_none() => *slot = Some(Path::new(value)),
+            _ => return usage(),
+        }
+    }
+    let (code, line) = match send_notice(config, file) {
+        Ok(receipt) => match writeln!(io::stdout().lock(), "{receipt}") {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(e) => (EXIT_FAILURE, format!("stdout: {e}")),
+        },
+        Err(failed) => failed,
+    };
+    let _ = writeln!(io::stderr().lock(), "ulei-tg notify: {line}");
+    ExitCode::from(code)
+}
+
+/// The receipt line of the notice read from `file` or stdin, or the exit code and the line
+/// saying why it was not sent whole.
+fn send_notice(config: Option<&Path>, file: Option<&Path>) -> Result<String, (u8, String)> {
+    let refused = |line: String| (EXIT_REFUSED, line);
+    let transport = Transport::load(config).map_err(|e| refused(e.to_string()))?;
+    let bytes = match file {
+        Some(path) => File::open(path)
+            .and_then(read_bounded)
+            .map_err(|e| refused(format!("{}: {e}", path.display())))?,
+        None => read_bounded(io::stdin().lock()).map_err(|e| refused(format!("stdin: {e}")))?,
+    };
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(refused(format!(
+            "the input is over {MAX_INPUT_BYTES} bytes"
+        )));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| refused("the text is not UTF-8".to_owned()))?;
+    let sender = Sender::new(Client::new(transport.bot), Arc::new(SystemClock));
+    match notify::notify(&sender, &transport.owner_ids, &text) {
+        Ok(receipt) => Ok(receipt.to_line()),
+        Err(e) if e.is_refusal() => Err(refused(e.to_string())),
+        Err(e) => Err((EXIT_FAILURE, e.to_string())),
+    }
+}
+
+/// The bytes of `input` up to one past `MAX_INPUT_BYTES`, so an over-long input is seen
+/// without reading all of it.
+fn read_bounded(input: impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    input
+        .take(MAX_INPUT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn usage() -> ExitCode {
+    let _ = io::stderr().write_all(USAGE.as_bytes());
+    ExitCode::from(EXIT_USAGE)
 }
 
 /// Runs the channel until a signal or a fatal error; the line saying why it failed.
