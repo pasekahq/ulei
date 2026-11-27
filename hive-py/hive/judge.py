@@ -1,8 +1,9 @@
 """One-shot judge of a head card: one C4G turn on the route alias the config maps from the card's step.
 
 The answer's first `VERDICT:` line gives `done`, optionally followed by notes, or `rework` or `disputed` followed by the
-reason. A rework is only for missing or wrong work; gaps in how the report presents it are notes on a `done`, which
-start no round. `disputed` is no failure: the worker's evidence says the task itself is wrong, and the card's author
+reason. A rework is only for missing or wrong work: at most 3 essential defects, each naming the criterion it fails,
+then minor gaps under `Notes:`, which go to the author and not to the next worker. Gaps in how the report presents
+finished work are notes on a `done`, which start no round. `disputed` is no failure: the worker's evidence says the task itself is wrong, and the card's author
 decides.
 """
 import re
@@ -14,6 +15,7 @@ REPORT_CHARS = 12000
 GATE_CHARS = 2000
 REVIEW_CHARS = 4000
 VERDICT_RE = re.compile(r'VERDICT:\s*(done|rework|disputed)\b\W*(.*)$', re.I)
+NOTES_RE = re.compile(r'[#*_ ]*notes\b[*_ ]*(?:\([^)]*\))?[*_ ]*(?::[*_ ]*(.*)|$)', re.I)
 SYSTEM = '\n'.join([
     'You are the JUDGE of a finished task. Compare the result in the worker report with the task: its goal, its',
     'acceptance command (it already passed) and its judge criteria, and with the review if there is one.',
@@ -41,12 +43,16 @@ SYSTEM = '\n'.join([
     'Before a rework, ask whether the owner would wait another round for the missing items. When the deliverable is',
     'done and correct and only notes are missing, the answer is no: `VERDICT: done` with the notes.',
     "Do not accept a worker's reason for skipping required work unless its evidence shows the work is not needed.",
-    'A review FAIL is weighed by the same rule: a FAIL that lists only notes is `VERDICT: done` with the notes.',
+    'A review FAIL is weighed by the same rule: a FAIL that lists only notes is `VERDICT: done` with the notes, and',
+    'the items under its `Notes` heading are notes.',
     'The FIRST line of your answer is exactly `VERDICT: done`, `VERDICT: rework` or `VERDICT: disputed`.',
     'After `VERDICT: done`, you may add short notes on minor gaps for the card author; they start no new round.',
-    'After `VERDICT: rework`, the next lines say what is missing or wrong and what must change; the next worker',
-    'reads them as its instructions. Name the essential defects first; then list the minor gaps as optional, so one',
-    'round fixes everything.',
+    'After `VERDICT: rework`, the next lines are a numbered list of at most 3 essential defects. Each item names the',
+    'criterion, the part of the goal or the rule it fails, then says what is missing or wrong and what must change.',
+    'The next worker reads this list as its instructions, so nothing minor goes in it. With more than 3 essential',
+    'defects, name the 3 that matter most.',
+    'Minor gaps go after the list, under a line `Notes:`, one per line. The notes go to the card author, not to the',
+    'next worker, and they are never a reason for the rework.',
     'Answer `VERDICT: disputed` when the dispute is about the task itself, not the work: the worker reports',
     '`RESULT: disputed`, or its evidence says the premise, a required artifact or the criteria are wrong and the',
     'task text cannot settle it. Do not fail it and do not ask for rework: the card goes to its author, who decides.',
@@ -76,6 +82,17 @@ def prompt(card, report, gate, review):
     if review is not None:
         parts += ['', f"## Review: VERDICT {review['verdict']}", clip(review['report'] or '(no text)', REVIEW_CHARS)]
     return '\n'.join(parts)
+
+
+def split_notes(text):
+    """(instructions, notes) of a rework or a review: the text before its first line that opens the notes (`Notes:`,
+    `## Notes`, `**Notes (minor):** first note`), and the notes from that line on; notes is '' without such a line."""
+    lines = (text or '').splitlines()
+    for i, line in enumerate(lines):
+        m = NOTES_RE.match(line.strip())
+        if m:
+            return '\n'.join(lines[:i]).strip(), '\n'.join([m.group(1) or ''] + lines[i + 1:]).strip()
+    return (text or '').strip(), ''
 
 
 def verdict(text):

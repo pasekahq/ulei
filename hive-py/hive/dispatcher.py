@@ -576,7 +576,8 @@ class Dispatcher:
                 self.fail_broken(c, r)
                 return 1
             why = f"review {r['verdict'] or 'no verdict'} by {r['model']}" if r['status'] == 'exited' else f"reviewer {r['status']}"
-            self.fail(c, why, feedback=(r['report'] or '')[:4000])
+            todo = judge.split_notes(r['report'])[0]  # the review's Notes are for the author, not the next round
+            self.fail(c, why, feedback=(todo or r['report'] or '')[:4000])
             return 1
 
     def panel_runs(self, c, round_no):
@@ -945,8 +946,14 @@ class Dispatcher:
             data = {'round': c['round'], 'route': self.cfg['judge']['routes'][c['step']]}
             if c['tag'] is not None:
                 data['tag'] = c['tag']
+            notes = ''
+            if found is not None and found[0] == 'rework':
+                # The notes under a rework go to the author, not to the next worker; a rework of notes only is a done.
+                todo, notes = judge.split_notes(found[1])
+                found, notes = (('rework', todo), notes) if todo else (('done', notes), '')
             if found is not None:
-                store.event(self.conn, c['id'], 'judge', {**data, 'verdict': found[0], 'reason': found[1]})
+                store.event(self.conn, c['id'], 'judge', {**data, 'verdict': found[0], 'reason': found[1],
+                                                          **({'notes': notes} if notes else {})})
                 verdict, reason = found
                 if verdict == 'rework' and self.worker_disputes(cur):
                     verdict = 'disputed'  # a dispute about the task is never failed: its author decides
