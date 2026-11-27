@@ -14,7 +14,7 @@ Placeholders. Fill them on the host only; never write a value into this reposito
 | `<ULEI_CHECKOUT>`, `<RELEASE_DIR>` | A checkout of the release's commit and the release directory, as in `docs/runbooks/mvp-pilot-cutover.md` 1.3. |
 | `<CONFIG_HOME>` | `$XDG_CONFIG_HOME` of the account (default `$HOME/.config`). |
 | `<UID>` | The account's uid (`id -u`). |
-| `<DEVICE>` | The block device of the data, such as `/dev/vdz`: `findmnt -no SOURCE -T <data dir>`, its whole disk from `lsblk -no PKNAME <partition>`. |
+| `<DEVICE>` | The physical disk of the data, such as `/dev/vdz`: `findmnt -no SOURCE -T <data dir>`, then the disk below that partition and any device-mapper layer, `lsblk -nso NAME,TYPE <source>` (the line of type `disk`). |
 | `<READ_IOPS>`, `<WRITE_IOPS>` | What `<DEVICE>` sustains in random 4 KiB reads and writes, from the provider's figure or a measurement with a random 4 KiB O_DIRECT reader. |
 | `<HIVE_CONFIG>` | The Hive's config file (`HIVE_CONFIG` of the dispatcher). |
 | `<MANAGER>` | `/sys/fs/cgroup/user.slice/user-<UID>.slice/user@<UID>.service`. |

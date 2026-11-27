@@ -3,7 +3,7 @@ the user manager.
 
 ``python3 ci/io_classes_run.py RELEASE_DIR WORKDIR`` writes a 1 GiB data file in WORKDIR on the
 runner's disk, installs the class slices with ``deploy/install.sh`` from a synthetic ``[host.io]``
-naming that disk with 300 read and 300 write IOPS, and puts them into the user manager. Under an
+naming the physical disk under it with 300 read and 300 write IOPS, and puts them into the user manager. Under an
 uncapped random 4 KiB O_DIRECT read load of 8 threads at the idle IO class, it runs two probe
 readers at once, one 4 KiB O_DIRECT read every 50 ms each: one in ``hive-urgent.slice`` at
 ``CPUWeight=1000`` and the best-effort IO class at level 0, one in ``background.slice`` at the idle
@@ -92,12 +92,21 @@ def probe(path: str, count: int, interval: float) -> None:
 
 
 def disk_of(path: Path) -> tuple[str, str, str]:
-    """The whole disk under ``path``'s filesystem: its name, ``MAJ:MIN`` and active scheduler."""
+    """The physical disk under ``path``'s filesystem, below its partition and any device-mapper
+    layers (the first of their ``slaves``): its name, ``MAJ:MIN`` and active scheduler."""
     dev = os.stat(path).st_dev
     block = Path(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}").resolve()
-    if (block / "partition").exists():
-        block = block.parent
-    scheduler = (block / "queue/scheduler").read_text(encoding="ascii").split()
+    while True:
+        if (block / "partition").exists():
+            block = block.parent
+        slaves = sorted((block / "slaves").iterdir()) if (block / "slaves").is_dir() else []
+        if not slaves:
+            break
+        block = slaves[0].resolve()
+    scheduler_file = block / "queue/scheduler"
+    if not scheduler_file.exists():
+        raise Failure(f"{block.name} under {path} has no queue/scheduler")
+    scheduler = scheduler_file.read_text(encoding="ascii").split()
     active = next((s.strip("[]") for s in scheduler if s.startswith("[")), " ".join(scheduler))
     return block.name, (block / "dev").read_text(encoding="ascii").strip(), active
 
@@ -235,9 +244,9 @@ def run(release: Path, work: Path) -> bool:
     if "io" not in controllers:
         annotate("error", "io classes", f"the user manager has no io controller: {controllers}")
         return False
-    disk, majmin, scheduler = disk_of(work)
-    data = data_file(work)
     try:
+        disk, majmin, scheduler = disk_of(work)
+        data = data_file(work)
         slices = install_slices(release, work, disk)
         annotate("notice", "io classes: urgent against background", classes(data, scheduler))
     except (Failure, OSError, subprocess.SubprocessError, ValueError, KeyError) as e:
