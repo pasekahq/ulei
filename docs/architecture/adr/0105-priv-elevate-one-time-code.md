@@ -1,4 +1,4 @@
-# ADR-0094: Temporary full root by a one-time code the owner gets in the owner's chat
+# ADR-0105: Temporary full root by a one-time code the owner gets in the owner's chat
 
 Status: proposed
 Date: 2026-11-27
