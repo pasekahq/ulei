@@ -325,9 +325,10 @@ fn garden_propose_sends_a_timed_out_candidate_once_more_and_returns_its_record()
     let sent = bodies(&fake);
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert_eq!(sent[0], sent[1]);
-    // The first call waits the C7 5 s; the second is answered at once.
+    // The first call gives up after the C7 5 s; the second waits out the late first answer
+    // (the fake serves its responders one at a time, as the garden does) within its 30 s.
     assert!(took >= Duration::from_secs(5), "{took:?}");
-    assert!(took < Duration::from_secs(7), "{took:?}");
+    assert!(took < Duration::from_secs(15), "{took:?}");
 }
 
 #[test]
