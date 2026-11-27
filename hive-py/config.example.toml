@@ -148,6 +148,13 @@ urgent_sources = ["cron:000000000001", "cron:000000000002"]  # and their :condit
 urgent_reserve = 1         # per ceiling: non-urgent stops this many short, urgent may run this many over
 urgent_floor_mb = 768      # urgent passes a closed gate while MemAvailable - starting x per_run_mb stays at or above this
 
+[head_wait_nudge]
+# A running worker whose head has run one command this long gets a nudge over its live input, again every interval
+# while that command runs; another command starts over. Journaled as wait_nudge; never stops a head. 0 = off.
+interval_s = 1200
+# {minutes}: how long the command has run; {command}: its command line, redacted and cut. Default: an English text.
+text = "You have been waiting for a command for {minutes} minutes: {command}\nAre you sure it has not hung? Check its state and result; stop it if needed and go on."
+
 [resources]
 enabled = true
 max_local_runs = 5         # all heads + scripts + detached acceptance checks together

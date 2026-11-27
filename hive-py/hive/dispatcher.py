@@ -21,7 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import api, c4g, delivery, judge, liveness, store, heads, resources
+from . import api, c4g, delivery, inspect, judge, liveness, store, heads, resources, wait_nudge
 
 REPO = Path(__file__).resolve().parents[1]
 EXCERPT = 2500
@@ -89,6 +89,7 @@ class Dispatcher:
         self._host_limit = None
         self._urgent_host_limit = None
         self._floors_ok = False
+        self._nudged_at = None
 
     def admission_limit(self, ceiling, urgent):
         """Count below which a launch fits one ceiling: urgent_reserve under it for non-urgent, over it for urgent."""
@@ -189,6 +190,7 @@ class Dispatcher:
             early = self.schedule_checks(owner_only=True)
             summary = {'reaped': reaped, 'advanced': early + self.advance(), 'launched': self.launch()}
             summary['advanced'] += self.advance()   # a just-finished fast fake/gate may complete in the same tick
+            summary['nudged'] = self.nudge_waits()
             summary['published'] = self.publish()
             with store.tx(self.conn):
                 store.meta_set(self.conn, 'dispatcher_tick', summary)
@@ -1350,6 +1352,27 @@ class Dispatcher:
                                   'live input acknowledgement timed out' if live else 'head has no live input channel'})
                     n += 1
             self.kill(cur)
+        return n
+
+    def nudge_waits(self):
+        """Journal a `wait_nudge` for every running worker whose head has run one command `head_wait_nudge.interval_s`
+        or longer, again every interval while that command runs (hive/wait_nudge.py); at most once per CHECK_S.
+        Reads the units' cgroups and /proc only; never stops a head. Returns the number of nudges journaled."""
+        section = self.cfg.get('head_wait_nudge') or wait_nudge.config(self.cfg)
+        now = self.clock()
+        if not section['interval_s'] or (self._nudged_at is not None and now - self._nudged_at < wait_nudge.CHECK_S):
+            return 0
+        self._nudged_at = now
+        probe = inspect.Probe(cgroup_root=self.cgroup_root, proc_root=self.proc_root, gh=None)
+        n = 0
+        for r in self.conn.execute(wait_nudge.ACTIVE_WORKERS, (now - section['interval_s'],)).fetchall():
+            command = wait_nudge.longest(probe, r)
+            if command is None or command['age_s'] < section['interval_s']:
+                continue
+            with store.tx(self.conn):
+                if self.conn.execute('SELECT status FROM runs WHERE id=?', (r['id'],)).fetchone()['status'] != 'running':
+                    continue
+                n += wait_nudge.nudge(self.conn, section, r, command, now) is not None
         return n
 
     def cancel(self, card_id, reason='', actor='secretary', migrate=False, expected_version=None, steward_check=False, keep_card=None, keep_version=None):

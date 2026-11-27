@@ -32,7 +32,7 @@ SECRET_NAME = re.compile(r'(^|[._-])(env|secrets?|token|credentials?|passwords?|
                          re.IGNORECASE)
 # The events whose `data` explains a round's outcome.
 ROUND_EVENTS = ('gate', 'judge', 'review_requested', 'retry', 'blocked', 'done', 'cancelled', 'rework', 'process_wait',
-                'run_reaped', 'launch_error', 'steer_restart', 'disputed', 'dispute_resolved')
+                'run_reaped', 'launch_error', 'steer_restart', 'disputed', 'dispute_resolved', 'wait_nudge')
 PULL = [re.compile(r'\bgh\s+pr\s+(?:checks|view|merge|ready|diff)\s+(?:(?:-R|--repo)[= ]?\S+\s+)?#?(\d+)\b'),
         re.compile(r'github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)')]
 RUN_WATCH = re.compile(r'\bgh\s+run\s+(?:watch|view)\s+(?:(?:-R|--repo)[= ]?\S+\s+)?(\d+)\b')
