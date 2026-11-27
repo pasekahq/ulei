@@ -80,7 +80,13 @@ instead); the text after it is the judge's notes on minor gaps, kept as the `rea
 `judge` event and handed to the author as `judge_notes` of the result with the reason
 `judge done with notes`, and it starts no round; `rework`
 followed by a reason fails the round through the normal retry path with the reason as the next
-worker's feedback, spending `max_rounds`; it takes no backoff, so the next round starts on the
+worker's feedback, spending `max_rounds`. The reason is a numbered list of at most 3 essential
+defects, each naming the criterion, the part of the goal or the rule it fails; minor gaps go after
+it under a `Notes:` line. The dispatcher cuts the text at that line (`judge.split_notes`): only
+the list becomes the feedback, the notes stay in the `notes` field of the `judge` event for the
+author, and a `rework` with notes only counts as `done` with those notes. The reviewer writes its
+minor items under `## Notes` in REVIEW.md the same way, and a review FAIL that becomes feedback
+directly (an external executor's round) loses its notes the same way. A rework takes no backoff, so the next round starts on the
 next tick (a failed worker round or gate still waits `[retry_backoff]`). A failed turn is no
 verdict, and nothing else is tried: no other route, vendor or CLI, and never the request without its tag. A
 retryable class keeps the card in `check` with `retry_at` at the gateway's `resets_at`, else

@@ -706,6 +706,28 @@ def test_review_fail_twice_blocks(env):
     assert 'missing thing' in c['runs'][2]['prompt']  # reviewer feedback reaches round 2 worker
 
 
+def test_review_fail_notes_stay_out_of_the_next_round(env):
+    _, conn, d = env
+    cid = mk(conn, '[reviewfail][reviewnotes] reviewer adds a note', review=True)
+    assert run_until(d, conn, cid) == 'blocked'
+    c = api.get(conn, cid)
+    reviews = [r for r in c['runs'] if r['role'] == 'reviewer']
+    assert all('## Notes\nminor wording' in r['report'] for r in reviews)  # the author still finds the notes
+    [second] = [r for r in c['runs'] if r['role'] == 'worker' and r['round'] == 2]
+    assert 'missing thing' in second['prompt'] and 'minor wording' not in second['prompt']
+
+
+def test_reviewer_fails_with_at_most_three_items_naming_their_criteria_and_keeps_notes_apart(env):
+    _, conn, _ = env
+    card = api.get(conn, mk(conn, '[ok] reviewer rule', review=True))
+    text = heads.reviewer_prompt(card, 1, 'report', {'exit_code': 0, 'output': ''})
+    for rule in ('A FAIL lists at most 3 essential items', 'Each item names the criterion',
+                 'nothing\nminor goes in them', 'under a heading `## Notes`',
+                 'not to the next worker, and they are never a reason for a FAIL'):
+        assert rule in text
+    assert 'the missing work first' not in text
+
+
 def test_review_fail_then_pass(env):
     _, conn, d = env
     cid = mk(conn, '[reviewround2] fixed after review', review=True)
@@ -731,7 +753,7 @@ def test_judge_review_delivers_persisted_criteria_and_uses_other_vendor(env, mon
     assert '## Persisted judge criteria\n```text\n' + criteria + '\n```' in reviewer['prompt']
     assert 'every persisted judge criterion is satisfied' not in reviewer['prompt']
     assert 'work a criterion requires was not done' in reviewer['prompt']
-    assert 'A gap only in how the report presents finished work goes under `Notes` after `VERDICT: PASS`' in reviewer['prompt']
+    assert 'A gap only in how the report presents finished work goes under `## Notes` after `VERDICT: PASS`' in reviewer['prompt']
 
 
 def test_judge_review_fail_feedback_retries_then_passes(env, monkeypatch, capsys):
@@ -782,14 +804,19 @@ def test_command_reviewer_prompt_stays_compatible(env):
         'the work itself falls short: the goal is not met, the result is wrong, a claim the owner will act on has',
         'no evidence, or work a criterion requires was not done (a change of code, configuration or docs, a test, a',
         'check that proves the change works, a merged PR, a part of the answer the goal asks for), or a rule of the',
-        'task was broken. List what must change, the missing work first.',
+        'task was broken.',
+        'A FAIL lists at most 3 essential items, numbered. Each item names the criterion, the part of the goal or',
+        'the rule it fails, then says what must change. The next worker reads them as its instructions, so nothing',
+        'minor goes in them. With more than 3 essential items, name the 3 that matter most.',
+        'Minor items go at the end of REVIEW.md under a heading `## Notes`, after a PASS or a FAIL alike. They go to',
+        'the card author, not to the next worker, and they are never a reason for a FAIL.',
         'A record about the work (an issue, a ref, a link) is required work when the goal asks for it or the review',
         'fails anyway. Next to a finished and correct deliverable, a missing record is a note that names it.',
         'For a change (code, configuration, docs, a PR), every change, test and doc the criteria require is required',
         'work. For a question or a research, an answer that covers only part of what the goal asks about fails; but an',
         'item that widens the question is a note even when the criteria list it: other subjects next to the one the',
         'owner asked about, the CI of an already merged PR, extra statistics, extra context.',
-        'A gap only in how the report presents finished work goes under `Notes` after `VERDICT: PASS`: a list instead',
+        'A gap only in how the report presents finished work goes under `## Notes` after `VERDICT: PASS`: a list instead',
         'of a table, wording, length, order, a statement left implicit that the evidence shows, raw output next to a',
         'result with its source.',
         "The owner's clarifications outrank the criteria: when the owner asked for speed or a minimal change,",
@@ -4409,6 +4436,23 @@ def test_dots_review_uses_a_ladder_reviewer(env):
     assert (worker['vendor'], worker['status']) == ('dots', 'exited')
     assert (reviewer['role'], reviewer['status'], reviewer['verdict']) == ('reviewer', 'exited', 'PASS')
     assert reviewer['vendor'] in heads.VENDORS
+
+
+def test_dots_review_fail_hands_its_essentials_not_its_notes_to_the_next_round(env):
+    cfg, conn, d = env
+    cfg['executors']['dots']['poll_s'] = 0
+    run_heads_inline(cfg, d)
+    cid = dots_card(conn, cfg, title='[reviewfail][reviewnotes] dots reviewed', review=True)
+    d.tick()
+    out = dots_state(cfg) / 'out.txt'
+    out.write_text('42\n')
+    dots_reply(cfg, 'done', [out])
+    d.tick()
+    d.tick()
+    card = api.get(conn, cid)
+    [reviewer] = [r for r in card['runs'] if r['role'] == 'reviewer']
+    assert reviewer['verdict'] == 'FAIL' and 'minor wording' in reviewer['report']
+    assert card['feedback'] == 'VERDICT: FAIL\nmissing thing'
 
 
 def dots_get_mode(cfg, mode):

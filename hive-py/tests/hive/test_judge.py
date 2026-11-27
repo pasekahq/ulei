@@ -141,6 +141,61 @@ def test_the_judge_reworks_for_missing_work_not_for_how_the_report_presents_it(e
     assert api.card_row(conn, cid)['state'] == 'done'
 
 
+def test_the_judge_reworks_with_at_most_three_items_naming_their_criteria_and_keeps_notes_apart(env, gateway):
+    _, conn, d = env
+    in_check(conn)
+    settle(d)
+    [request] = gateway.requests
+    system = request['system']
+    for rule in ('a numbered list of at most 3 essential defects', 'Each item names the',
+                 'criterion, the part of the goal or the rule it fails', 'so nothing minor goes in it',
+                 'under a line `Notes:`', 'not to the\nnext worker, and they are never a reason for the rework',
+                 'the items under its `Notes` heading are notes'):
+        assert rule in system
+    assert 'list the minor gaps as optional' not in system
+
+
+def test_rework_notes_go_to_the_author_not_to_the_next_worker(env, gateway):
+    _, conn, d = env
+    todo = '1. Criterion "the March totals": they are missing; add them.'
+    gateway.script = [answer('VERDICT: rework\n' + todo + '\nNotes:\n- the runs are a list, not a table')]
+    cid = in_check(conn, acceptance_kind='judge', judge_criteria='the March totals; a table of the runs')
+    settle(d)
+    card = api.get(conn, cid)
+    assert (card['state'], card['feedback']) == ('queued', todo)
+    assert [e['data'] for e in card['events'] if e['kind'] == 'judge'] == [
+        {'round': 1, 'route': 'judge-s1', 'verdict': 'rework', 'reason': todo,
+         'notes': '- the runs are a list, not a table'}]
+    record_spawns(d)
+    d.launch()
+    [prompt] = [r['prompt'] for r in api.get(conn, cid)['runs'] if r['round'] == 2]
+    assert todo in prompt and 'not a table' not in prompt
+
+
+def test_a_rework_of_notes_only_is_a_done_with_the_notes(env, gateway):
+    _, conn, d = env
+    gateway.script = [answer('VERDICT: rework\nNotes: the issue ref is missing.')]
+    cid = in_check(conn)
+    settle(d)
+    card = api.get(conn, cid)
+    assert (card['state'], card['round'], card['result']) == ('done', 1, 'judge done with notes')
+    [payload] = [json.loads(r['payload']) for r in conn.execute("SELECT payload FROM outbox WHERE card_id=?", (cid,))]
+    assert payload['judge_notes'] == 'the issue ref is missing.'
+
+
+@pytest.mark.parametrize('text,split', [
+    ('1. a\n2. b\nNotes:\n- x\n- y', ('1. a\n2. b', '- x\n- y')),
+    ('1. a\n## Notes\nx', ('1. a', 'x')),
+    ('1. a\n**Notes:** the table is a list', ('1. a', 'the table is a list')),
+    ('1. a\n## Notes (not a reason for FAIL)\n- q', ('1. a', '- q')),
+    ('1. a\nNotes are missing from the docs.\n2. b', ('1. a\nNotes are missing from the docs.\n2. b', '')),
+    ('1. a', ('1. a', '')),
+    (None, ('', '')),
+])
+def test_split_notes_cuts_at_the_notes_heading_only(text, split):
+    assert judge.split_notes(text) == split
+
+
 @pytest.mark.parametrize('text,found', [
     ('VERDICT: done', ('done', '')),
     ('**VERDICT: done**\nNotes: the table is a list.', ('done', 'Notes: the table is a list.')),
