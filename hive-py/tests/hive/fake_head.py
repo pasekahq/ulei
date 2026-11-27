@@ -51,7 +51,8 @@ if '[provideroutage]' in title and not reviewer and len(open('calls.log').readli
     sys.exit(1)
 if reviewer:
     fail = '[reviewfail]' in title or ('[reviewround2]' in title and '(round 1)' in prompt)
-    open('REVIEW.md', 'w').write('VERDICT: FAIL\nmissing thing\n' if fail else 'VERDICT: PASS\nlooks right\n')
+    notes = '## Notes\nminor wording\n' if '[reviewnotes]' in title else ''
+    open('REVIEW.md', 'w').write(('VERDICT: FAIL\nmissing thing\n' if fail else 'VERDICT: PASS\nlooks right\n') + notes)
 else:
     write = '[ok]' in title or ('[round2]' in title and rnd >= 2) or '[reviewfail]' in title or '[reviewround2]' in title
     if write and '[never]' not in title:
