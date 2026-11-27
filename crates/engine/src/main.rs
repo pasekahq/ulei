@@ -497,25 +497,13 @@ fn journaled(
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
     let mut journal = Journal::open(&db).map_err(|e| fail(&e))?;
-    let session = if run.new {
-        journal.new_session(&run.session)
-    } else {
-        journal.session(&run.session)
-    }
-    .map_err(|e| fail(&e))?;
-    let default = default_of(run, &journal).map_err(|e| fail(&e))?;
-    let route = route_of(run, &session, &default);
+    let (session, base) = session_of(&mut journal, run).map_err(|e| fail(&e))?;
+    let route = route_of(run, &session, &base);
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
     let stores = stores(config).map_err(|e| fail(&e))?;
     let (context, trace) = turn_context(config, stores.garden.as_ref(), run, (next, route));
-    journal_tools(
-        &mut tools,
-        (db.as_path(), socket.as_path()),
-        stores,
-        (next, run, default.as_str()),
-        origin,
-    )
-    .map_err(|e| fail(&e))?;
+    journal_tools(&mut tools, &db, &socket, stores, (next, run, &base), origin)
+        .map_err(|e| fail(&e))?;
     let ids = next
         .request_ids()
         .map_err(|e| fail(&format!("request ids: {e}")))?;
@@ -853,9 +841,10 @@ fn journaled_prompt(run: &Run) -> String {
 /// `garden_search` and `garden_propose` when the garden is configured.
 fn journal_tools(
     tools: &mut Registry,
-    (db, socket): (&Path, &Path),
+    db: &Path,
+    socket: &Path,
     stores: Stores,
-    (turn, run, default): (journal::Turn, &Run, &str),
+    (turn, run, default): (journal::Turn, &Run, &String),
     origin: Origin,
 ) -> Result<(), DuplicateTool> {
     tools.register(Box::new(SessionSearch::new(db.to_path_buf(), turn.session)))?;
@@ -885,6 +874,17 @@ fn journal_tools(
         tools.register(Box::new(GardenPropose::new(garden, origin)))?;
     }
     Ok(())
+}
+
+/// The session `run` runs in, a new one of its key for `run.new`, and the route alias a session
+/// of `run` that stores none runs on ([`default_of`]).
+fn session_of(journal: &mut Journal, run: &Run) -> Result<(Session, String), journal::Error> {
+    let session = if run.new {
+        journal.new_session(&run.session)
+    } else {
+        journal.session(&run.session)
+    }?;
+    Ok((session, default_of(run, journal)?))
 }
 
 /// The route alias a session of `run` that stores none runs on: the one `run` gives, else the
