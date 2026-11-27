@@ -77,7 +77,7 @@ here=$(dirname "$0")
 set -- ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors ulei-memory ulei-hive-mcp \
   ulei-garden ulei-garden-embed
 units="ulei-engine.service ulei-inbox.service ulei-tg.service ulei-connectors.service ulei-memory.service
-  ulei-hive-mcp.service ulei-garden.service ulei-night.service ulei-night.timer"
+  ulei-hive-mcp.service ulei-garden.service ulei-night.service ulei-night.timer ulei.slice"
 
 [ "$(id -u)" -ne 0 ] || fail account "run as the account that owns the deployment, not root"
 case "${HOME:-}" in

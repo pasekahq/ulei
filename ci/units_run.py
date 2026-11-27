@@ -69,6 +69,12 @@ UNITS = (
     "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", CONNECTORS, MEMORY, HIVE_MCP,
     GARDEN,
 )
+# The units on the path of an owner turn, in `ulei.slice` without IO limits (ADR-0042 section 11);
+# the connector runner and the night gardener stay in the manager's default slice.
+INTERACTIVE = (
+    "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", MEMORY, HIVE_MCP, GARDEN,
+)
+SLICE = "ulei.slice"
 # The keys whose paths each daemon writes (ADR-0042 section 3).
 WRITES = {
     "ulei-inbox.service": ("inbox.root", "inbox.socket"),
@@ -391,10 +397,27 @@ def check_process(unit: str, pid: str) -> str:
             raise Failure(f"{unit}: {file} is missing, the user manager has no such controller")
         if file.read_text(encoding="ascii").strip() != limits[prop]:
             raise Failure(f"{unit}: {file} is {file.read_text().strip()}, {prop} is {limits[prop]}")
+    placed = check_slice(unit, cgroup)
     return (
         f"NoNewPrivs 1, seccomp filter, memory.max {limits['MemoryMax']}, "
-        f"pids.max {limits['TasksMax']}"
+        f"pids.max {limits['TasksMax']}; {placed}"
     )
+
+
+def check_slice(unit: str, cgroup: str) -> str:
+    """An interactive ``unit``'s process, in cgroup ``cgroup``, runs in `ulei.slice`, whose io.max
+    holds no limit (ADR-0042 section 11)."""
+    if unit not in INTERACTIVE:
+        return f"cgroup {cgroup}"
+    parent = Path(cgroup).parent
+    if parent.name != SLICE:
+        slice_ = show(unit, "Slice")["Slice"]
+        raise Failure(f"{unit}: cgroup {cgroup} is not in {SLICE}, Slice= is {slice_}")
+    io_max = Path("/sys/fs/cgroup" + str(parent)) / "io.max"
+    limits = io_max.read_text(encoding="ascii").strip() if io_max.exists() else ""
+    if limits:
+        raise Failure(f"{unit}: {io_max} limits the owner turn's IO: {limits}")
+    return f"in {SLICE}, io.max empty"
 
 
 def check_mounts(unit: str, pid: str, home: Path, dirs: list[Path]) -> str:
