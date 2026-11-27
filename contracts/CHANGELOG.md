@@ -32,6 +32,13 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `source`, `owner_visible` and `priority` from the product shape are not fields yet (adding
   them would break the Python consumers, which reject unknown fields): planned for C1 2.0.0 in S1.
 
+## C2 0.5.0
+- New tool `hive_resolve` (additive, ADR-0095): `HiveResolveInput` (`card_id`, `action` one of
+  `accept` and `rework`, a required `text` of 1 to 4000 characters) answered by `Ack`. The
+  author's decision on a disputed card (`blocked`, wait `disputed`): `accept` finishes it done,
+  `rework` queues a new round with `text` as its instructions; it runs `hive.py resolve` with the
+  server's actor as `--by`, never an input.
+
 ## C2 0.4.0
 - Read-only snapshot tools of the hive (additive, ADR-0086): `hive_inspect` (`CardRef` →
   `HiveInspectOutput`: state, round, title, result and report lines, `waiting_on`, one line on

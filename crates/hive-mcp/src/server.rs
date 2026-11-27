@@ -248,7 +248,7 @@ impl Server {
             "protocolVersion": version,
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "ulei-hive-mcp", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "The hive's tools: delegate work as a card (hive_create), follow it (hive_list, hive_show), steer it (hive_steer) or cancel it (hive_cancel).",
+            "instructions": "The hive's tools: delegate work as a card (hive_create), follow it (hive_list, hive_show), steer it (hive_steer), cancel it (hive_cancel) or decide its dispute (hive_resolve).",
         });
         Response::json(200, &rpc_result(id, &result)).with("Mcp-Session-Id", session)
     }

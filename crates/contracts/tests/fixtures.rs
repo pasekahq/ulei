@@ -141,6 +141,7 @@ fn c2_fixtures_match_the_types() {
     roundtrip::<c::HiveListInput>("c2/valid/HiveListInput.filters.json");
     roundtrip::<c::HiveListInput>("c2/valid/HiveListInput.state.json");
     roundtrip::<c::HiveListOutput>("c2/valid/HiveListOutput.two.json");
+    roundtrip::<c::HiveResolveInput>("c2/valid/HiveResolveInput.rework.json");
     roundtrip::<c::HiveSteerInput>("c2/valid/HiveSteerInput.note.json");
     roundtrip::<c::InboxAckInput>("c2/valid/InboxAckInput.success.json");
     refused::<c::HiveCreateInput>("c2/invalid/HiveCreateInput.extra_deliver.json");
