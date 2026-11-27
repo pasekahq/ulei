@@ -32,6 +32,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `source`, `owner_visible` and `priority` from the product shape are not fields yet (adding
   them would break the Python consumers, which reject unknown fields): planned for C1 2.0.0 in S1.
 
+## C2 0.5.1
+- Descriptions of `HiveCreateInput` only (no keyword changes): `accept_review` is the judge's
+  acceptance and no longer implies `review`; `review` is off by default and only `review: true`
+  turns it on, with the author's three cases for it (code cards, complex research, the author's
+  own choice). The hive CLI `create --accept-review` no longer sets `--review` (owner, 26.11.2026).
+
 ## C2 0.5.0
 - New tool `hive_resolve` (additive, ADR-0095): `HiveResolveInput` (`card_id`, `action` one of
   `accept` and `rework`, a required `text` of 1 to 4000 characters) answered by `Ack`. The
