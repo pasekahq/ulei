@@ -1,0 +1,25 @@
+{
+  "events": [
+    {
+      "id": "hive:h_1:done",
+      "kind": "task_result",
+      "reason": "uncertain",
+      "source": "hive",
+      "time": 1763300990
+    },
+    {
+      "id": "probe-1",
+      "kind": "provider_outage",
+      "reason": "expired-processing",
+      "source": "probe-1",
+      "time": 1763300991.25
+    },
+    {
+      "id": ":lone",
+      "kind": "weekly",
+      "reason": "deferred-exhausted",
+      "source": "",
+      "time": 1763300992
+    }
+  ]
+}

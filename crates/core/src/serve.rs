@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c1::{
     AckRequest, ClaimRequest, CountsRequest, ErrorCode, GetRequest, HealthRequest, RenewRequest,
-    RetryRequest, StartRequest,
+    RetryRequest, StartRequest, UncertainList, UncertainRequest,
 };
 
 use crate::inbox::{
@@ -31,6 +31,10 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_HEAD: usize = 8 * 1024;
 /// Most bytes of a request body.
 pub const MAX_BODY: usize = 512 * 1024;
+/// Events an `uncertain` request answers when it names no `limit`.
+pub const UNCERTAIN_LIMIT: u32 = 20;
+/// Largest `limit` of an `uncertain` request.
+pub const MAX_UNCERTAIN_LIMIT: u32 = 100;
 
 const SERVER: &str = concat!("ulei-inbox ", env!("CARGO_PKG_VERSION"));
 const CHUNK: usize = 8 * 1024;
@@ -47,6 +51,7 @@ enum Op {
     Get,
     Health,
     Counts,
+    Uncertain,
 }
 
 impl Op {
@@ -61,6 +66,7 @@ impl Op {
             "get" => Self::Get,
             "health" => Self::Health,
             "counts" => Self::Counts,
+            "uncertain" => Self::Uncertain,
             _ => return None,
         })
     }
@@ -270,6 +276,17 @@ impl Server {
             Op::Counts => {
                 let CountsRequest {} = input(fields)?;
                 serde_json::to_value(inbox.counts().map_err(|e| store_error(&e))?)
+                    .map_err(|_| error(ErrorCode::Internal, "answer does not serialize"))?
+            }
+            Op::Uncertain => {
+                let req: UncertainRequest = input(fields)?;
+                let limit = req.limit.map_or(Ok(UNCERTAIN_LIMIT), u32::try_from);
+                let limit = match limit {
+                    Ok(limit) if (1..=MAX_UNCERTAIN_LIMIT).contains(&limit) => limit,
+                    _ => return Err(invalid_body()),
+                };
+                let events = inbox.uncertain(limit).map_err(|e| store_error(&e))?;
+                serde_json::to_value(UncertainList { events })
                     .map_err(|_| error(ErrorCode::Internal, "answer does not serialize"))?
             }
         };

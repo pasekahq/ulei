@@ -13,6 +13,7 @@ use common::{
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use ulei_contracts::generated::c1::{Kind, UncertainReason};
 use ulei_core::inbox::{
     DEFER_SECONDS, Error, EventRow, Guarded, Inbox, Invalid, LEASE_TTL, MAX_OFFERS, RETRY_DELAY,
     canonical,
@@ -1563,4 +1564,122 @@ fn done_rows_with_free_text_outcomes_are_left_alone() {
 
     let after: Vec<EventRow> = ids.iter().map(|id| stored(&inbox, id)).collect();
     assert_eq!(after, before);
+}
+
+fn publish_id_at(inbox: &mut Inbox, id: &str, kind: &str, at: f64) {
+    let mut fields = body(id);
+    fields.insert("id".to_owned(), json!(id));
+    fields.insert("kind".to_owned(), json!(kind));
+    assert_eq!(
+        inbox
+            .publish(&sign(&TEST_KEY, &Value::Object(fields)), at)
+            .expect("publish"),
+        id
+    );
+}
+
+/// One event in each status but `uncertain`, all stored before any uncertain one would be.
+fn settled_statuses(inbox: &mut Inbox, at: f64) {
+    for (id, outcome) in [("case:done", "success"), ("case:deferred", "deferred")] {
+        publish_id_at(inbox, id, "task_result", NOW - 2.0);
+        settle(inbox, at, outcome);
+    }
+    publish_id_at(inbox, "case:processing", "task_result", NOW - 1.0);
+    processing(inbox, at + 1.0, 1e6);
+    publish_id_at(inbox, "case:leased", "task_result", NOW - 1.0);
+    claim(inbox, at + 2.0, 1e6);
+    publish_id_at(inbox, "case:pending", "task_result", NOW - 1.0);
+}
+
+fn listed(inbox: &Inbox, limit: u32) -> Vec<(String, String, Kind, f64, UncertainReason)> {
+    inbox
+        .uncertain(limit)
+        .expect("uncertain")
+        .into_iter()
+        .map(|e| (e.id, e.source, e.kind, e.time, e.reason))
+        .collect()
+}
+
+#[test]
+fn uncertain_lists_only_uncertain_events_oldest_first_and_bounded() {
+    let scratch = Scratch::new();
+    let root = scratch.root_with_key(&TEST_KEY);
+    let mut inbox = Inbox::open(&root).expect("open");
+    publish_id_at(&mut inbox, "case:offered", "weekly", NOW + 1.0);
+    let due = deferred(&mut inbox, MAX_OFFERS, NOW + 100.0);
+    inbox.recover(due).expect("recover");
+    let at = due + 1000.0;
+    publish_id_at(&mut inbox, "probe", "provider_outage", NOW + 5.0);
+    processing(&mut inbox, at, 1.0);
+    inbox.recover(at + 2.0).expect("recover");
+    for (n, id) in ["hive:h_1:done", "case:tie", "case:newest"]
+        .into_iter()
+        .enumerate()
+    {
+        let created = if n < 2 { NOW + 10.0 } else { NOW + 20.0 };
+        publish_id_at(&mut inbox, id, "task_result", created);
+        settle(&mut inbox, at + 3.0, "uncertain");
+    }
+    settled_statuses(&mut inbox, at + 10.0);
+    let before = stored_rows(&root.join("events.sqlite3"));
+
+    let all = vec![
+        (
+            "case:offered".to_owned(),
+            "case".to_owned(),
+            Kind::Weekly,
+            NOW + 1.0,
+            UncertainReason::DeferredExhausted,
+        ),
+        (
+            "probe".to_owned(),
+            "probe".to_owned(),
+            Kind::ProviderOutage,
+            NOW + 5.0,
+            UncertainReason::ExpiredProcessing,
+        ),
+        (
+            "case:tie".to_owned(),
+            "case".to_owned(),
+            Kind::TaskResult,
+            NOW + 10.0,
+            UncertainReason::Uncertain,
+        ),
+        (
+            "hive:h_1:done".to_owned(),
+            "hive".to_owned(),
+            Kind::TaskResult,
+            NOW + 10.0,
+            UncertainReason::Uncertain,
+        ),
+        (
+            "case:newest".to_owned(),
+            "case".to_owned(),
+            Kind::TaskResult,
+            NOW + 20.0,
+            UncertainReason::Uncertain,
+        ),
+    ];
+    assert_eq!(inbox.counts().expect("counts").uncertain, 5);
+    assert_eq!(listed(&inbox, 100), all);
+    assert_eq!(listed(&inbox, 3), all[..3]);
+    assert_eq!(listed(&inbox, 1), all[..1]);
+    assert_eq!(stored_rows(&root.join("events.sqlite3")), before);
+}
+
+#[test]
+fn uncertain_is_empty_when_no_event_is_uncertain() {
+    let scratch = Scratch::new();
+    let mut inbox = open_test_inbox(&scratch);
+    assert_eq!(listed(&inbox, 100), Vec::new());
+    settled_statuses(&mut inbox, NOW);
+    let statuses: Vec<String> = ["done", "deferred", "processing", "leased", "pending"]
+        .iter()
+        .map(|status| stored(&inbox, &format!("case:{status}")).status)
+        .collect();
+    assert_eq!(
+        statuses,
+        ["done", "deferred", "processing", "leased", "pending"]
+    );
+    assert_eq!(listed(&inbox, 100), Vec::new());
 }

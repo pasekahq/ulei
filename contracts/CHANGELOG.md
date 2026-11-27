@@ -5,6 +5,14 @@ enum value or operation; a field becoming required; a type or validation keyword
 `additionalProperties` becoming `false`) needs a major bump (minor while `0.x`), an entry
 here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <rev>` enforces it.
 
+## C1 1.3.0
+- Inbox wire operation `uncertain` (additive; the packet is unchanged): `UncertainRequest`
+  (optional `limit`, 1 to 100, 20 when absent) answered by `UncertainList`, at most `limit`
+  events with status `uncertain`, oldest first by `created` then `id`, each an `UncertainEvent`
+  without payload: `id`, `source` (the packet `id` up to its first `:`), `kind` (the packet
+  `kind`), `time` (the row `created`) and `reason` (the row `outcome`, an `UncertainReason`).
+  The inbox answers it from one read query and changes no row (ADR-0097 section 5).
+
 ## C1 1.2.0
 - Inbox wire operation `counts` (additive; the packet is unchanged): `CountsRequest` (no
   arguments) answered by `Counts`, the number of stored events with status `pending`, `leased`,
