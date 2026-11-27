@@ -518,6 +518,7 @@ fn set_route_runs_the_next_turn_on_the_stored_alias() {
         .set_route(&SetRouteRequest {
             session: "chat".into(),
             route: "fast".into(),
+            global: None,
         })
         .expect("set_route");
     assert_eq!(
@@ -547,6 +548,7 @@ fn an_inject_replay_answers_the_same_turn_and_the_owner_session_is_idle_after_it
         .set_route(&SetRouteRequest {
             session: OWNER.into(),
             route: "main".into(),
+            global: None,
         })
         .expect("set_route");
     let _hold = engine.hold_inbox();

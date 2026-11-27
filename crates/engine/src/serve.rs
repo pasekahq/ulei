@@ -6,7 +6,8 @@
 //! meanwhile; turns of different sessions run at the same time. `interrupt` stops the running
 //! turn at once; `inject` records an inbox event in the journal and starts its turn in the free
 //! owner session, which `inbox_turns` hands over to the channel and `report_delivery` settles in
-//! that record; `set_route` stores the alias the session's later turns run on; `raw_sessions`
+//! that record; `set_route` stores the alias the session's later turns run on, with `global`
+//! also as the default route of every session that stores none (ADR-0094); `raw_sessions`
 //! pages through the journal's raw dialogue (ADR-0051).
 
 use std::any::Any;
@@ -60,6 +61,17 @@ pub trait Runner: Send + Sync {
     /// fires and handing `interim` the text of each interim assistant message, and says how
     /// it ended.
     fn run(&self, input: &Input, interrupt: &Interrupt, interim: &mut dyn FnMut(&str)) -> Ending;
+
+    /// Whether the model gateway the turns run on lists the route alias `_alias`, checked
+    /// before a global `set_route` makes it the default of every session; `Err` with a short
+    /// reason when the gateway cannot be asked. A runner without a gateway to ask lists every
+    /// alias.
+    ///
+    /// # Errors
+    /// The gateway could not be reached or answered off its contract.
+    fn lists_route(&self, _alias: &str) -> Result<bool, String> {
+        Ok(true)
+    }
 }
 
 /// A turn the server runs: a prompt `submit_turn` took, or an inbox event `inject` took; the
@@ -945,13 +957,14 @@ impl Server {
     fn status(&self, request: StatusRequest, deadline: Instant) -> Result<SessionStatus, Reply> {
         let journal = self.journal.borrow();
         let failed = |_| error(ErrorCode::Internal, "journal read failed");
-        let route = journal
-            .route(
-                &request.session,
-                deadline.saturating_duration_since(Instant::now()),
-            )
-            .map_err(failed)?
-            .unwrap_or_else(|| self.route.clone());
+        let within = || deadline.saturating_duration_since(Instant::now());
+        let route = match journal.route(&request.session, within()).map_err(failed)? {
+            Some(route) => route,
+            None => journal
+                .default_route(within())
+                .map_err(failed)?
+                .unwrap_or_else(|| self.route.clone()),
+        };
         let mut status = {
             let lanes = lock(&self.shared.lanes);
             let lane = lanes.sessions.get(&request.session);
@@ -1141,19 +1154,43 @@ impl Server {
     }
 
     /// Stores `request.route` with the current session of its key, which a missing session
-    /// creates; a journal lock is given up at `deadline`.
+    /// creates, and for a global request first as the default route, which an alias the
+    /// gateway does not list never becomes and the configured alias clears; a journal lock is
+    /// given up at `deadline`.
     fn set_route(&self, request: SetRouteRequest, deadline: Instant) -> Result<RouteSet, Reply> {
+        let within = || deadline.saturating_duration_since(Instant::now());
+        let failed = |_| error(ErrorCode::Internal, "journal write failed");
+        let global = request.global.unwrap_or(false);
+        if global {
+            match self.runner.lists_route(&request.route) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(error(
+                        ErrorCode::BadRequest,
+                        &format!("unknown route alias {:?}", request.route),
+                    ));
+                }
+                Err(reason) => {
+                    return Err(error(
+                        ErrorCode::Internal,
+                        &format!("could not list the gateway's routes: {reason}"),
+                    ));
+                }
+            }
+            let stored = (request.route != self.route).then_some(request.route.as_str());
+            self.journal
+                .borrow_mut()
+                .store_default_route(stored, within())
+                .map_err(failed)?;
+        }
         self.journal
             .borrow_mut()
-            .store_route(
-                &request.session,
-                &request.route,
-                deadline.saturating_duration_since(Instant::now()),
-            )
-            .map_err(|_| error(ErrorCode::Internal, "journal write failed"))?;
+            .store_route(&request.session, &request.route, within())
+            .map_err(failed)?;
         Ok(RouteSet {
             session: request.session,
             route: request.route,
+            global: Some(global),
         })
     }
 

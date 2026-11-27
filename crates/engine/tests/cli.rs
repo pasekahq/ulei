@@ -1242,7 +1242,8 @@ fn forget_in_an_owner_turn_sends_its_refs_to_the_garden_socket_of_the_config() {
 }
 
 #[test]
-fn set_model_in_an_owner_turn_stores_a_listed_alias_and_refuses_an_unknown_or_a_foreign_one() {
+fn set_model_in_an_owner_turn_stores_a_listed_alias_globally_on_request_and_refuses_an_unknown_or_a_foreign_one()
+ {
     let routes: ulei_contracts::generated::c4g::RoutesAnswer = serde_json::from_value(json!({
         "routes": [
             {"alias": "chat", "state": "ready", "model": "claude-sonnet-5-5"},
@@ -1256,6 +1257,12 @@ fn set_model_in_an_owner_turn_stores_a_listed_alias_and_refuses_an_unknown_or_a_
             tool_step(vec![call("c2", "set_model", json!({"model": "gpt"}))]),
             tool_step(vec![call("c3", "set_model", json!({"model": "opus"}))]),
             text_step("switched"),
+            tool_step(vec![call(
+                "g1",
+                "set_model",
+                json!({"model": "opus", "global": true}),
+            )]),
+            text_step("default"),
             tool_step(vec![call("c4", "set_model", json!({"model": "chat"}))]),
             text_step("not yours"),
         ],
@@ -1264,7 +1271,7 @@ fn set_model_in_an_owner_turn_stores_a_listed_alias_and_refuses_an_unknown_or_a_
     let dir = Scratch::new();
     let db = dir.0.join("journal.sqlite3");
     let config = reminder_config(&fake, &db, &dir.0, None);
-    for channel in ["main-chat", "other"] {
+    for channel in ["main-chat", "main-chat", "other"] {
         let mut args = run_args("chat", "switch to opus");
         args.extend(["--channel".into(), channel.into()]);
         let out = engine(&dir.0)
@@ -1290,7 +1297,9 @@ fn set_model_in_an_owner_turn_stores_a_listed_alias_and_refuses_an_unknown_or_a_
     let set = result(3);
     assert!(set.contains("\"model\": \"opus\""), "{set}");
     assert!(set.contains("\"previous\": \"main\""), "{set}");
-    let foreign = result(5);
+    let global = result(5);
+    assert!(global.contains("\"global\": true"), "{global}");
+    let foreign = result(7);
     assert!(
         foreign.contains("runs only when the owner asks"),
         "{foreign}"
@@ -1299,6 +1308,13 @@ fn set_model_in_an_owner_turn_stores_a_listed_alias_and_refuses_an_unknown_or_a_
     assert_eq!(
         journal
             .route("chat", std::time::Duration::from_secs(1))
+            .unwrap()
+            .as_deref(),
+        Some("opus")
+    );
+    assert_eq!(
+        journal
+            .default_route(std::time::Duration::from_secs(1))
             .unwrap()
             .as_deref(),
         Some("opus")

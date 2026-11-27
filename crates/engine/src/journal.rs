@@ -30,9 +30,9 @@ use crate::agent::Outcome;
 use crate::compress;
 use crate::tools::random_hex;
 
-/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 7 are
+/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 8 are
 /// migrated.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 /// Longest session key, as the C4G `session_key`.
 pub const MAX_KEY_CHARS: usize = 128;
 
@@ -63,6 +63,12 @@ const MARKS: &str = "CREATE TABLE marks (
   id INTEGER PRIMARY KEY, n INTEGER NOT NULL REFERENCES messages (n), at INTEGER NOT NULL,
   reason TEXT NOT NULL, provenance TEXT NOT NULL, lifted_at INTEGER, lifted_provenance TEXT);
 CREATE INDEX marks_live ON marks (n) WHERE lifted_at IS NULL;";
+/// Engine settings the journal keeps across restarts, one row per name; `route` is the default
+/// route alias a global C6 `set_route` stored (C8 `DefaultRoute`, ADR-0094).
+const SETTINGS: &str =
+    "CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;";
+/// The name of the default route alias in `settings`.
+const DEFAULT_ROUTE: &str = "route";
 const INDEX: &str = "INSERT INTO messages_fts (rowid, content, tool_name, tool_calls, role) VALUES (?1, ?2, ?3, ?4, ?5)";
 /// Version 1 to 2: sessions gain the stored system prompt, absent for the existing ones.
 const MIGRATE_1: &str =
@@ -250,6 +256,7 @@ impl Journal {
                 tx.execute_batch(MESSAGES)?;
                 tx.execute_batch(FTS)?;
                 tx.execute_batch(MARKS)?;
+                tx.execute_batch(SETTINGS)?;
             }
             SCHEMA_VERSION => {}
             found @ 1..SCHEMA_VERSION => {
@@ -264,7 +271,10 @@ impl Journal {
                 if found < 7 {
                     migrate_6(&tx)?;
                 }
-                tx.execute_batch(MARKS)?;
+                if found < 8 {
+                    tx.execute_batch(MARKS)?;
+                }
+                tx.execute_batch(SETTINGS)?;
             }
             found => return Err(Error::SchemaVersion(found)),
         }
@@ -333,6 +343,52 @@ impl Journal {
         });
         self.conn.busy_timeout(BUSY_TIMEOUT)?;
         stored
+    }
+
+    /// The default route alias a global C6 `set_route` stored (C8 `DefaultRoute`); `None` when
+    /// none is stored and the configured one holds. Waits at most `within` for a lock another
+    /// connection holds.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`], `SQLITE_BUSY` when the lock outlasts `within`.
+    pub fn default_route(&self, within: Duration) -> Result<Option<String>, Error> {
+        self.conn.busy_timeout(within)?;
+        let route = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE name=?1",
+                [DEFAULT_ROUTE],
+                |r| r.get(0),
+            )
+            .optional();
+        self.conn.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(route?)
+    }
+
+    /// Stores `route` as the default route alias, or with `None` removes the stored one so the
+    /// configured default holds again. Waits at most `within` for a lock another connection
+    /// holds.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`], `SQLITE_BUSY` when the lock outlasts `within`.
+    pub fn store_default_route(
+        &mut self,
+        route: Option<&str>,
+        within: Duration,
+    ) -> Result<(), Error> {
+        self.conn.busy_timeout(within)?;
+        let stored = match route {
+            Some(route) => self.conn.execute(
+                "INSERT INTO settings (name, value) VALUES (?1, ?2)
+                 ON CONFLICT (name) DO UPDATE SET value=excluded.value",
+                params![DEFAULT_ROUTE, route],
+            ),
+            None => self
+                .conn
+                .execute("DELETE FROM settings WHERE name=?1", [DEFAULT_ROUTE]),
+        };
+        self.conn.busy_timeout(BUSY_TIMEOUT)?;
+        stored.map(drop).map_err(Error::from)
     }
 
     /// The session of `key` with the highest id, if any.

@@ -20,7 +20,7 @@ pub enum Command {
     Model {
         /// The route alias; `None` shows the current one.
         alias: Option<String>,
-        /// `--global` was given: the owner asked to keep the alias beyond this session.
+        /// `--global` was given: the alias also becomes the default of new sessions.
         global: bool,
     },
 }
@@ -140,6 +140,8 @@ pub struct NewSession {
 pub struct RouteSwitch {
     /// The alias now in use.
     pub alias: String,
+    /// The alias is now also the engine's default route.
+    pub global: bool,
     /// Its context window.
     pub context_total: Option<u64>,
 }
@@ -170,13 +172,14 @@ pub trait Engine {
     /// The engine could not be reached.
     fn status(&mut self) -> Result<EngineStatus, EngineError>;
 
-    /// Switches the model route of the session to `alias`.
+    /// Switches the model route of the session to `alias`, and with `global` also makes it the
+    /// engine's default route for new sessions and after a restart.
     ///
     /// Seam: C6 `set_route`.
     ///
     /// # Errors
     /// The alias is unknown (the message is shown to the owner) or the engine is unreachable.
-    fn set_route(&mut self, alias: &str) -> Result<RouteSwitch, EngineError>;
+    fn set_route(&mut self, alias: &str, global: bool) -> Result<RouteSwitch, EngineError>;
 
     /// Ends the session and starts a fresh one.
     ///
@@ -235,16 +238,16 @@ pub fn run_command(
         Command::Model {
             alias: Some(alias),
             global,
-        } => match engine.set_route(alias) {
+        } => match engine.set_route(alias, *global) {
             Ok(switch) => {
                 let mut lines = vec![format!("Модель изменена на `{}`", switch.alias)];
                 if let Some(total) = switch.context_total {
                     lines.push(format!("Контекст: {} токенов", thousands(total)));
                 }
-                // C6 has no default route to write: the switch holds until `/new` either way.
-                lines.push(if *global {
-                    "_(`--global` пока не поддерживается: модель действует до `/new`, \
-                     затем снова маршрут по умолчанию)_"
+                // The reference saves to its config file; the engine keeps the default in its
+                // journal (ADR-0094), so the line names the effect instead of the file.
+                lines.push(if switch.global {
+                    "Сохранено как модель по умолчанию (`--global`): действует и после `/new`"
                         .to_owned()
                 } else {
                     "_(только для этого сеанса — добавьте `--global`, чтобы сохранить)_".to_owned()
