@@ -1,0 +1,8 @@
+{
+  "name": "judge-eval-claude-cli",
+  "private": true,
+  "description": "The Claude Code CLI of the workflow judge-eval.yml: the linux-x64 native binary at one exact version, installed by hash with npm ci --ignore-scripts.",
+  "dependencies": {
+    "@anthropic-ai/claude-code-linux-x64": "2.1.329"
+  }
+}
