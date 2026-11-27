@@ -84,8 +84,9 @@ chain, not a port.
 
 ### 4. Keys and how `install.sh` derives the caps
 
-- `ulei.toml` gains `[host.io]` (C9 0.17.0): `device`, the block device under `/dev/`, and
-  `read_iops` and `write_iops`, what it sustains in random 4 KiB IO. No daemon reads it.
+- `ulei.toml` gains `[host.io]` (C9 0.17.0): `device`, the whole block device under `/dev/` the
+  data's filesystem sits on (a device-mapper device itself, where a cgroup's reads are throttled
+  and counted), and `read_iops` and `write_iops`, what it sustains in random 4 KiB IO. No daemon reads it.
   `install.sh` reads only that table form, and refuses another form of a `host` key, a missing key
   or a malformed value before it copies anything.
 - `install.sh` writes each capped class slice as its shipped file followed by its caps:
@@ -113,9 +114,10 @@ transient unit, within the caps of its slice. They replace the bandwidth keys of
 ### 7. Measurement
 
 The CI job `systemd-units` delegates io to the runner's user manager, installs the slices with a
-synthetic `[host.io]` naming the runner's disk and runs `ci/io_classes_run.py`: probe reads of
-the urgent and background classes under a random 4 KiB O_DIRECT read load, the disk's scheduler,
-and the `io.stat` read rate of `hive-heads.slice` against its `IOReadIOPSMax`. It reports them in
+synthetic `[host.io]` naming the device the runner's data filesystem sits on and runs
+`ci/io_classes_run.py`: probe reads of the urgent and background classes under a random 4 KiB
+O_DIRECT read load, the physical disk's scheduler, and the read rate of `hive-heads.slice`, by
+`io.stat` and by the load's own count, against its `IOReadIOPSMax`. It reports them in
 notices and says when the IO priority shows no effect; it fails only when the capped slice reads
 more than 15 % above its cap. When the priority shows no effect, the IOPS caps are the mechanism.
 

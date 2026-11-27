@@ -3,14 +3,16 @@ the user manager.
 
 ``python3 ci/io_classes_run.py RELEASE_DIR WORKDIR`` writes a 1 GiB data file in WORKDIR on the
 runner's disk, installs the class slices with ``deploy/install.sh`` from a synthetic ``[host.io]``
-naming the physical disk under it with 300 read and 300 write IOPS, and puts them into the user manager. Under an
+naming the whole device its filesystem sits on, device-mapper included, with 300 read and 300
+write IOPS, and puts them into the user manager. Under an
 uncapped random 4 KiB O_DIRECT read load of 8 threads at the idle IO class, it runs two probe
 readers at once, one 4 KiB O_DIRECT read every 50 ms each: one in ``hive-urgent.slice`` at
 ``CPUWeight=1000`` and the best-effort IO class at level 0, one in ``background.slice`` at the idle
-class. It reports their p50 and p90, the load's IOPS and the disk's scheduler in a notice, and
-says so when the urgent probe is not faster. Then it runs the same load in
-``hive-heads.slice`` and compares the slice's ``io.stat`` read delta per second with its
-``IOReadIOPSMax``. Only a rate above the cap by more than TOLERANCE fails the run.
+class. It reports their p50 and p90, the load's IOPS and the scheduler of the physical disk in a
+notice, and says so when the urgent probe is not faster. Then it runs the same load in
+``hive-heads.slice`` and compares the slice's ``io.stat`` read delta per second, and the load's
+own count, with its ``IOReadIOPSMax``. Only a rate above the cap by more than TOLERANCE fails the
+run.
 
 ``load FILE THREADS SECONDS`` and ``probe FILE COUNT INTERVAL`` are the readers the units run:
 the load prints its reads and IOPS as JSON at the end or on SIGTERM, the probe one latency in
@@ -92,10 +94,14 @@ def probe(path: str, count: int, interval: float) -> None:
 
 
 def disk_of(path: Path) -> tuple[str, str, str]:
-    """The physical disk under ``path``'s filesystem, below its partition and any device-mapper
-    layers (the first of their ``slaves``): its name, ``MAJ:MIN`` and active scheduler."""
+    """The whole device ``path``'s filesystem sits on, where its cgroup's reads are throttled and
+    counted, with its ``MAJ:MIN``, and the active scheduler of the physical disk below it (under
+    any device-mapper layers, the first of their ``slaves``)."""
     dev = os.stat(path).st_dev
-    block = Path(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}").resolve()
+    top = Path(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}").resolve()
+    if (top / "partition").exists():
+        top = top.parent
+    block = top
     while True:
         if (block / "partition").exists():
             block = block.parent
@@ -108,7 +114,9 @@ def disk_of(path: Path) -> tuple[str, str, str]:
         raise Failure(f"{block.name} under {path} has no queue/scheduler")
     scheduler = scheduler_file.read_text(encoding="ascii").split()
     active = next((s.strip("[]") for s in scheduler if s.startswith("[")), " ".join(scheduler))
-    return block.name, (block / "dev").read_text(encoding="ascii").strip(), active
+    if block != top:
+        active = f"{active} on {block.name} below {top.name}"
+    return top.name, (top / "dev").read_text(encoding="ascii").strip(), active
 
 
 def manager_cgroup() -> Path:
@@ -220,9 +228,10 @@ def capped(data: Path, majmin: str, slices: dict[str, dict[str, str]]) -> str:
     group = manager_cgroup() / "hive.slice/hive-heads.slice"
 
     def reads() -> int:
+        # The kernel leaves out a device, or its byte and IO counters, while they are all zero.
         for line in (group / "io.stat").read_text(encoding="ascii").splitlines():
             if line.startswith(majmin + " "):
-                return int(dict(f.split("=") for f in line.split()[1:])["rios"])
+                return int(dict(f.split("=", 1) for f in line.split()[1:]).get("rios", 0))
         return 0
 
     io_max = (group / "io.max").read_text(encoding="ascii").strip()
@@ -230,10 +239,10 @@ def capped(data: Path, majmin: str, slices: dict[str, dict[str, str]]) -> str:
     time.sleep(SAMPLE_SECONDS)
     rate = (reads() - first) / (time.monotonic() - began)
     loaded = json.loads(finish(heads))
-    message = (f"hive-heads.slice io.max {io_max!r}; io.stat rios {rate:.1f}/s over "
+    message = (f"hive-heads.slice io.max {io_max!r}; io.stat rios of {majmin} {rate:.1f}/s over "
                f"{SAMPLE_SECONDS} s against IOReadIOPSMax {cap} (tolerance {TOLERANCE:.0%}); "
                f"the load counted {loaded['iops']} IOPS")
-    if rate > cap * (1 + TOLERANCE):
+    if max(rate, loaded["iops"]) > cap * (1 + TOLERANCE):
         raise Failure(message)
     return message
 
