@@ -5,6 +5,12 @@ enum value or operation; a field becoming required; a type or validation keyword
 `additionalProperties` becoming `false`) needs a major bump (minor while `0.x`), an entry
 here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <rev>` enforces it.
 
+## C1 1.5.0
+- `Kind` gains `reminder_due` and `reminder_fallback` (additive; the packet is unchanged). The
+  hive publishes `reminder_due` when a reminder card falls due, its payload carrying the reminder
+  text verbatim, and `reminder_fallback` after it sent a reminder to the owner directly through
+  `ulei-tg notify`, carrying the text sent and the Telegram receipt (ADR-0100).
+
 ## C1 1.4.0
 - Inbox wire operation `reconcile` (additive; the packet is unchanged): `ReconcileRequest` (`id`,
   `outcome` a `ReconcileOutcome`, the one value `reconciled-delivered`, and `note` a

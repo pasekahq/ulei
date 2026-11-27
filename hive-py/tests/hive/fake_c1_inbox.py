@@ -1,5 +1,5 @@
 """The owner inbox's C1 daemon for the hive tests: `POST /v1/publish` and `POST /v1/get` over HTTP/1.1 on a unix
-socket, one request per connection, stored in a FakeInbox. Every request is kept in `requests` as (method, raw body)
+socket, one request per connection, stored in a FakeInbox that accepts every C1 kind. Every request is kept in `requests` as (method, raw body)
 and checked against C1's PublishRequest or GetRequest; a violation is kept in `invalid` and answered `bad_request`."""
 import json
 import socket
@@ -19,7 +19,7 @@ class FakeC1Inbox:
     """Serves `inbox` (a FakeInbox) on `path`; `close` wakes the blocked accept with one connection."""
 
     def __init__(self, path, key):
-        self.path, self.inbox = str(path), FakeInbox(key)
+        self.path, self.inbox = str(path), FakeInbox(key, C1['$defs']['Kind']['enum'])
         self.requests, self.invalid = [], []
         self.closing = False
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

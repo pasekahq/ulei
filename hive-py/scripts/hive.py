@@ -9,7 +9,7 @@
                  [--every DURATION | --cron EXPR [--tz IANA] [--misfire skip|latest] [--start-window HH:MM-HH:MM]]
                  [--max-runs N] [--until TIMESTAMP] [--overlap skip|queue]
                  [--script PATH [--script-timeout SECONDS]] [--deliver telegram|owner-inbox|local] [--tag TAG]
-                 [--wait SECONDS] [--json]
+                 [--reminder TEXT] [--wait SECONDS] [--json]
   hive.py list [--state S ...] [--class C] [--parent EPIC] [--followup-of CARD] [--creator ACTOR]
                  [--placement board|hidden] [--query TEXT] [--limit N] [--json]
   hive.py board [--json] [--archive [--limit N]]   columns in progress, waiting (with a badge) and done;
@@ -29,6 +29,10 @@
   hive.py cancel CARD [--reason TEXT] [--by OWNER|secretary]   cancel and wait for active heads to exit;
                  OWNER is config owner_actor
   hive.py stop CARD [--by ACTOR]   a recurring card creates no further instances; existing ones run on
+  hive.py reminder claim CARD [--by ACTOR]   take a due reminder; stops its unclaimed fallback
+  hive.py reminder send CARD [--text TEXT] [--by ACTOR]   send a claimed reminder through ulei-tg notify, the original
+                 text without --text; prints the Telegram receipt
+  hive.py reminder withdraw CARD --reason TEXT [--by ACTOR]   withdraw a claimed reminder; nothing is sent
   hive.py assign CARD (EXECUTOR | --none) [--on-unavailable wait|fallback] [--by ACTOR]
                  set or remove the worker executor (a [vendors.*] name) of a created, queued or waiting card
   hive.py tag CARD (TAG | --none) [--by ACTOR]   set or clear the user tag qb binds to a login; not on a final card
@@ -52,7 +56,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from hive import api, store, dispatcher, heads, liveness, delivery, inspect  # noqa: E402
+from hive import api, store, dispatcher, heads, liveness, delivery, inspect, reminder  # noqa: E402
 
 TZ = dt.timezone(dt.timedelta(hours=1))
 
@@ -268,6 +272,8 @@ def main(argv=None):
     c.add_argument('--until', type=parse_timestamp, help='with --every/--cron: offset-aware ISO-8601 time after which no instance starts')
     c.add_argument('--overlap', help='with --every/--cron: skip (default) a period while the previous instance runs, or queue it behind')
     c.add_argument('--tag', help='the user tag qb binds to a login: ^[a-z][a-z0-9_-]{0,63}$')
+    c.add_argument('--reminder', help='a reminder: this text, verbatim, is due at --not-before or each period; '
+                   'no head runs and the acceptance is optional')
     c.add_argument('--wait', type=float, default=0, help='block up to N seconds for done/blocked')
     c.add_argument('--json', action='store_true')
     ls = sub.add_parser('list')
@@ -352,14 +358,26 @@ def main(argv=None):
     st.add_argument('card')
     st.add_argument('text')
     st.add_argument('--by', default='secretary')
+    rm = sub.add_parser('reminder', help='the secretary claims a due reminder, then sends or withdraws it')
+    verbs = rm.add_subparsers(dest='verb', required=True)
+    for verb, text in (('claim', 'take a due reminder; stops its unclaimed fallback'),
+                       ('send', 'send a claimed reminder through ulei-tg notify'),
+                       ('withdraw', 'withdraw a claimed reminder; nothing is sent')):
+        v = verbs.add_parser(verb, help=text)
+        v.add_argument('card')
+        v.add_argument('--by', default='secretary', help='secretary or config owner_actor')
+        if verb == 'send':
+            v.add_argument('--text', help='the text to send instead of the original')
+        if verb == 'withdraw':
+            v.add_argument('--reason', required=True)
     sub.add_parser('tick')
     d = sub.add_parser('daemon')
     d.add_argument('--interval', type=float, default=10)
     sub.add_parser('observe')
     sub.add_parser('ladder')
     a = ap.parse_args(argv)
-    if a.cmd == 'create' and not (a.script or a.acceptance or a.accept_review):
-        ap.error('one of the arguments --acceptance --accept-review is required (unless --script is set)')
+    if a.cmd == 'create' and not (a.script or a.reminder or a.acceptance or a.accept_review):
+        ap.error('one of the arguments --acceptance --accept-review is required (unless --script or --reminder is set)')
     if a.cmd == 'board' and a.limit < 1:
         ap.error('argument --limit: must be a positive number of cards')
 
@@ -402,7 +420,7 @@ def main(argv=None):
                                       every=a.every, max_runs=a.max_runs, until=a.until, overlap=a.overlap,
                                       cron=a.cron, tz=a.tz, misfire=a.misfire, start_window=a.start_window, script=a.script,
                                       script_timeout=a.script_timeout, deliver=a.deliver, gate_timeout=a.gate_timeout,
-                                      tag=a.tag)
+                                      tag=a.tag, reminder=a.reminder)
         except api.CardError as e:
             print(f'hive: card rejected: {e}', file=sys.stderr)
             return 2
@@ -521,6 +539,14 @@ def main(argv=None):
             print(f"  executor: {card['executor']}")
         if card['tag'] is not None:
             print(f"  tag: {card['tag']}")
+        if card['reminder'] is not None:
+            rs = card['reminder_state']
+            print('  reminder: ' + (f"{rs['state']} · due {ts(rs['due_at'], tz)} · attempts {rs['attempts']}"
+                                    + (f" · claimed by {rs['claimed_by']}" if rs['claimed_by'] else '')
+                                    + (f" · sent by {rs['sent_by']}" if rs['sent_by'] else '')
+                                    + (f" · reason: {rs['reason']}" if rs['reason'] else '')
+                                    + (f" · error: {rs['error']}" if rs['error'] else '') if rs else 'not due yet'))
+            print(f"    text: {card['reminder']}")
         if card['model'] is not None:
             print(f"  model: {card['model']} · effort: {card['effort']}")
         if card['panel']:
@@ -581,6 +607,25 @@ def main(argv=None):
             print(f'hive: resolve rejected: {e}', file=sys.stderr)
             return 2
         print(f'{a.card} dispute resolved: {a.decision}, now {state}')
+        return 0
+
+    if a.cmd == 'reminder':
+        d = dispatcher.Dispatcher(cfg, conn)
+        try:
+            if a.verb == 'claim':
+                reminder.claim(d, a.card, a.by)
+                print(f'{a.card} reminder claimed by {a.by}')
+            elif a.verb == 'send':
+                print(json.dumps({'card': a.card, 'state': 'delivered', 'receipt': reminder.send(d, a.card, a.text, a.by)}))
+            else:
+                reminder.withdraw(d, a.card, a.reason, a.by)
+                print(f'{a.card} reminder withdrawn')
+        except api.CardError as e:
+            print(f'hive: reminder {a.verb} refused: {e}', file=sys.stderr)
+            return 2
+        except reminder.SendFailed as e:
+            print(f'hive: reminder send failed: {e}', file=sys.stderr)
+            return 1
         return 0
 
     if a.cmd == 'release':

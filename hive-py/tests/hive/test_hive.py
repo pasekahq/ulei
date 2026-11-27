@@ -22,6 +22,7 @@ REAL_SCHEDULE_GATE = dispatcher.Dispatcher.schedule_gate
 
 FAKE = Path(__file__).with_name('fake_head.py')
 FAKE_DOTS = Path(__file__).with_name('fake_dots.py')
+FAKE_ULEI_TG = Path(__file__).with_name('fake_ulei_tg.py')
 FAKE_INBOX_LIBRARY = Path(__file__).with_name('fake_inbox_library')
 
 
@@ -140,6 +141,10 @@ routes = {{ 1 = "judge-s1", 2 = "judge-s2", 3 = "judge-s3", 4 = "judge-s4", 5 = 
 route = "steward-test"
 max_tokens = 2048
 timeout_s = 30
+
+[reminders]
+tg_binary = "{tmp}/bin/fake-ulei-tg"
+tg_config = "{tmp}/ulei.toml"
 """
 
 
@@ -152,6 +157,10 @@ def env(tmp_path, monkeypatch, gateway):
     dots = tmp_path / 'bin' / 'fakedots'
     dots.write_text(f'#!/bin/sh\nexec {sys.executable} {FAKE_DOTS} {tmp_path / "dots"} "$@"\n')
     dots.chmod(0o755)
+    tg = tmp_path / 'bin' / 'fake-ulei-tg'
+    tg.write_text(f'#!/bin/sh\nexec {sys.executable} {FAKE_ULEI_TG} {tmp_path / "tg"} "$@"\n')
+    tg.chmod(0o755)
+    (tmp_path / 'tg').mkdir()
     config = tmp_path / 'config.toml'
     config.write_text(TEST_CONFIG.format(tmp=tmp_path, fake=fake, library=FAKE_INBOX_LIBRARY, texts=ROOT / 'texts'))
     monkeypatch.setenv('HIVE_CONFIG', str(config))

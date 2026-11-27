@@ -32,7 +32,7 @@ ADMISSION_DEFAULTS = {'urgent_max_step': 2, 'urgent_reserve': 1, 'urgent_floor_m
 # Deployment values without a default: a config that lacks one is refused with the key's name.
 REQUIRED_KEYS = ('owner_actor', 'owner_tz', 'delivery', 'results_dir', 'card_show_command',
                  'head_env', 'gate_env', 'script_env', 'script_env_file', 'steward_dir', 'rotation_log', 'texts',
-                 'gateway_socket', 'judge', 'steward')
+                 'gateway_socket', 'judge', 'steward', 'reminders')
 JUDGE_NUMBERS = ('max_tokens', 'timeout_s', 'retry_s')
 STEWARD_NUMBERS = ('max_tokens', 'timeout_s')
 ROUTE_ALIAS = re.compile(r'[a-z][a-z0-9_-]{0,63}')
@@ -130,6 +130,12 @@ CREATE INDEX IF NOT EXISTS cards_board ON cards(card_class, kind, id);
 CREATE INDEX IF NOT EXISTS links_followup ON links(card_id) WHERE kind='followup';
 """
 
+# One row per reminder card that fell due (ADR-0100); the dispatcher reads the open ones every tick. Additive.
+REMINDERS = """
+CREATE TABLE IF NOT EXISTS reminders(card_id TEXT PRIMARY KEY REFERENCES cards(id), state TEXT NOT NULL CHECK(state IN ('due', 'claimed', 'delivered', 'withdrawn', 'failed')), due_at REAL NOT NULL, claimed_at REAL, claimed_by TEXT, attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL, error TEXT, sent_by TEXT, sent_text TEXT, receipt TEXT, sent_at REAL, reason TEXT, updated_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS reminders_open ON reminders(state) WHERE state IN ('due', 'claimed');
+"""
+
 SERIES_COLUMNS = {'gate_timeout': 'REAL', 'series_every': 'REAL', 'series_max': 'INTEGER', 'series_until': 'REAL', 'series_overlap': 'TEXT',
                   'series_stopped': 'REAL', 'series_next': 'INTEGER', 'series_skipped': 'INTEGER',
                   'series_period': 'INTEGER', 'series_cron': 'TEXT', 'series_tz': 'TEXT', 'series_due': 'REAL',
@@ -172,7 +178,8 @@ def missing(key):
 def check_deployment(cfg):
     """Refuse a config without a deployment value: the keys of REQUIRED_KEYS and TEXTS, the keys the delivery adapter
     reads, the home and the boolean tag_launcher of each vendor that runs heads, a daily_runs that is not a non-negative
-    integer, the disk and cgroups of enabled [resources] and the home of a configured limits command."""
+    integer, the disk and cgroups of enabled [resources], the home of a configured limits command and the [reminders]
+    table (reminder.config)."""
     for key in REQUIRED_KEYS:
         if key not in cfg:
             raise missing(key)
@@ -214,6 +221,8 @@ def check_deployment(cfg):
         raise ValueError(f"config: gateway_socket must be a path, got {cfg['gateway_socket']!r}")
     cfg['judge'] = check_judge(cfg['judge'])
     check_steward(cfg['steward'])
+    from . import reminder
+    cfg['reminders'] = reminder.config(cfg['reminders'])
 
 
 def check_numbers(table, name, keys):
@@ -361,6 +370,8 @@ def connect(db_path, begin_retries=0, owner_actor=None):
     migrate(conn, owner_actor)
     if 'tag' not in card_columns:
         conn.execute('ALTER TABLE cards ADD COLUMN tag TEXT')
+    if 'reminder' not in card_columns:
+        conn.execute('ALTER TABLE cards ADD COLUMN reminder TEXT')
     indexes = conn.execute('PRAGMA index_list(runs)').fetchall()
     old_unique = any(i['origin'] == 'u' and
                      [c['name'] for c in conn.execute(f"PRAGMA index_info({i['name']})")] == ['card_id', 'round', 'role']
@@ -384,7 +395,7 @@ def connect(db_path, begin_retries=0, owner_actor=None):
     conn.execute('DROP INDEX IF EXISTS runs_active_claim')
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS runs_reviewer_claim ON runs(card_id, round, role)
                     WHERE role='reviewer'""")
-    conn.executescript(TICK_INDEXES + BOARD_INDEXES)
+    conn.executescript(TICK_INDEXES + BOARD_INDEXES + REMINDERS)
     return conn
 
 

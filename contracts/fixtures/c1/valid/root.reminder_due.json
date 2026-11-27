@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "kind": "reminder_due",
+  "id": "hive:h_0000cafe:reminder_due",
+  "payload": "{\"source\": \"hive\", \"card_id\": \"h_0000cafe\", \"title\": \"synthetic reminder\", \"text\": \"Synthetic reminder: water the plants.\", \"due_at\": 1763290000.5, \"series\": null, \"period\": null, \"unclaimed_s\": 180, \"claim_silence_s\": 300, \"next_actor\": \"secretary\", \"how_to_read\": \"hive.py show h_0000cafe\", \"note\": \"Synthetic note.\"}",
+  "source_ts": 1763290000.5,
+  "trust": "untrusted-source-data",
+  "mac": "5903e8793a1dcdd407a87f95756fed6efc10bcd6a13ea5851fd759c827544da8"
+}
