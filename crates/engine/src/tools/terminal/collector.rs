@@ -228,7 +228,7 @@ pub(super) fn spill_path(dir: &Path, child: u32) -> PathBuf {
 }
 
 /// `dir` and its parents created, `dir` a real directory of mode 0700.
-fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let meta = fs::symlink_metadata(dir)?;
     if !meta.is_dir() {

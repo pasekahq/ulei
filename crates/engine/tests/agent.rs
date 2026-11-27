@@ -1077,6 +1077,7 @@ fn the_trace_holds_the_turn_context_requests_and_tool_calls() {
     );
     assert!(lines[3]["ms"].as_f64().unwrap() >= 0.0);
     assert!(lines[3]["result_chars"].as_u64().unwrap() > 0);
+    assert_eq!(lines[3]["spilled"], json!(false));
     assert_eq!(
         (
             lines[4]["request_id"].clone(),
@@ -1361,6 +1362,130 @@ fn a_call_past_the_batch_deadline_gets_the_timeout_text_and_the_others_their_res
     assert_eq!((got[1].0.as_str(), got[1].1), ("c2", false));
     assert!(got[1].2.contains("1|alpha"), "{:?}", got[1]);
     assert_eq!(sent_messages(&fake, 1), out.messages[..2]);
+}
+
+/// A tool of the name `name` answering `chars` characters of `fill`.
+struct Big {
+    name: &'static str,
+    chars: usize,
+    fill: char,
+}
+
+impl Tool for Big {
+    fn definition(&self) -> c4g::Tool {
+        c4g::Tool {
+            name: self.name.into(),
+            description: String::new(),
+            input_schema: Map::new(),
+            native: None,
+        }
+    }
+
+    fn run(&self, _input: &Map<String, Value>, _ctx: Context<'_>) -> Output {
+        Output::ok(self.fill.to_string().repeat(self.chars))
+    }
+}
+
+#[test]
+fn a_large_mcp_result_reaches_the_model_as_a_preview_with_the_path_of_its_file() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![
+            call("c1", "mcp__hive__hive_health", json!({})),
+            call("c2", "mcp__hive__hive_list", json!({})),
+        ]),
+        text_step("Done."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.extra.push(Box::new(Big {
+        name: "mcp__hive__hive_health",
+        chars: 63_520,
+        fill: 'h',
+    }));
+    run.extra.push(Box::new(Big {
+        name: "mcp__hive__hive_list",
+        chars: 50_000,
+        fill: 'l',
+    }));
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    let got = results(&out.messages[1]);
+    let path = dir.0.join("spillover").join("c1.txt");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "h".repeat(63_520));
+    assert!(!got[0].1, "{:?}", got[0]);
+    assert!(
+        got[0].2.starts_with(&format!(
+            "<persisted-output>\nThis tool result was too large (63,520 characters, 62.0 KB).\n\
+             Full output saved to: {}\n",
+            path.display()
+        )),
+        "{:?}",
+        got[0].2
+    );
+    assert!(got[0].2.contains(&format!(
+        "Preview (first 1500 chars):\n{}\n...\n",
+        "h".repeat(1500)
+    )));
+    assert!(got[0].2.chars().count() < 2_400, "{}", got[0].2.len());
+    // At the threshold a result stays whole.
+    assert_eq!(got[1].2, "l".repeat(50_000));
+    assert!(!dir.0.join("spillover").join("c2.txt").exists());
+    // The request of the next step carries the preview, not the result.
+    assert_eq!(sent_messages(&fake, 1), out.messages[..2]);
+}
+
+#[test]
+fn the_largest_results_of_a_step_over_its_budget_go_to_files() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![
+            call("c1", "memory", json!({})),
+            call("c2", "web_search", json!({"query": "q1"})),
+            call("c3", "mcp__hive__hive_list", json!({})),
+        ]),
+        text_step("Done."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.extra.push(Box::new(Big {
+        name: "memory",
+        chars: 98_000,
+        fill: 'm',
+    }));
+    run.extra.push(Box::new(Big {
+        name: "web_search",
+        chars: 99_000,
+        fill: 'w',
+    }));
+    run.extra.push(Box::new(Big {
+        name: "mcp__hive__hive_list",
+        chars: 40_000,
+        fill: 'l',
+    }));
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    // Each is under its own threshold; together they pass 200,000 characters, and saving the
+    // largest one brings them under it.
+    let got = results(&out.messages[1]);
+    assert_eq!(got[0].2, "m".repeat(98_000));
+    assert!(
+        got[1].2.starts_with("<persisted-output>\n"),
+        "{:?}",
+        got[1].2
+    );
+    assert_eq!(
+        fs::read_to_string(dir.0.join("spillover").join("c2.txt")).unwrap(),
+        "w".repeat(99_000)
+    );
+    assert!(got[1].2.chars().count() < 2_400, "{}", got[1].2.len());
+    assert_eq!(got[2].2, "l".repeat(40_000));
 }
 
 #[test]

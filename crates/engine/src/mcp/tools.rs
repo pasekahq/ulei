@@ -28,7 +28,7 @@ const MAX_RESOURCE_B64_CHARS: usize = MAX_RESOURCE_BYTES * 4 / 3 + 4;
 const ELISION_SCAN_MIN_CHARS: usize = 1_000;
 /// How much of a result the elision scan reads.
 const ELISION_SCAN_MAX_CHARS: usize = 65_536;
-const ELISION_NOTICE: &str = "\n[note: this result contains provider-side elision markers (e.g. \
+pub(crate) const ELISION_NOTICE: &str = "\n[note: this result contains provider-side elision markers (e.g. \
 \"...N more items\" / has_more:true). The data shown is INCOMPLETE \u{2014} page/fetch the \
 remainder before treating any enumeration as complete.]";
 
