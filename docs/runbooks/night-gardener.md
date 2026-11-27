@@ -248,6 +248,42 @@ judge-v1 on Haiku, Sonnet and Opus). The recall floors are deliberately loose, b
 leaves memory untouched while damage does not; the damage and precision bounds are the ones a
 route must not fall below before it judges silently.
 
+### 6a. The judge eval in CI
+
+The workflow `judge-eval.yml` runs the same eval through the Claude Code CLI (`--claude --gate`,
+default model `haiku`) against a real model. It is informational and never a required check. It
+runs:
+
+- on pull requests into main from branches of this repository that change the judge's prompt
+  (`crates/engine/src/night/judge.txt`), its parser and stage (`night/judge.rs`, `extract.rs`,
+  `stages.rs`, the prompt's golden file), the garden's hint selection (`crates/garden/src/judge.rs`,
+  `edge.rs`), `ci/judge_eval.py`, `ci/reconcile_eval/`, the pinned CLI in `ci/claude-cli/` or
+  the workflow itself; a fork's pull request skips it, since the run would hold the credential;
+- weekly, Wednesdays 03:41 UTC, to catch drift of the model behind the alias;
+- by hand: `gh workflow run judge-eval.yml -R pasekahq/ulei -f model=sonnet`, with
+  `-f limit=25` for a smoke run of the first 25 cases.
+
+It needs one of two repository secrets, used only by this workflow: `CLAUDE_CODE_OAUTH_TOKEN`, a
+subscription token (`claude setup-token` on a machine logged in to the subscription, then
+`gh secret set CLAUDE_CODE_OAUTH_TOKEN -R pasekahq/ulei` and paste it), or `ANTHROPIC_API_KEY`
+(`gh secret set ANTHROPIC_API_KEY -R pasekahq/ulei`); with both set, the token is used. With
+neither, the job ends green with the notice `judge eval skipped: no Claude credential` and
+calls nothing. A full Haiku run takes about 6 minutes and costs about 0.05 to 0.07 USD.
+
+The step summary shows the model id, cases scored of 419, failed calls, dropped facts, accuracy,
+precision and recall per relation, silent damage, each gate threshold with pass or fail, the
+cost and the wall time; the artifact `judge-eval` (30 days) holds `judge-eval.json` and the raw
+replies of calls with a malformed attempt or a dropped case. The job fails when the gate fails
+(the unscored-cases threshold covers failed calls), and with the CLI's own message when the
+credential is refused or a usage limit is hit.
+
+Read a red run with the noise in mind: two Haiku runs of the same prompt differed in 18 of the
+419 cases (9 each way), and per-relation rates moved by up to 1.5 points. Haiku clears the
+recall floors by a few cases only (supersedes 0.806 against 0.75, contradiction about 0.70
+against 0.60), so a single run that misses one recall threshold by a case or two is not yet a
+regression: run it again, or on `sonnet`, before acting. A miss of silent damage or duplicate
+precision is not noise.
+
 ## 7. The first full pass over an imported history
 
 Raise `max_usd` to `<BUDGET>` and run by hand, or let the timer do it night by night:

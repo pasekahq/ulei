@@ -1,0 +1,132 @@
+name: Judge eval
+
+# ADR-0096: the night's judge of stage d on the 419 synthetic cases of ci/reconcile_eval/
+# judge-eval.jsonl, through the headless Claude Code CLI against a real Claude model
+# (ci/judge_eval.py --claude --gate). On demand, weekly (model drift) and on pull requests into
+# main that touch the judge's prompt, its parser, its stage, the garden's hints, the eval or this
+# file. Informational, never a required check: the gate's thresholds are provisional and about 18
+# of the 419 cases flip between two runs of the same model (docs/runbooks/night-gardener.md
+# section 6). Without a Claude credential among the repository secrets the job ends green with
+# a notice and calls nothing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Model alias or id for the CLI (haiku, sonnet, opus, ...)
+        type: string
+        default: haiku
+      limit:
+        description: Only the first N cases (empty for all 419; e.g. 25 for a smoke run)
+        type: string
+        default: ""
+  # Pull requests into main only, and only when a file that can change the judge's verdicts or
+  # the eval's reading of them changes.
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/engine/src/night/judge.rs"
+      - "crates/engine/src/night/judge.txt"
+      - "crates/engine/src/night/extract.rs"
+      - "crates/engine/src/night/stages.rs"
+      - "crates/engine/tests/fixtures/judge-prompt.txt"
+      - "crates/garden/src/judge.rs"
+      - "crates/garden/src/edge.rs"
+      - "ci/judge_eval.py"
+      - "ci/reconcile_eval/**"
+      - "ci/claude-cli/**"
+      - ".github/workflows/judge-eval.yml"
+  schedule:
+    - cron: "41 3 * * 3" # Wednesdays 03:41 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: judge-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  judge:
+    # The pull request's own code runs with the Claude credential, so only branches of this
+    # repository get here; a fork's pull request (which gets no secrets anyway) skips the job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Claude credential
+        id: credential
+        env:
+          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$OAUTH_TOKEN" ] || [ -n "$API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::judge eval skipped: no Claude credential (repository secret CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY)"
+            echo "Judge eval skipped: no Claude credential." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.credential.outputs.present == 'true'
+        with:
+          persist-credentials: false
+      # The linux-x64 native binary of the CLI at the exact version of ci/claude-cli, checked
+      # against the lockfile's hash; no install script runs.
+      - name: Install the Claude Code CLI
+        if: steps.credential.outputs.present == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/claude-cli"
+          cp ci/claude-cli/package.json ci/claude-cli/package-lock.json "$RUNNER_TEMP/claude-cli/"
+          npm ci --prefix "$RUNNER_TEMP/claude-cli" --ignore-scripts --no-audit --no-fund
+          bin="$RUNNER_TEMP/claude-cli/node_modules/@anthropic-ai/claude-code-linux-x64/claude"
+          "$bin" --version
+          echo "CLAUDE_BIN=$bin" >> "$GITHUB_ENV"
+      - name: Judge eval
+        if: steps.credential.outputs.present == 'true'
+        env:
+          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MODEL: ${{ inputs.model || 'haiku' }}
+          LIMIT: ${{ inputs.limit }}
+          DISABLE_AUTOUPDATER: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        run: |
+          # One credential reaches the CLI: the subscription token when it is set, else the key.
+          if [ -n "$OAUTH_TOKEN" ]; then
+            export CLAUDE_CODE_OAUTH_TOKEN="$OAUTH_TOKEN"
+          else
+            export ANTHROPIC_API_KEY="$API_KEY"
+          fi
+          unset OAUTH_TOKEN API_KEY
+          args=(--claude --claude-bin "$CLAUDE_BIN" --model "$MODEL" --gate
+                --out judge-eval.json --save-raw raw --summary-md "$GITHUB_STEP_SUMMARY")
+          if [ -n "$LIMIT" ]; then
+            case "$LIMIT" in
+              *[!0-9]*) echo "::error::limit must be a whole number, got '$LIMIT'"; exit 1 ;;
+            esac
+            args+=(--limit "$LIMIT")
+          fi
+          status=0
+          python3 -I ci/judge_eval.py "${args[@]}" || status=$?
+          case "$status" in
+            0) ;;
+            1) echo "::error::judge eval: the gate failed (thresholds in the step summary; one red recall threshold can be run noise, see the runbook)" ;;
+            *)
+              why=$(python3 -I -c 'import json, sys
+          try:
+              print(json.load(open(sys.argv[1], encoding="utf-8")).get("error", "").replace("\n", " "))
+          except (OSError, ValueError):
+              pass' judge-eval.json)
+              echo "::error::judge eval stopped: ${why:-exit $status, see the log}" ;;
+          esac
+          exit "$status"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.credential.outputs.present == 'true'
+        with:
+          name: judge-eval
+          path: |
+            judge-eval.json
+            raw/
+          retention-days: 30
+          if-no-files-found: ignore

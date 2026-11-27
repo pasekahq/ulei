@@ -11,7 +11,9 @@ only its own fact undecided (a *dropped* case, unscored, as the night leaves it 
 answer with no object, or deciding no fact, is malformed and asked once more, then the call
 fails and its cases are unscored.
 
-It calls a model, so it never runs in CI. Give it one endpoint:
+It calls a model, so it is never a required check: the workflow ``judge-eval.yml`` runs it with
+``--claude`` on demand, weekly and on pull requests that touch the judge, when a Claude
+credential is set (``docs/runbooks/night-gardener.md`` section 6). Give it one endpoint:
 
 - ``--gateway SOCKET --route ALIAS``: the qb gateway (C4G) the night uses; qb holds the keys.
 - ``--openai-url URL --model NAME``: any OpenAI-compatible chat completions endpoint, the key
@@ -23,7 +25,9 @@ It calls a model, so it never runs in CI. Give it one endpoint:
   no MCP servers, no settings files and no saved session; the prompt goes in on stdin and the
   answer is read from the JSON envelope. ``--timeout`` bounds each call; a timeout, a failed
   exit or an unreadable envelope counts as a malformed answer (asked once more, then a failed
-  call). The cost the envelope reports is summed into ``usage.cost_usd``. Example:
+  call); an error envelope that is an authentication or usage-limit error stops the run at
+  once with exit 2 and that error, in ``error`` of ``--out``. The cost the envelope reports is
+  summed into ``usage.cost_usd``. Example:
   ``python3 ci/judge_eval.py --claude --model sonnet --out judge-eval.json``; add
   ``--limit 6`` for a cheap smoke run.
 
@@ -51,7 +55,8 @@ and it prints, and writes as JSON to ``--out``:
 case, one JSON file per call. ``--gate`` exits 1 unless the run meets the provisional thresholds
 of ``GATE`` (``docs/runbooks/night-gardener.md`` section 6). ``--rescore FILE`` scores (and
 gates) the per-case verdicts of an earlier ``--out`` file again under the current set and
-metrics, without a model.
+metrics, without a model. ``--summary-md FILE`` appends a compact Markdown table of the run (the
+scores, each gate threshold, cost and wall time) to FILE, e.g. ``$GITHUB_STEP_SUMMARY``.
 
 ``python3 ci/judge_eval.py --self-test`` checks the rendering against the engine's golden file,
 the reading of answers and the scoring on scripted judges, without any model. Synthetic data
@@ -306,6 +311,32 @@ def openai_call(url: str, model: str, key: str, system: str, prompt: str, max_to
                  data.get("model", model))
 
 
+class Refused(Exception):
+    """The endpoint refuses every call: no or a wrong credential, or a usage limit. The run
+    stops at once instead of counting each call as malformed."""
+
+
+# What the CLI's error envelope says when the API, or the CLI itself, refuses the account.
+REFUSAL_TYPES = ("authentication_error", "permission_error", "billing_error",
+                 "rate_limit_error")
+REFUSAL_TEXTS = ("not logged in", "/login", "invalid api key", "failed to authenticate",
+                 "usage limit", "limit reached", "hit your limit", "credit balance")
+
+
+def cli_refusal(envelope: dict) -> str | None:
+    """The reason of an error envelope of the CLI that is an authentication or usage-limit
+    error, else None."""
+    if not envelope.get("is_error"):
+        return None
+    said = str(envelope.get("result") or "")
+    status, kind = envelope.get("api_error_status"), envelope.get("api_error_type")
+    if (status in (401, 402, 403, 429) or kind in REFUSAL_TYPES
+            or any(t in said.lower() for t in REFUSAL_TEXTS)):
+        detail = ", ".join(str(x) for x in (status, kind) if x)
+        return f"{said[:300]}" + (f" ({detail})" if detail else "")
+    return None
+
+
 def claude_call(binary: str, model: str | None, system: str, prompt: str,
                 timeout: float) -> Reply:
     """One headless Claude Code turn: an empty working directory, the judge's prompt as the
@@ -321,9 +352,20 @@ def claude_call(binary: str, model: str | None, system: str, prompt: str,
         with tempfile.TemporaryDirectory(prefix="judge-eval-") as empty:
             done = subprocess.run(argv, input=prompt, capture_output=True, text=True,
                                   encoding="utf-8", cwd=empty, timeout=timeout)
+        try:
+            envelope = json.loads(done.stdout)
+        except ValueError:
+            envelope = None
+        # The CLI exits 1 with an error envelope on stdout when the API refuses the call.
+        refusal = cli_refusal(envelope) if isinstance(envelope, dict) else None
+        if refusal:
+            raise Refused(refusal)
         if done.returncode != 0:
-            raise RuntimeError(f"exit {done.returncode}: {done.stderr.strip()[:200]}")
-        envelope = json.loads(done.stdout)
+            said = envelope.get("result") if isinstance(envelope, dict) else None
+            raise RuntimeError(f"exit {done.returncode}: "
+                               f"{str(said or done.stderr.strip())[:200]}")
+        if not isinstance(envelope, dict):
+            raise ValueError(f"no JSON envelope: {done.stdout[:200]!r}")
         if envelope.get("is_error") or not isinstance(envelope.get("result"), str):
             raise RuntimeError(f"error envelope: {str(envelope.get('result'))[:200]}")
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
@@ -433,18 +475,57 @@ def score(cases: list[dict], said: dict[str, dict[str, tuple[str, str | None]] |
     }
 
 
-def gate(scores: dict) -> list[str]:
-    """The thresholds of `GATE` that `scores` misses; a metric with no value misses."""
-    missed = []
+def gate_rows(scores: dict) -> list[tuple[str, str, float, float | None, bool]]:
+    """Each threshold of `GATE` with the value of `scores` and whether it is met; a metric
+    with no value misses."""
+    rows = []
     for metric, kind, bound in GATE:
         value = scores
         for key in metric.split("."):
             value = value.get(key) if isinstance(value, dict) else None
         ok = value is not None and (value <= bound if kind == "max" else value >= bound)
-        if not ok:
-            missed.append(f"{metric} {value} ({'at most' if kind == 'max' else 'at least'} "
-                          f"{bound})")
-    return missed
+        rows.append((metric, kind, bound, value, ok))
+    return rows
+
+
+def gate(scores: dict) -> list[str]:
+    """The thresholds of `GATE` that `scores` misses; a metric with no value misses."""
+    return [f"{metric} {value} ({'at most' if kind == 'max' else 'at least'} {bound})"
+            for metric, kind, bound, value, ok in gate_rows(scores) if not ok]
+
+
+def summary_md(result: dict) -> str:
+    """A compact Markdown table of a run, for a CI step summary."""
+    def num(value, digits: int = 3) -> str:
+        return "n/a" if value is None else f"{value:.{digits}f}"
+    usage = result.get("usage") or {}
+    out = [f"### Judge eval: {result.get('judge') or 'unknown judge'}", ""]
+    if result.get("error"):
+        out += [f"**Stopped:** {result['error']}", ""]
+    s = result.get("scores")
+    if s:
+        damage = s.get("silent_damage_pairs") or [0, 0]
+        out += ["| | |", "|---|---|",
+                f"| cases scored / total | {s['scored']} / {s['cases']} |",
+                f"| calls / failed calls | {usage.get('calls', 'n/a')} / "
+                f"{usage.get('failed_calls', 'n/a')} ({s['cases_failed']} cases) |",
+                f"| dropped facts | {s['cases_dropped']} |",
+                f"| unscored rate | {num(s['unscored_rate'])} |",
+                f"| case accuracy (in reach) | {num(s['accuracy']['all'])} "
+                f"({num(s['accuracy_in_reach']['all'])}) |",
+                f"| silent damage | {num(s['silent_damage_rate'], 4)} "
+                f"({damage[0]}/{damage[1]} pairs) |",
+                f"| cost (reported by the endpoint) | {num(usage.get('cost_usd'))} USD |",
+                f"| wall time | {num(usage.get('wall_seconds'), 0)} s |", "",
+                "| relation | precision | recall in hints |", "|---|---|---|"]
+        for r in RELATIONS:
+            precision = s["contradiction_precision"] if r == "contradiction" else s["precision"][r]
+            out.append(f"| {r} | {num(precision)} | {num(s['recall_in_hints'][r])} |")
+        out += ["", "| gate (provisional) | value | bound | |", "|---|---|---|---|"]
+        for metric, kind, bound, value, ok in gate_rows(s):
+            out.append(f"| {metric} | {num(value, 4)} | {'≤' if kind == 'max' else '≥'} "
+                       f"{bound} | {'pass' if ok else '**FAIL**'} |")
+    return "\n".join(out) + "\n"
 
 
 def run(cases: list[dict], call, per_call: int,
@@ -670,6 +751,32 @@ def self_test() -> int:
     check(c288["gold"].get("also") == [{"ref": "e41.f23", "relation": "supersedes"}],
           "case c288 lists its related hint")
 
+    # The CLI's refusals (the envelopes it printed with no, a wrong and a bad OAuth credential)
+    # stop the run; another error envelope is a malformed answer.
+    for envelope in (
+            {"is_error": True, "api_error_status": None,
+             "result": "Not logged in · Please run /login"},
+            {"is_error": True, "api_error_status": 401, "api_error_type": "authentication_error",
+             "result": "Invalid API key · Fix external API key"},
+            {"is_error": True, "api_error_status": 429, "result": "Claude AI usage limit reached"}):
+        check(cli_refusal(envelope) is not None, f"a refusal not seen: {envelope}")
+    check(cli_refusal({"is_error": True, "api_error_status": 500, "result": "Overloaded"}) is None
+          and cli_refusal({"is_error": False, "result": "{}"}) is None, "a refusal too many")
+    with tempfile.TemporaryDirectory(prefix="judge-eval-test-") as tmp:
+        fake = Path(tmp) / "claude"
+        fake.write_text("#!/bin/sh\ncat >/dev/null\necho '{\"is_error\": true, \"api_error_status\""
+                        ": null, \"result\": \"Not logged in\"}'\nexit 1\n", encoding="utf-8")
+        fake.chmod(0o755)
+        try:
+            claude_call(str(fake), None, "system", "prompt", 30)
+            check(False, "a refused CLI call did not stop the run")
+        except Refused as e:
+            check("Not logged in" in str(e), f"the refusal's reason: {e}")
+    table = summary_md({"judge": "scripted judge-v2", "usage": {"calls": 1, "failed_calls": 0},
+                        "scores": perfect})
+    check("| recall_in_hints.supersedes | n/a | ≥ 0.75 | **FAIL** |" in table
+          and "| duplicate | 1.000 | 1.000 |" in table, f"the summary table:\n{table}")
+
     for what in errors:
         print(f"judge eval: {what}", file=sys.stderr)
     if errors:
@@ -698,6 +805,8 @@ def main(argv: list[str]) -> int:
                    help="exit 1 unless the run meets the provisional thresholds")
     p.add_argument("--rescore", type=Path, metavar="FILE",
                    help="score the verdicts of an earlier --out file again, no model")
+    p.add_argument("--summary-md", type=Path, metavar="FILE",
+                   help="append a Markdown table of the run (e.g. $GITHUB_STEP_SUMMARY)")
     args = p.parse_args(argv)
     if args.self_test:
         return self_test()
@@ -729,7 +838,22 @@ def main(argv: list[str]) -> int:
                 return openai_call(args.openai_url, args.model, key, system, prompt,
                                    args.max_tokens, args.timeout)
             judge = args.model
-        said, records, usage = run(cases, call, args.batch, args.save_raw)
+        started = time.monotonic()
+        try:
+            said, records, usage = run(cases, call, args.batch, args.save_raw)
+        except Refused as e:
+            why = (f"the {'Claude CLI' if args.claude else 'endpoint'} reported an "
+                   f"authentication or usage-limit error: {e}")
+            result = {"judge": f"{judge} {PROMPT_VERSION}", "error": why}
+            if args.out:
+                args.out.write_text(json.dumps(result, ensure_ascii=False, indent=1),
+                                    encoding="utf-8")
+            if args.summary_md:
+                with args.summary_md.open("a", encoding="utf-8") as f:
+                    f.write(summary_md(result))
+            print(f"judge eval: stopped: {why}", file=sys.stderr)
+            return 2
+        usage["wall_seconds"] = round(time.monotonic() - started)
         unscored = {"failed": usage["cases_failed"], "dropped": usage["cases_dropped"]}
         result = {"judge": f"{usage['model'] or judge} {PROMPT_VERSION}", "usage": usage,
                   "scores": score(cases, said, unscored), "hint_recall_e5_small": 0.886}
@@ -740,6 +864,9 @@ def main(argv: list[str]) -> int:
     if args.out:
         args.out.write_text(json.dumps({**result, **({"cases": records} if records else {})},
                                        ensure_ascii=False, indent=1), encoding="utf-8")
+    if args.summary_md:
+        with args.summary_md.open("a", encoding="utf-8") as f:
+            f.write(summary_md(result))
     for what in missed:
         print(f"judge eval: gate missed: {what}", file=sys.stderr)
     return 1 if missed else 0
