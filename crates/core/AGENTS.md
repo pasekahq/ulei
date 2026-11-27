@@ -17,7 +17,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - `prompt::model_text` builds an event's prompt byte for byte as the reference does for `weekly` and every task kind;
   the hive's `reminder_due` and `watchdog_alert` get the reminder policy (decide through the `hive_reminder` tool, the
   tool's send is the only send, `NO_REPLY_DONE` after it) and `reminder_fallback` its own (already delivered, send
-  nothing), ADR-0101. `tests/model_text.rs` pins both.
+  nothing), ADR-0101; the engine's `job_result` gets its own (tell the owner the result of the earlier request the
+  job belongs to), ADR-0102. `tests/model_text.rs` pins them.
+- C1 `pull` (ADR-0102) carries no content: it sets a flag and wakes the delivery loop, whose next step takes the
+  engine's ended jobs over C6 `job_results`, publishes each as a `job_result` signed with the root's producer key
+  (`Inbox::publish_own`) and confirms them with C6 `jobs_done`. Without a `pull` the loop never calls those methods,
+  so an idle inbox calls no engine.
 - Config comes from a file; no personal ids or paths in code. `ulei-inbox serve` and `status` read
   `ulei.toml` only through `ulei_contracts::config`; this crate holds no TOML reader.
 - `ulei-connectors` (module `connectors`, ADR-0056) reads `ulei.toml` only through

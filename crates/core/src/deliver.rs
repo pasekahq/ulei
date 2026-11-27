@@ -1,7 +1,8 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The owner inbox delivery loop of `ulei-inbox serve` with `inbox.deliver` (ADR-0036 sections
 //! 1 to 3 and 7): the single consumer of a root, taking each claimable event into the engine's
-//! owner session over C6 and settling it from the turn's report.
+//! owner session over C6 and settling it from the turn's report. After a C1 `pull` it also
+//! publishes the engine's ended background jobs as `job_result` events (ADR-0102).
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Write};
@@ -9,15 +10,18 @@ use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
 
-use serde_json::Value;
-use ulei_contracts::generated::c1::AckOutcome;
+use serde_json::{Map, Value, json};
+use ulei_contracts::generated::c1::{AckOutcome, EventTrust, Kind};
 use ulei_contracts::generated::c6::{
-    Delivery, InjectRequest, InjectResponse, StatusRequest, TurnOutcome, TurnReport, TurnState,
+    Delivery, InjectRequest, InjectResponse, JobResult, StatusRequest, TurnOutcome, TurnReport,
+    TurnState,
 };
 
 use crate::c6::{self, Client};
@@ -39,6 +43,10 @@ pub const TICK_FAILED: &str = "ulei-inbox: owner inbox tick failed; durable even
 pub const ENGINE_UNREACHABLE: &str = "ulei-inbox: engine unreachable: ";
 /// The stderr line written once when `is_idle` answers again after [`ENGINE_UNREACHABLE`].
 pub const ENGINE_REACHABLE: &str = "ulei-inbox: engine reachable again";
+/// Job results asked for at once after a `pull`.
+pub const JOB_RESULTS_LIMIT: u64 = 16;
+/// The prefix of the event id of a job's result, before the job id.
+pub const JOB_EVENT_PREFIX: &str = "engine:job:";
 /// Period of the loop's fallback poll when the root's database cannot be watched (ADR-0084):
 /// rows other writers commit without a C1 publish are taken within it.
 pub const POLL: Duration = Duration::from_secs(5);
@@ -99,6 +107,7 @@ pub struct Consumer {
     flight: Option<Flight>,
     poll: Option<Duration>,
     unreachable: Option<String>,
+    pull: Option<Arc<AtomicBool>>,
 }
 
 /// A claimed event whose `inject` has no answer yet; its lease is held.
@@ -177,6 +186,7 @@ pub fn open(
         flight: None,
         poll: None,
         unreachable: None,
+        pull: None,
     }))
 }
 
@@ -186,6 +196,13 @@ impl Consumer {
     #[must_use]
     pub fn polling(mut self, every: Duration) -> Self {
         self.poll = Some(every);
+        self
+    }
+
+    /// The consumer that takes the engine's ended jobs at the step after `pull` was set.
+    #[must_use]
+    pub fn pulling(mut self, pull: Arc<AtomicBool>) -> Self {
+        self.pull = Some(pull);
         self
     }
 
@@ -218,6 +235,13 @@ impl Consumer {
     /// One step of `Bridge.tick`: follow the turn in flight, or replay an unanswered
     /// `inject`, or recover, check `ENABLED`, the engine's owner session, claim and inject.
     fn step(&mut self) -> Result<Wait, Failed> {
+        if self
+            .pull
+            .as_ref()
+            .is_some_and(|pull| pull.swap(false, Ordering::AcqRel))
+        {
+            self.take_jobs()?;
+        }
         if self.flight.is_some() {
             return self.follow();
         }
@@ -250,6 +274,41 @@ impl Consumer {
         match self.inbox.claim(now()?, self.pace.lease_ttl)? {
             Some(row) => self.inject(claimed(&row)?),
             None => Ok(Wait::Now),
+        }
+    }
+
+    /// Publishes each ended job the engine holds as a `job_result` event signed with the
+    /// producer key, then confirms them to the engine with `jobs_done`, until none is left. A
+    /// result whose id the store holds with other content is confirmed, the stored event kept.
+    fn take_jobs(&mut self) -> Result<(), Failed> {
+        loop {
+            let results = self
+                .engine
+                .job_results(JOB_RESULTS_LIMIT)
+                .map_err(|_| Failed)?;
+            let count = results.results.len() as u64;
+            if count == 0 {
+                return Ok(());
+            }
+            let mut done = Vec::with_capacity(results.results.len());
+            for result in results.results {
+                match self.inbox.publish_own(job_packet(&result), now()?) {
+                    Ok(_) => {}
+                    Err(inbox::Error::Conflict) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "ulei-inbox: the result of job {} conflicts with its stored event; the stored one stays",
+                            result.job
+                        );
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                done.push(result.job);
+            }
+            self.engine.jobs_done(done).map_err(|_| Failed)?;
+            if count < JOB_RESULTS_LIMIT {
+                return Ok(());
+            }
         }
     }
 
@@ -441,6 +500,34 @@ fn pause(published: &Receiver<()>, until: Instant) -> bool {
             Err(RecvTimeoutError::Disconnected) => return false,
         }
     }
+}
+
+/// The unsigned `job_result` packet of `result`: id [`JOB_EVENT_PREFIX`] and the job id, observed
+/// at the job's end, its payload a JSON object of the result.
+fn job_packet(result: &JobResult) -> Map<String, Value> {
+    let payload = json!({
+        "source": "engine",
+        "job_id": result.job,
+        "tool": result.tool,
+        "outcome": result.outcome.as_str(),
+        "started": result.started,
+        "ended": result.ended,
+        "output": result.output,
+    });
+    let mut packet = Map::new();
+    packet.insert("version".to_owned(), Value::from(1));
+    packet.insert("kind".to_owned(), Value::from(Kind::JobResult.as_str()));
+    packet.insert(
+        "id".to_owned(),
+        Value::from(format!("{JOB_EVENT_PREFIX}{}", result.job)),
+    );
+    packet.insert("payload".to_owned(), Value::from(payload.to_string()));
+    packet.insert("source_ts".to_owned(), Value::from(result.ended));
+    packet.insert(
+        "trust".to_owned(),
+        Value::from(EventTrust::UntrustedSourceData.as_str()),
+    );
+    packet
 }
 
 /// The `inject` request of a claimed row: its id, the packet's `kind`, the model text, the

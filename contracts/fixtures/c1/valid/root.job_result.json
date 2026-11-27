@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "kind": "job_result",
+  "id": "engine:job:1763290000000000-3",
+  "payload": "{\"source\":\"engine\",\"job_id\":\"1763290000000000-3\",\"tool\":\"terminal\",\"outcome\":\"ok\",\"started\":1763290000.5,\"ended\":1763290120.25,\"output\":\"{\\\"output\\\": \\\"build finished\\\", \\\"exit_code\\\": 0, \\\"error\\\": null}\"}",
+  "source_ts": 1763290120.25,
+  "trust": "untrusted-source-data",
+  "mac": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+}

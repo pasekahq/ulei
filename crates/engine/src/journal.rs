@@ -1,12 +1,13 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The session journal (C8, ADR-0014): sessions with their system prompts, their live and
 //! archived messages and the steps of their turns, the history index of their turn messages and
-//! the forget marks on messages (ADR-0051) and the record of each inbox event the C6 server
-//! accepted, in one `SQLite` file. A turn sends the live set and numbers its request ids from
+//! the forget marks on messages (ADR-0051), the record of each inbox event the C6 server
+//! accepted and the background jobs of owner turns (ADR-0102), in one `SQLite` file. A turn sends the live set and numbers its request ids from
 //! journal state, so a turn after a restart sends the bytes an engine that never stopped would
 //! send, but for the random tag of its request ids.
 
 pub mod history;
+pub mod jobs;
 pub mod marks;
 pub mod raw;
 pub mod search;
@@ -30,9 +31,9 @@ use crate::agent::Outcome;
 use crate::compress;
 use crate::tools::random_hex;
 
-/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 8 are
+/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 9 are
 /// migrated.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 /// Longest session key, as the C4G `session_key`.
 pub const MAX_KEY_CHARS: usize = 128;
 
@@ -261,6 +262,7 @@ impl Journal {
                 tx.execute_batch(FTS)?;
                 tx.execute_batch(MARKS)?;
                 tx.execute_batch(SETTINGS)?;
+                tx.execute_batch(jobs::SCHEMA)?;
             }
             SCHEMA_VERSION => {}
             found @ 1..SCHEMA_VERSION => {
@@ -278,7 +280,10 @@ impl Journal {
                 if found < 8 {
                     tx.execute_batch(MARKS)?;
                 }
-                tx.execute_batch(SETTINGS)?;
+                if found < 9 {
+                    tx.execute_batch(SETTINGS)?;
+                }
+                tx.execute_batch(jobs::SCHEMA)?;
             }
             found => return Err(Error::SchemaVersion(found)),
         }

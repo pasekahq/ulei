@@ -13,8 +13,9 @@ use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use serde::Serialize;
 use serde_json::Value;
 use ulei_contracts::generated::c6::{
-    Empty, Error as WireError, ErrorCode, IdleStatus, InjectRequest, InjectResponse, SessionStatus,
-    StatusRequest, TurnOutcome, TurnReport, TurnState,
+    Ack, Empty, Error as WireError, ErrorCode, IdleStatus, InjectRequest, InjectResponse,
+    JobResult, JobResults, JobResultsRequest, JobsDone, SessionStatus, StatusRequest, TurnOutcome,
+    TurnReport, TurnState,
 };
 
 use crate::inbox::{canonical, own_uid};
@@ -30,6 +31,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Most turns a session queue holds: the C6 `maximum` of `queue_depth`.
+/// Most characters of C6 `JobResult.tool`.
+const MAX_JOB_TOOL_CHARS: usize = 128;
+/// Most characters of C6 `JobResult.output`.
+const MAX_JOB_OUTPUT_CHARS: usize = 8192;
 const MAX_QUEUE: u64 = 32;
 
 const CHUNK: usize = 8 * 1024;
@@ -212,6 +217,40 @@ impl Client {
             check_report(report, false)?;
         }
         Ok(status)
+    }
+
+    /// C6 `job_results` of at most `limit` results.
+    ///
+    /// # Errors
+    /// [`Error`]; a result off its C6 shape is [`Error::Invalid`].
+    pub fn job_results(&self, limit: u64) -> Result<JobResults, Error> {
+        let request = JobResultsRequest { limit: Some(limit) };
+        let body = self.call("job_results", &input(serde_json::to_value(&request))?)?;
+        let answer: JobResults =
+            serde_json::from_value(body).map_err(|_| Error::Invalid("not a JobResults"))?;
+        let valid = |r: &JobResult| {
+            is_job_id(&r.job)
+                && (1..=MAX_JOB_TOOL_CHARS).contains(&r.tool.chars().count())
+                && r.output.chars().count() <= MAX_JOB_OUTPUT_CHARS
+                && r.started >= 0.0
+                && r.ended >= 0.0
+        };
+        if answer.results.len() as u64 > limit || !answer.results.iter().all(valid) {
+            return Err(Error::Invalid("JobResults is off its C6 shape"));
+        }
+        Ok(answer)
+    }
+
+    /// C6 `jobs_done` of `jobs`.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn jobs_done(&self, jobs: Vec<String>) -> Result<Ack, Error> {
+        let body = self.call(
+            "jobs_done",
+            &input(serde_json::to_value(&JobsDone { jobs }))?,
+        )?;
+        serde_json::from_value(body).map_err(|_| Error::Invalid("not an Ack"))
     }
 
     /// Sends `input` to `POST /v1/<method>` and returns the `200` body unchecked.
@@ -413,6 +452,14 @@ fn is_turn_id(text: &str) -> bool {
         && text
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'-'))
+}
+
+/// Whether `text` is a C6 `JobId`: `^[a-zA-Z0-9_-]{1,64}$`.
+fn is_job_id(text: &str) -> bool {
+    (1..=64).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
 /// Whether `text` is a C6 `SessionKey`: 1 to 128 characters.

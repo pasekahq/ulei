@@ -338,6 +338,7 @@ fn turn(journal: &mut Journal, fake: &FakeGateway, prompt: &str, cwd: &Path) -> 
         cwd,
         template: &template,
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
+        owner_budget: None,
         empty_guard: true,
         origin: Origin::Other,
         compaction: Some(Compaction {

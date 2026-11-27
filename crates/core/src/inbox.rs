@@ -12,9 +12,9 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use hmac::KeyInit;
+use hmac::{KeyInit, Mac};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use ulei_contracts::generated::c1::{
     AckOutcome, Counts, ReconcileAudit, ReconcileOutcome, UncertainEvent, UncertainReason,
 };
@@ -269,6 +269,24 @@ impl Inbox {
         }
         tx.commit()?;
         Ok(checked.id.to_owned())
+    }
+
+    /// Stores `packet`, the six C1 fields without `mac`, signed with the producer key, as
+    /// [`Inbox::publish`] does.
+    ///
+    /// # Errors
+    /// As [`Inbox::publish`].
+    pub fn publish_own(
+        &mut self,
+        mut packet: Map<String, Value>,
+        now: f64,
+    ) -> Result<String, Error> {
+        let signed = packet::signed_bytes(&Value::Object(packet.clone()))?;
+        let mut mac = self.mac.clone();
+        mac.update(&signed);
+        let tag = lower_hex(&mac.finalize().into_bytes());
+        packet.insert("mac".to_owned(), Value::String(tag));
+        self.publish(&Value::Object(packet), now)
     }
 
     /// [`Inbox::publish`] of a packet given as JSON text; text `serde_json` cannot hold is

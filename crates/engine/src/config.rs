@@ -158,6 +158,20 @@ pub const CONCURRENT_TOOL_TIMEOUT: Setting = Setting {
     env: "ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT",
 };
 
+/// Seconds one tool call of a top-level owner turn may keep the turn waiting; `0` or less for
+/// no budget (ADR-0102).
+pub const OWNER_CALL_BUDGET: Setting = Setting {
+    key: "engine.owner_call_budget",
+    env: "ULEI_ENGINE_OWNER_CALL_BUDGET",
+};
+
+/// Unix socket of the owner inbox, whose C1 `pull` `serve` calls when a background job ended;
+/// unset, no tool call is offloaded.
+pub const INBOX_SOCKET: Setting = Setting {
+    key: "inbox.socket",
+    env: "ULEI_INBOX_SOCKET",
+};
+
 /// Most steps of one turn before the summary request: a count, `0` or less, `none`, `null`,
 /// `unlimited`, `infinite`, `infinity`, `inf` or `∞` for no limit.
 pub const MAX_STEPS: Setting = Setting {

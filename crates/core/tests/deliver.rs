@@ -1229,3 +1229,97 @@ fn status_calls_come_one_deliver_tick_apart() {
         "three ticks took longer than one default tick"
     );
 }
+
+/// A C6 `JobResult` of job `job` that ended `ok` with `output`.
+fn job_result(job: &str, output: &str) -> Value {
+    json!({
+        "job": job, "tool": "terminal", "outcome": "ok", "started": 1_763_289_900.5,
+        "ended": 1_763_290_000.25, "output": output,
+    })
+}
+
+#[test]
+fn a_pull_publishes_each_ended_job_as_a_signed_job_result_confirms_it_and_delivers_it() {
+    let scratch = Scratch::new();
+    let root = enabled_root(&scratch);
+    let engine = FakeC6::start(&scratch.socket());
+    let result = job_result("1763289000000000-1", "{\"output\": \"built\"}");
+    engine.script("job_results", Reply::Ok(json!({"results": [result]})));
+    engine.script("job_results", Reply::Ok(json!({"results": []})));
+    engine.script("jobs_done", Reply::Ok(json!({"ok": true})));
+    engine.script("is_idle", idle(true));
+    engine.script("inject", accepted());
+    engine.script("status", status("running", None));
+    let daemon = daemon(&scratch, &root);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        engine.count(),
+        0,
+        "the loop called the engine before a pull"
+    );
+
+    let pulled: Value = call(&daemon.socket, "pull", &json!({}), 200);
+    assert_eq!(pulled, json!({"ok": true}));
+    let done = engine.wait_calls("jobs_done", 1);
+    assert_eq!(done[0].0, json!({"jobs": ["1763289000000000-1"]}));
+    let id = "engine:job:1763289000000000-1";
+    let injects = engine.wait_calls("inject", 1);
+    assert_eq!(
+        (&injects[0].0["event_id"], &injects[0].0["kind"]),
+        (&json!(id), &json!("job_result"))
+    );
+    let inbox = Inbox::open(&root).expect("inbox");
+    let row = inbox.get(id).expect("get").expect("the job's event");
+    let stored: Value = serde_json::from_slice(&row.packet).expect("packet");
+    let payload: Value =
+        serde_json::from_str(stored["payload"].as_str().expect("payload")).expect("payload json");
+    assert_eq!(
+        payload,
+        json!({
+            "source": "engine", "job_id": "1763289000000000-1", "tool": "terminal",
+            "outcome": "ok", "started": 1_763_289_900.5, "ended": 1_763_290_000.25,
+            "output": "{\"output\": \"built\"}",
+        })
+    );
+    let mut unsigned = stored.clone();
+    unsigned.as_object_mut().expect("object").remove("mac");
+    assert_eq!(
+        sign(&KEY, &unsigned),
+        stored,
+        "signed with the producer key"
+    );
+    assert_eq!(stored["source_ts"], 1_763_290_000.25);
+    assert_eq!(engine.calls("job_results").len(), 1);
+}
+
+#[test]
+fn a_result_pulled_again_before_its_confirmation_stays_one_event() {
+    let scratch = Scratch::new();
+    let root = enabled_root(&scratch);
+    let engine = FakeC6::start(&scratch.socket());
+    let result = job_result("1763289000000000-2", "same");
+    // The fake repeats its last reply: the engine hands the same result again.
+    engine.script("job_results", Reply::Ok(json!({"results": [result]})));
+    engine.script("jobs_done", Reply::Ok(json!({"ok": true})));
+    engine.script("is_idle", idle(false));
+    let daemon = daemon(&scratch, &root);
+    let _: Value = call(&daemon.socket, "pull", &json!({}), 200);
+    engine.wait_calls("jobs_done", 1);
+    let _: Value = call(&daemon.socket, "pull", &json!({}), 200);
+    engine.wait_calls("jobs_done", 2);
+    let counts: Value = call(&daemon.socket, "counts", &json!({}), 200);
+    assert_eq!(counts["pending"], 1, "{counts}");
+    assert_eq!(daemon.stderr(), "");
+}
+
+#[test]
+fn without_the_delivery_loop_a_pull_is_not_taken() {
+    let scratch = Scratch::new();
+    let root = scratch.root_with_key(&KEY);
+    let engine = FakeC6::start(&scratch.socket());
+    let daemon = daemon(&scratch, &root);
+    let pulled: Value = call(&daemon.socket, "pull", &json!({}), 200);
+    assert_eq!(pulled, json!({"ok": false}));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(engine.count(), 0);
+}

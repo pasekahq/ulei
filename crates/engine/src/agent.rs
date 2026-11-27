@@ -22,6 +22,7 @@ use ulei_contracts::generated::c4g::{
 
 use crate::compress::{self, Compaction, Compression, MAX_COMPRESSION_ATTEMPTS};
 use crate::gateway::{Client, Error, Turn};
+use crate::jobs::OwnerBudget;
 use crate::policy::{Chain, Origin, StopDecision};
 use crate::tools::{Context, Interrupt, Output, Registry, py_strip, squeeze, thousands};
 use crate::trace::{self, Trace};
@@ -200,6 +201,9 @@ pub struct Agent<'a> {
     pub template: &'a Template,
     /// Deadline of one parallel segment of tool calls; `None` waits for every call.
     pub batch_timeout: Option<Duration>,
+    /// How long one tool call may keep the turn waiting, set for the top-level owner turns of
+    /// `serve` (ADR-0102); `None` waits for every call.
+    pub owner_budget: Option<OwnerBudget<'a>>,
     /// Whether two empty replies with zero output tokens from one route end the retries early.
     pub empty_guard: bool,
     /// Who sent the turn's input and where, as the policies scope on it.
@@ -774,10 +778,15 @@ impl Agent<'_> {
             cwd: self.cwd,
             interrupt,
         };
-        let (mut outputs, spans): (Vec<Output>, Vec<dispatch::Span>) =
-            dispatch::run_calls(self.chain, self.tools, calls, ctx, self.batch_timeout)
-                .into_iter()
-                .unzip();
+        let (mut outputs, spans): (Vec<Output>, Vec<dispatch::Span>) = dispatch::run_calls(
+            self.chain,
+            self.tools,
+            calls,
+            ctx,
+            (self.batch_timeout, self.owner_budget),
+        )
+        .into_iter()
+        .unzip();
         let window = self
             .compaction
             .as_ref()

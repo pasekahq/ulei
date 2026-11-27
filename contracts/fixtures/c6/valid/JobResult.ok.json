@@ -1,0 +1,8 @@
+{
+  "job": "1763290000000000-3",
+  "tool": "terminal",
+  "outcome": "ok",
+  "started": 1763290000.5,
+  "ended": 1763290120.25,
+  "output": "{\"output\": \"build finished\", \"exit_code\": 0, \"error\": null}"
+}

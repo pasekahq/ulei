@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c6-runtime-adapter.schema.json",
   "title": "RuntimeAdapter",
-  "description": "C6 (draft): wire protocol between the core and an agent runtime: a runtime adapter (a plugin of a foreign runtime, which may be Python) or the engine `ulei-engine`. The runtime is the server and serves the operations in `x-methods`; the core and other local callers are clients: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0008). Methods: `inject`, `is_idle`, `status`, `submit_turn`, `turn_events`, `interrupt`, `set_route`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel`, `inbox_turns`, `report_delivery`; session and turn semantics: ADR-0028; a turn's reply: ADR-0031.",
+  "description": "C6 (draft): wire protocol between the core and an agent runtime: a runtime adapter (a plugin of a foreign runtime, which may be Python) or the engine `ulei-engine`. The runtime is the server and serves the operations in `x-methods`; the core and other local callers are clients: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0008). Methods: `inject`, `is_idle`, `status`, `submit_turn`, `turn_events`, `interrupt`, `set_route`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel`, `inbox_turns`, `report_delivery`, `job_results`, `jobs_done`; session and turn semantics: ADR-0028; a turn's reply: ADR-0031.",
   "x-methods": [
     {
       "name": "inject",
@@ -69,6 +69,18 @@
       "name": "owner_channel",
       "input": "#/$defs/Empty",
       "output": "#/$defs/OwnerChannel"
+    },
+    {
+      "name": "job_results",
+      "description": "The finished background jobs whose results the owner inbox has not confirmed, oldest first; the runtime keeps each across its restarts until `jobs_done` names it (ADR-0102).",
+      "input": "#/$defs/JobResultsRequest",
+      "output": "#/$defs/JobResults"
+    },
+    {
+      "name": "jobs_done",
+      "description": "Confirms that the owner inbox stored the results of the named jobs; the runtime forgets them. Naming a job it does not hold changes nothing.",
+      "input": "#/$defs/JobsDone",
+      "output": "#/$defs/Ack"
     }
   ],
   "x-transport": {
@@ -1024,6 +1036,113 @@
       "required": [
         "kind",
         "address"
+      ],
+      "additionalProperties": false
+    },
+    "JobId": {
+      "type": "string",
+      "description": "Identity of one background job, never given to another job of the same runtime, across restarts; the owner inbox event of its result is `engine:job:<JobId>`.",
+      "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+    },
+    "JobOutcome": {
+      "type": "string",
+      "description": "How a job ended: `ok` the tool returned a result, `error` it returned a failure (its own time limit included), `lost` the runtime stopped or restarted while the job ran, which stopped its work.",
+      "enum": [
+        "ok",
+        "error",
+        "lost"
+      ]
+    },
+    "JobResult": {
+      "type": "object",
+      "description": "The final result of one tool call an owner turn offloaded past its budget.",
+      "properties": {
+        "job": {
+          "$ref": "#/$defs/JobId",
+          "description": "The job."
+        },
+        "tool": {
+          "type": "string",
+          "description": "The tool the call ran.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "outcome": {
+          "$ref": "#/$defs/JobOutcome",
+          "description": "How it ended."
+        },
+        "started": {
+          "type": "number",
+          "description": "Unix time the call started.",
+          "minimum": 0
+        },
+        "ended": {
+          "type": "number",
+          "description": "Unix time the job ended.",
+          "minimum": 0
+        },
+        "output": {
+          "type": "string",
+          "description": "The tool's result as the model would have seen it, a long one saved to a file and replaced by a preview with its path as tool results are, then cut to 8000 characters.",
+          "maxLength": 8192
+        }
+      },
+      "required": [
+        "job",
+        "tool",
+        "outcome",
+        "started",
+        "ended",
+        "output"
+      ],
+      "additionalProperties": false
+    },
+    "JobResultsRequest": {
+      "type": "object",
+      "description": "Ask for unconfirmed job results.",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "description": "Most results of the answer; 16 when absent.",
+          "minimum": 1,
+          "maximum": 64
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "JobResults": {
+      "type": "object",
+      "description": "Unconfirmed job results, oldest first; empty when none waits.",
+      "properties": {
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobResult"
+          },
+          "maxItems": 64
+        }
+      },
+      "required": [
+        "results"
+      ],
+      "additionalProperties": false
+    },
+    "JobsDone": {
+      "type": "object",
+      "description": "The jobs whose results the owner inbox stored.",
+      "properties": {
+        "jobs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobId"
+          },
+          "minItems": 1,
+          "maxItems": 64
+        }
+      },
+      "required": [
+        "jobs"
       ],
       "additionalProperties": false
     }

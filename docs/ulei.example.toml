@@ -7,7 +7,8 @@
 # $HOME/.config/ulei/ulei.toml. Syntax: section headers, `key = "string"` without escapes,
 # `key = integer`, `key = true` or `false`, comments and blank lines.
 
-# ulei-inbox serve; `socket` also ulei status.
+# ulei-inbox serve; `socket` also ulei status and ulei-engine serve, which calls its `pull` when
+# a background job ended (ADR-0102).
 [inbox]
 root = "/srv/example/inbox"
 socket = "/run/example/inbox.sock"
@@ -44,6 +45,10 @@ spill_mcp_result_chars = 50000
 spill_step_chars = 200000
 spill_preview_chars = 1500
 concurrent_tool_timeout = 60
+# Seconds one tool call of an owner turn on the main channel may keep the turn waiting
+# (ADR-0102): a terminal call still running then goes on as a background job whose result
+# reaches the owner as an inbox event; any other call is stopped. 0 turns the budget off.
+owner_call_budget = 45
 max_steps = 90
 # The qb prompt cache mode of every request: auto_1h (default), auto or off.
 prompt_cache = "auto_1h"

@@ -1,6 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The tool calls of one model step, run segment by segment as [`plan`] splits them; the calls
-//! of a parallel segment run on scoped worker threads that exist only while it runs.
+//! of a parallel segment run on scoped worker threads that exist only while it runs. The calls
+//! of an owner turn run under its call budget (ADR-0102).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -9,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use ulei_contracts::generated::c4g::ToolCall;
 
+use crate::jobs::{OwnerBudget, owner_call};
 use crate::policy::Chain;
 use crate::tools::{Context, Output, Registry, plan};
 use crate::trace::now;
@@ -25,23 +27,32 @@ pub(super) type Span = (f64, f64);
 
 /// One output per call of `calls`, in call order, with the span of its run. A parallel segment
 /// ends after `timeout` when one is given; its calls without a result by then get the timeout
-/// text.
+/// text. Under `owner`, each call keeps the turn waiting at most its budget, the calls of a
+/// parallel segment counted from the segment's start (ADR-0102).
 pub(super) fn run_calls(
     chain: &mut Chain,
     tools: &Registry,
     calls: &[ToolCall],
     ctx: Context<'_>,
-    timeout: Option<Duration>,
+    (timeout, owner): (Option<Duration>, Option<OwnerBudget<'_>>),
 ) -> Vec<(Output, Span)> {
     let mut outputs = Vec::with_capacity(calls.len());
     for segment in plan(calls, ctx.cwd) {
         let calls = &calls[segment.calls];
         if segment.parallel {
-            outputs.extend(parallel(chain, tools, calls, ctx, timeout));
+            outputs.extend(parallel(chain, tools, calls, ctx, (timeout, owner)));
         } else {
             outputs.extend(calls.iter().map(|call| {
                 let start = now();
-                let output = chain.run_tool(tools, call, ctx);
+                let output = match owner {
+                    None => chain.run_tool(tools, call, ctx),
+                    Some(owner) => chain.admit(tools, call, ctx.cwd).unwrap_or_else(|| {
+                        let deadline = Instant::now() + owner.limit;
+                        let mut output = owner_call(tools, call, ctx, deadline, owner);
+                        chain.post_tool(call, &mut output);
+                        output
+                    }),
+                };
                 (output, (start, now()))
             }));
         }
@@ -56,9 +67,10 @@ fn parallel(
     tools: &Registry,
     calls: &[ToolCall],
     ctx: Context<'_>,
-    timeout: Option<Duration>,
+    (timeout, owner): (Option<Duration>, Option<OwnerBudget<'_>>),
 ) -> Vec<(Output, Span)> {
     let started = now();
+    let owner_deadline = owner.map(|owner| (Instant::now() + owner.limit, owner));
     let denied: Vec<Option<Output>> = calls
         .iter()
         .map(|call| chain.admit(tools, call, ctx.cwd))
@@ -81,7 +93,10 @@ fn parallel(
                     };
                     let call: &ToolCall = &calls[i];
                     let start = now();
-                    let output = tools.execute(&call.name, &call.input, ctx);
+                    let output = match owner_deadline {
+                        Some((deadline, owner)) => owner_call(tools, call, ctx, deadline, owner),
+                        None => tools.execute(&call.name, &call.input, ctx),
+                    };
                     if send.send((i, (output, (start, now())))).is_err() {
                         break;
                     }

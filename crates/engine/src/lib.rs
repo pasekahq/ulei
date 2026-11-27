@@ -12,6 +12,7 @@ pub mod config;
 pub mod garden;
 pub mod gateway;
 pub mod images;
+pub mod jobs;
 pub mod journal;
 pub mod mcp;
 pub mod night;

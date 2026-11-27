@@ -1,0 +1,12 @@
+{
+  "results": [
+    {
+      "job": "1763290000000000-4",
+      "tool": "terminal",
+      "outcome": "lost",
+      "started": 1763290000.5,
+      "ended": 1763290300.0,
+      "output": "The engine stopped while the job ran; its work was stopped with it."
+    }
+  ]
+}
