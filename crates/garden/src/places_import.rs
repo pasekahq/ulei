@@ -4,27 +4,15 @@
 //! written, through the daemon's `places_write`, `places_verdict` and `places_profile`.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::path::PathBuf;
-use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::api::{
-    ApiConfig, ApiError, Garden, Hybrid, MAX_PLACE_ATTRS, MAX_PLACES_BATCH, as_f64, wire_refusal,
-};
-use crate::client::post;
+use crate::api::{MAX_PLACE_ATTRS, MAX_PLACES_BATCH, as_f64};
 use crate::edge::normalise;
-use crate::miss::{KEY_LEN, ProducerKey};
 use crate::model::UnixTime;
-use crate::rerank::NoReranker;
-use crate::store::Store;
+use crate::places_wire::{BedWire, CallError, Rehearsal, write_refusal};
 use crate::wire::c7;
 
-/// The connect, every read and every write of one C7 call of the import.
-const TIMEOUT: Duration = Duration::from_secs(30);
-/// Bytes of a C7 answer at most.
-const MAX_ANSWER: u64 = 4 * 1024 * 1024;
 const DAY: i64 = 86_400;
 
 /// A line of the file the import refuses, with the rule it breaks.
@@ -71,158 +59,6 @@ impl ImportError {
             }),
             Self::Failed(message) => json!({"error": "failed", "message": message}),
         }
-    }
-}
-
-/// A C7 call the daemon or the rehearsal answered with an error.
-#[derive(Debug)]
-pub enum CallError {
-    /// The request was refused: a line of the file breaks the rule, said by the message.
-    Refused(String, String),
-    /// Anything else; the import stops.
-    Failed(String),
-}
-
-/// The bed's C7 writes, served by the daemon or rehearsed in process.
-pub trait BedWire {
-    /// C7 `places_write`.
-    ///
-    /// # Errors
-    ///
-    /// [`CallError`].
-    fn places_write(
-        &mut self,
-        req: &c7::PlacesWriteRequest,
-    ) -> Result<c7::PlacesWriteResponse, CallError>;
-
-    /// C7 `places_verdict`.
-    ///
-    /// # Errors
-    ///
-    /// [`CallError`].
-    fn places_verdict(
-        &mut self,
-        req: &c7::PlacesVerdictRequest,
-    ) -> Result<c7::PlacesVerdictResponse, CallError>;
-
-    /// C7 `places_profile`.
-    ///
-    /// # Errors
-    ///
-    /// [`CallError`].
-    fn places_profile(
-        &mut self,
-        req: &c7::PlacesProfileRequest,
-    ) -> Result<c7::PlacesProfileResponse, CallError>;
-}
-
-/// The daemon's C7 at `garden.socket`, one connection per call.
-pub struct Socket(pub PathBuf);
-
-impl Socket {
-    /// The body of the `200` answer of `method` to `body`.
-    fn call(
-        &self,
-        method: &str,
-        body: Result<Vec<u8>, serde_json::Error>,
-    ) -> Result<Vec<u8>, CallError> {
-        let body = body.map_err(|e| CallError::Failed(e.to_string()))?;
-        let (status, answer) = post(&self.0, method, &body, TIMEOUT, MAX_ANSWER)
-            .map_err(|e| CallError::Failed(format!("{}: {e}", self.0.display())))?;
-        if status == 200 {
-            return Ok(answer);
-        }
-        let error: c7::Error = serde_json::from_slice(&answer)
-            .map_err(|_| CallError::Failed(format!("{method}: answered {status}")))?;
-        Err(match error.code {
-            c7::ErrorCode::InvalidRequest | c7::ErrorCode::NotFound => {
-                CallError::Refused(error.code.as_str().to_owned(), error.message)
-            }
-            code => CallError::Failed(format!("{method}: {}: {}", code.as_str(), error.message)),
-        })
-    }
-}
-
-fn malformed(method: &str) -> CallError {
-    CallError::Failed(format!("{method}: malformed answer"))
-}
-
-impl BedWire for Socket {
-    fn places_write(
-        &mut self,
-        req: &c7::PlacesWriteRequest,
-    ) -> Result<c7::PlacesWriteResponse, CallError> {
-        let answer = self.call("places_write", serde_json::to_vec(req))?;
-        serde_json::from_slice(&answer).map_err(|_| malformed("places_write"))
-    }
-
-    fn places_verdict(
-        &mut self,
-        req: &c7::PlacesVerdictRequest,
-    ) -> Result<c7::PlacesVerdictResponse, CallError> {
-        let answer = self.call("places_verdict", serde_json::to_vec(req))?;
-        serde_json::from_slice(&answer).map_err(|_| malformed("places_verdict"))
-    }
-
-    fn places_profile(
-        &mut self,
-        req: &c7::PlacesProfileRequest,
-    ) -> Result<c7::PlacesProfileResponse, CallError> {
-        let answer = self.call("places_profile", serde_json::to_vec(req))?;
-        serde_json::from_slice(&answer).map_err(|_| malformed("places_profile"))
-    }
-}
-
-/// The C7 writes on a fresh in-memory garden at `now`, so the bed's own rules check every line.
-struct Rehearsal {
-    garden: Garden,
-    now: UnixTime,
-}
-
-impl Rehearsal {
-    fn new(now: UnixTime) -> Result<Self, ImportError> {
-        let failed = |e: &dyn fmt::Display| ImportError::Failed(format!("rehearsal: {e}"));
-        let store = Store::open_in_memory().map_err(|e| failed(&e))?;
-        // The rehearsal never searches, so no miss is ever keyed with this key.
-        let key = ProducerKey::from_bytes(&[0; KEY_LEN]).map_err(|e| failed(&e))?;
-        let retriever = Hybrid::new(None, Box::new(NoReranker));
-        Ok(Self {
-            garden: Garden::new(store, retriever, ApiConfig::default(), key),
-            now,
-        })
-    }
-}
-
-fn rehearsed<T>(r: Result<T, ApiError>) -> Result<T, CallError> {
-    r.map_err(|e| match e {
-        ApiError::Refused(r) => {
-            CallError::Refused(wire_refusal(&r).as_str().to_owned(), r.to_string())
-        }
-        ApiError::Invalid(m) => CallError::Refused("invalid_request".to_owned(), m),
-        e => CallError::Failed(format!("rehearsal: {e}")),
-    })
-}
-
-impl BedWire for Rehearsal {
-    fn places_write(
-        &mut self,
-        req: &c7::PlacesWriteRequest,
-    ) -> Result<c7::PlacesWriteResponse, CallError> {
-        rehearsed(self.garden.garden_places_write(req, self.now))
-    }
-
-    fn places_verdict(
-        &mut self,
-        req: &c7::PlacesVerdictRequest,
-    ) -> Result<c7::PlacesVerdictResponse, CallError> {
-        rehearsed(self.garden.garden_places_verdict(req, self.now))
-    }
-
-    fn places_profile(
-        &mut self,
-        req: &c7::PlacesProfileRequest,
-    ) -> Result<c7::PlacesProfileResponse, CallError> {
-        rehearsed(self.garden.garden_places_profile(req))
     }
 }
 
@@ -325,7 +161,7 @@ impl Written {
 /// [`ImportError::Failed`] when the rehearsal itself fails.
 pub fn check(text: &str, file_name: &str, now: UnixTime) -> Result<Plan, ImportError> {
     let (plan, mut refused) = parse(text, file_name);
-    let mut rehearsal = Rehearsal::new(now)?;
+    let mut rehearsal = Rehearsal::new(now).map_err(ImportError::Failed)?;
     refused.extend(write(&plan, &mut rehearsal)?.refused);
     if refused.is_empty() {
         return Ok(plan);
@@ -418,11 +254,10 @@ pub fn write(plan: &Plan, wire: &mut impl BedWire) -> Result<Written, ImportErro
     Ok(out)
 }
 
-/// The line of a refused `places_write` answer; only a daemon that breaks C7 leaves out its rule
-/// or message.
+/// The line of a refused place or attribute of a `places_write` answer.
 fn refusal(line: usize, rule: Option<c7::PlaceRefusal>, message: Option<&str>) -> RefusedLine {
-    let rule = rule.map_or("refused", c7::PlaceRefusal::as_str);
-    RefusedLine::new(line, rule, message.unwrap_or(rule))
+    let (rule, message) = write_refusal(rule, message);
+    RefusedLine::new(line, rule, message)
 }
 
 /// Where the parser is in the file.

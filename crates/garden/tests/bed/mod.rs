@@ -2,7 +2,7 @@
 //! test crates.
 
 use ulei_garden::api::Garden;
-use ulei_garden::places_import::{BedWire, CallError};
+use ulei_garden::places_wire::{BedWire, CallError};
 use ulei_garden::wire::c7;
 
 /// The importer's C7 writes answered by the garden at the Unix time `.1`.

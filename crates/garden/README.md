@@ -41,7 +41,7 @@ binaries are in the release and run under the user unit `ulei-garden.service` (A
   in a history, the owner's verdicts and the food profile. Bed rows are not facts: `search`,
   `pointers` and the core profile do not read them; `places_search` (`places_search`) is their
   one reader. Only `places::Bed` writes them, in process and for the C7 methods `places_write`,
-  `places_verdict` and `places_profile`, which `ulei-garden places import` calls (below).
+  `places_verdict` and `places_profile`, which the `ulei-garden places` commands call (below).
   With a recheck source the worker's recheck pass queues the stale attributes, asks the source
   about the places with an `osm_id`, writes what it observes and sets a place with a past
   closing date `gone`, backing off a failed call from 1 hour to 7 days; `ulei-garden serve`
@@ -115,18 +115,37 @@ model directory: replace it only by writing the new file beside it and renaming 
 never by writing over it or truncating it in place (`cp` onto it, an editor saving in place),
 which changes or removes the pages the running helper reads (ADR-0087 section 8).
 
-## Importing a places file
+## Places commands
 
 ```sh
 ulei-garden places import FILE [--dry-run] [--config PATH]
+ulei-garden places search [FILTER FLAGS] | --request JSON [--config PATH]
+ulei-garden places add-candidate NAME --source SOURCE [--attr KEY=VALUE]... [--checked-at UNIX] [--config PATH]
+ulei-garden places verdict (--id ID | --name NAME) --verdict -1|0|+1 --source-ref REF [--note TEXT] [--said-at UNIX] [--better-than ID] [--config PATH]
 ```
 
-A client of the daemon's socket (`garden.socket`): it checks every line of a places file in the
-format of ADR-0080 section 4, rehearsing its writes on a scratch in-memory garden, and writes a
-file without a refused line through `places_write`, `places_verdict` and `places_profile`. It
-prints one JSON object: the report, or an error listing every refused line with its number and
-rule (exit 1). `--dry-run` prints the counts of the file and connects to nothing. Converting a
-free-form list into the format: [`docs/runbooks/places-import.md`](../../docs/runbooks/places-import.md).
+Clients of the daemon's socket (`garden.socket`), each printing one JSON object on stdout: the
+answer with exit 0, or an error with exit 1 (exit 2 for arguments that form no command; the
+import prints its usage on stderr then). `ulei-garden --help`, or `--help` after a places
+command, prints every flag on stdout.
+
+- `import` checks every line of a places file in the format of ADR-0080 section 4, rehearsing
+  its writes on a scratch in-memory garden, and writes a file without a refused line through
+  `places_write`, `places_verdict` and `places_profile`. The error lists every refused line
+  with its number and rule. `--dry-run` prints the counts of the file and connects to nothing.
+  Converting a free-form list into the format:
+  [`docs/runbooks/places-import.md`](../../docs/runbooks/places-import.md).
+- `search` sends the filter flags, or the whole `PlacesSearchRequest` of `--request`, to
+  `places_search` and prints its `PlacesSearchResponse` as the daemon sent it.
+- `add-candidate` writes one place with `status=candidate` and its `source` through
+  `places_write`, its attributes with that source and `--checked-at` (default now), and
+  prints the place's and its attributes' answer.
+- `verdict` appends one verdict through `places_verdict` and prints `written` or `repeated`
+  with the row's `seq` and the place's id.
+
+A refused place, attribute or verdict writes nothing: `add-candidate` and `verdict --name`
+rehearse their writes like the import first. The secretary's use of the three commands, with examples:
+[`docs/runbooks/places-import.md`](../../docs/runbooks/places-import.md#single-places-from-the-command-line).
 
 ## Release and unit
 

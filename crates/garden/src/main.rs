@@ -6,6 +6,10 @@
 //! `ulei-garden places import FILE [--dry-run] [--config PATH]`: a client of the daemon's socket
 //! that writes a places file into the bed (ADR-0080 section 4). It prints one JSON object on
 //! stdout: the report, exit 0; or an error, every refused line included, exit 1.
+//!
+//! `ulei-garden places search|add-candidate|verdict ...`: clients of the daemon's socket over the
+//! bed (ADR-0080 section 7). Each prints one JSON object on stdout: the answer, exit 0; or an
+//! error, exit 1, or exit 2 for arguments that form no command.
 
 #![forbid(unsafe_code)]
 
@@ -19,13 +23,31 @@ use serde_json::Value;
 use ulei_garden::embed::pipe::StartError;
 use ulei_garden::embed::supervisor::Supervisor;
 use ulei_garden::miss::Inbox;
-use ulei_garden::places_import::{self, ImportError, Socket};
+use ulei_garden::places_cli;
+use ulei_garden::places_import::{self, ImportError};
+use ulei_garden::places_wire::Socket;
 use ulei_garden::profile::Profile;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, bind, open};
 use ulei_garden::store::{Store, StoreError};
 use ulei_garden::worker::{self, Clock, SystemClock, Wake, Worker};
 
-const USAGE: &str = "usage: ulei-garden serve [--config PATH]\n       ulei-garden places import FILE [--dry-run] [--config PATH]\n";
+const USAGE: &str = "\
+usage: ulei-garden serve [--config PATH]
+       ulei-garden places import FILE [--dry-run] [--config PATH]
+       ulei-garden places search [--cuisine TERM]... [--near 'LAT, LON'] [--max-distance-m M]
+           [--min-rating X] [--max-price-for-two X] [--status STATUS]... [--vibe WORDS]
+           [--open-now --local-time YYYY-MM-DDTHH:MM] [--limit N] [--config PATH]
+       ulei-garden places search --request JSON [--config PATH]
+       ulei-garden places add-candidate NAME --source SOURCE [--attr KEY=VALUE]...
+           [--checked-at UNIX] [--config PATH]
+       ulei-garden places verdict (--id ID | --name NAME) --verdict -1|0|+1 --source-ref REF
+           [--note TEXT] [--said-at UNIX] [--better-than ID] [--config PATH]
+example: ulei-garden places search --cuisine noodles --near '0.5041, -25.0032' --limit 3
+example: ulei-garden places add-candidate 'Tidepool Kitchen' --source fixture-delivery-app \\
+           --attr 'address=Harbour Row 9' --attr cuisine=seafood
+example: ulei-garden places verdict --name 'Tidepool Kitchen' --verdict +1 \\
+           --source-ref chat:msg-9003 --note 'good chowder'
+";
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -39,17 +61,21 @@ fn main() -> ExitCode {
         let _ = std::io::stderr().write_all(USAGE.as_bytes());
         return ExitCode::from(2);
     }
+    if let [places, sub, rest @ ..] = args.as_slice()
+        && places == "places"
+        && let Some(sub @ ("search" | "add-candidate" | "verdict")) = sub.to_str()
+    {
+        if rest.iter().any(|a| a == "--help" || a == "-h") {
+            return help();
+        }
+        return places_command(sub, rest);
+    }
     let flag = match args.as_slice() {
         [command] if command == "serve" => None,
         [command, flag, path] if command == "serve" && flag == "--config" => {
             Some(PathBuf::from(path))
         }
-        [help] if help == "--help" || help == "-h" => {
-            return match std::io::stdout().lock().write_all(USAGE.as_bytes()) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(_) => ExitCode::from(1),
-            };
-        }
+        [flag] if flag == "--help" || flag == "-h" => return help(),
         _ => {
             let _ = std::io::stderr().write_all(USAGE.as_bytes());
             return ExitCode::from(2);
@@ -67,6 +93,14 @@ fn main() -> ExitCode {
     let line = serve(&settings);
     let _ = writeln!(std::io::stderr(), "garden: {line}");
     ExitCode::from(1)
+}
+
+/// Prints the usage on stdout.
+fn help() -> ExitCode {
+    match std::io::stdout().lock().write_all(USAGE.as_bytes()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(1),
+    }
 }
 
 /// The file, `--dry-run` and the `--config` path of `places import`, in any order.
@@ -117,6 +151,19 @@ fn import(file: &Path, dry_run: bool, flag: Option<&Path>) -> Result<(bool, Valu
     let socket = ulei_garden::serve::socket(flag).map_err(failed)?;
     let written = places_import::write(&plan, &mut Socket(socket))?;
     Ok((written.refused.is_empty(), written.to_json()))
+}
+
+/// Runs the places command `sub` with `args` and prints its one JSON answer.
+fn places_command(sub: &str, args: &[OsString]) -> ExitCode {
+    let (code, line) = match places_cli::run(sub, args, SystemClock.now()) {
+        Ok(line) => (0, line),
+        Err(e) => (e.exit_code(), e.to_json().to_string()),
+    };
+    let mut out = std::io::stdout().lock();
+    match writeln!(out, "{line}").and_then(|()| out.flush()) {
+        Ok(()) => ExitCode::from(code),
+        Err(_) => ExitCode::from(1),
+    }
 }
 
 /// One loud stderr line: the daemon starts lexical-only because the model file is corrupted.
