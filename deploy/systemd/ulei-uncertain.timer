@@ -1,0 +1,12 @@
+# ulei uncertain alerter's timer (user unit, ADR-0097 section 5): starts ulei-uncertain.service
+# every 10 minutes while the user manager runs.
+[Unit]
+Description=ulei uncertain alerter, every 10 minutes
+
+[Timer]
+OnCalendar=*:0/10
+RandomizedDelaySec=30s
+Unit=ulei-uncertain.service
+
+[Install]
+WantedBy=timers.target

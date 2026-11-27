@@ -5,57 +5,34 @@
     reason = "the other test crates use other parts of the shared support"
 )]
 mod support {
+    pub(crate) mod direct_config;
     pub(crate) mod fake_bot_api;
     pub(crate) mod fake_clock;
     pub(crate) mod process;
     pub(crate) mod scratch;
+    pub(crate) mod sender;
 }
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use support::fake_bot_api::{FakeBotApi, Reply, fail, ok};
-use support::fake_clock::FakeClock;
+use support::direct_config::{owners, write_config};
+use support::fake_bot_api::{FakeBotApi, Reply, fail};
 use support::process::{stderr, stdout};
 use support::scratch::Scratch;
-use ulei_channels::bot_api::{Client, Config, ErrorKind, Sender};
+use support::sender::{sender, sent};
+use ulei_channels::bot_api::ErrorKind;
 use ulei_channels::notify::{ChatReceipt, MAX_TEXT_BYTES, NotifyError, Receipt, notify};
 use ulei_channels::render::utf16_len;
 
-const TOKEN: &str = "123456:SECRET-TOKEN-OF-THE-NOTIFY-BOT";
 const OWNER: i64 = 42;
 const SECOND_OWNER: i64 = 43;
 const NOTICE: &str = "synthetic notice: 2 uncertain inbox events";
-
-/// Writes the token file and a `ulei.toml` naming the engine's C6 socket, the inbox's C1 socket
-/// and the fake Bot API; `telegram` is the `[telegram]` section after `base_url`.
-fn write_config(dir: &Scratch, fake: &FakeBotApi, telegram: &str) -> PathBuf {
-    let token = dir.path("token");
-    fs::write(&token, format!("{TOKEN}\n")).expect("token");
-    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).expect("chmod");
-    let text = format!(
-        "[engine]\nc6_socket = \"{c6}\"\n\n[inbox]\nsocket = \"{c1}\"\n\n[telegram]\n\
-         base_url = \"{base}\"\n{telegram}",
-        c6 = dir.socket("c6").display(),
-        c1 = dir.socket("c1").display(),
-        base = fake.base_url(),
-        telegram = telegram.replace("TOKEN_FILE", &token.display().to_string()),
-    );
-    let path = dir.path("ulei.toml");
-    fs::write(&path, text).expect("config");
-    path
-}
-
-fn owners(ids: &str) -> String {
-    format!("token_file = \"TOKEN_FILE\"\nowner_ids = \"{ids}\"\n")
-}
 
 /// Runs `ulei-tg notify --config CONFIG` with `extra` arguments and `stdin` as its input.
 fn run(config: &Path, extra: &[&str], stdin: &[u8]) -> Output {
@@ -76,10 +53,6 @@ fn run(config: &Path, extra: &[&str], stdin: &[u8]) -> Output {
     }
     drop(input);
     child.wait_with_output().expect("wait")
-}
-
-fn sent(id: i64) -> Reply {
-    ok(json!({ "message_id": id, "chat": { "id": OWNER } }))
 }
 
 /// Each `sendMessage` body the fake received, in order.
@@ -277,13 +250,6 @@ fn a_config_without_a_token_or_an_owner_is_refused_before_any_send() {
         assert_eq!(stderr(&output), format!("ulei-tg notify: {key}\n"), "{tag}");
         assert!(fake.requests().is_empty(), "{tag}");
     }
-}
-
-fn sender(fake: &FakeBotApi) -> (Sender, Arc<FakeClock>) {
-    let mut config = Config::new(TOKEN, Some(&fake.base_url()));
-    config.read_timeout = Duration::from_secs(2);
-    let clock = Arc::new(FakeClock::new(Duration::from_millis(250)));
-    (Sender::new(Client::new(config), clock.clone()), clock)
 }
 
 #[test]

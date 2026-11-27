@@ -1,7 +1,8 @@
 //! `ulei-tg`: the owner's Telegram channel (ADR-0032). SIGTERM and SIGINT stop it after the
 //! pending work is handed on, the offset is confirmed, the queued engine calls are made, the
 //! readers of the turns and the inbox thread stop and the queued messages are sent.
-//! `ulei-tg notify` sends one technical notice from stdin or a file (ADR-0097) and exits.
+//! `ulei-tg notify` sends one technical notice from stdin or a file (ADR-0097) and exits;
+//! `ulei-tg uncertain` tells the owner of the inbox's uncertain events once (ADR-0097 section 5).
 
 #![forbid(unsafe_code)]
 
@@ -12,28 +13,35 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use signal_hook::consts::{SIGINT, SIGTERM};
+use ulei_channels::alert::Alerter;
 use ulei_channels::bot_api::Client;
 use ulei_channels::bot_api::{Sender, Stop, SystemClock};
 use ulei_channels::c6;
 use ulei_channels::notify::{self, MAX_TEXT_BYTES};
-use ulei_channels::tg::{Channel, Inbox, Link, Outbound, SentTexts, Settings, Transport};
+use ulei_channels::tg::{
+    AlertSettings, Channel, Inbox, Link, Outbound, SentTexts, Settings, Transport,
+};
 
 const USAGE: &str = "usage: ulei-tg [--config PATH] | ulei-tg --version\n       \
-                     ulei-tg notify [--config PATH] [--file PATH]\n";
+                     ulei-tg notify [--config PATH] [--file PATH]\n       \
+                     ulei-tg uncertain [--config PATH] --state PATH\n";
 
 const EXIT_FAILURE: u8 = 1;
 const EXIT_USAGE: u8 = 2;
-/// `notify` refused the config or the text before any message went out.
+/// `notify` or `uncertain` refused the config, the text or the state before any message went out.
 const EXIT_REFUSED: u8 = 3;
 /// Largest input `notify` reads; room for whitespace around a text of `MAX_TEXT_BYTES`.
 const MAX_INPUT_BYTES: usize = 2 * MAX_TEXT_BYTES;
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    if args.first().is_some_and(|a| a == "notify") {
-        return notify_main(&args[1..]);
+    match args.first().and_then(|a| a.to_str()) {
+        Some("notify") => return notify_main(&args[1..]),
+        Some("uncertain") => return uncertain_main(&args[1..]),
+        _ => {}
     }
     let path = match args.as_slice() {
         [] => None,
@@ -58,19 +66,9 @@ fn main() -> ExitCode {
 /// `ulei-tg notify [--config PATH] [--file PATH]`: the receipt on stdout and exit 0, else one
 /// stderr line and `EXIT_REFUSED` before any send or `EXIT_FAILURE` after one may have gone out.
 fn notify_main(args: &[OsString]) -> ExitCode {
-    let (mut config, mut file) = (None, None);
-    let mut rest = args.iter();
-    while let Some(flag) = rest.next() {
-        let slot = match flag.to_str() {
-            Some("--config") => &mut config,
-            Some("--file") => &mut file,
-            _ => return usage(),
-        };
-        match rest.next() {
-            Some(value) if slot.is_none() => *slot = Some(Path::new(value)),
-            _ => return usage(),
-        }
-    }
+    let Some([config, file]) = path_flags(args, ["--config", "--file"]) else {
+        return usage();
+    };
     let (code, line) = match send_notice(config, file) {
         Ok(receipt) => match writeln!(io::stdout().lock(), "{receipt}") {
             Ok(()) => return ExitCode::SUCCESS,
@@ -80,6 +78,75 @@ fn notify_main(args: &[OsString]) -> ExitCode {
     };
     let _ = writeln!(io::stderr().lock(), "ulei-tg notify: {line}");
     ExitCode::from(code)
+}
+
+/// `ulei-tg uncertain [--config PATH] --state PATH`: one run of the alerter. The receipt on
+/// stdout when a notice went out, a stderr line when the inbox could not be read, and exit 0;
+/// else one stderr line and `EXIT_REFUSED` before any send or `EXIT_FAILURE` after one.
+fn uncertain_main(args: &[OsString]) -> ExitCode {
+    let Some([config, Some(state)]) = path_flags(args, ["--config", "--state"]) else {
+        return usage();
+    };
+    let (code, line) = match alert(config, state) {
+        Ok((receipt, inbox_error)) => {
+            if let Some(error) = inbox_error {
+                let _ = writeln!(io::stderr().lock(), "ulei-tg uncertain: {error}");
+            }
+            match receipt.map_or(Ok(()), |r| writeln!(io::stdout().lock(), "{r}")) {
+                Ok(()) => return ExitCode::SUCCESS,
+                Err(e) => (EXIT_FAILURE, format!("stdout: {e}")),
+            }
+        }
+        Err(failed) => failed,
+    };
+    let _ = writeln!(io::stderr().lock(), "ulei-tg uncertain: {line}");
+    ExitCode::from(code)
+}
+
+/// The receipt line of the notice the run sent, if any, and why the inbox could not be read,
+/// if it could not; or the exit code and the line saying why the run failed.
+fn alert(
+    config: Option<&Path>,
+    state: &Path,
+) -> Result<(Option<String>, Option<String>), (u8, String)> {
+    let refused = |line: String| (EXIT_REFUSED, line);
+    let settings = AlertSettings::load(config).map_err(|e| refused(e.to_string()))?;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| refused("the clock is before 1970".to_owned()))?
+        .as_secs();
+    let transport = settings.transport;
+    let sender = Sender::new(Client::new(transport.bot), Arc::new(SystemClock));
+    let alerter = Alerter::new(
+        settings.inbox_socket,
+        &sender,
+        &transport.owner_ids,
+        state.to_owned(),
+    )
+    .map_err(|e| refused(format!("inbox client: {e}")))?;
+    match alerter.run(now) {
+        Ok(run) => Ok((run.receipt.map(|r| r.to_line()), run.inbox_error)),
+        Err(e) if e.is_refusal() => Err(refused(e.to_string())),
+        Err(e) => Err((EXIT_FAILURE, e.to_string())),
+    }
+}
+
+/// The values of the path flags `names`, each given at most once, in any order; `None` for
+/// any other argument or a flag without its value.
+fn path_flags<'a, const N: usize>(
+    args: &'a [OsString],
+    names: [&str; N],
+) -> Option<[Option<&'a Path>; N]> {
+    let mut values = [None; N];
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let slot = names.iter().position(|name| flag.to_str() == Some(*name))?;
+        match rest.next() {
+            Some(value) if values[slot].is_none() => values[slot] = Some(Path::new(value)),
+            _ => return None,
+        }
+    }
+    Some(values)
 }
 
 /// The receipt line of the notice read from `file` or stdin, or the exit code and the line

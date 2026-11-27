@@ -13,8 +13,9 @@ use ulei_contracts::generated::c6::{TurnEventsRequest, TurnOutcome, TurnState};
 
 use super::link::ENGINE_FAILED;
 use super::outbound::{Closed, Outbox};
-use crate::c6::{self, Cancel, Event, session_key};
+use crate::c6::{self, Event, session_key};
 use crate::render::is_intentional_silence;
+use crate::uds::Cancel;
 
 /// The answer of a model that gave no visible text after its retries.
 pub(super) const EMPTY_SENTINEL: &str = "(empty)";

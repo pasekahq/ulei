@@ -16,4 +16,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   or C1 call, plain text without a parse mode. `ulei-tg notify` stays a thin wrapper of
   `notify::notify` and never changes the daemon's start line; its stderr line and the errors
   carry neither the text nor the token.
+- `alert` (ADR-0097 section 5) is the uncertain alerter: per run one C1 `uncertain` call and at
+  most one `notify::notify`, never a C6 call or another C1 method; a notice carries neither a
+  payload nor the message of a C1 error. Its state file is written atomically and a failed send
+  leaves it as it was. `ulei-tg uncertain` stays a thin wrapper of `alert::Alerter::run`, started
+  by `ulei-uncertain.timer`.
+- `uds` is the one client of the modules' Unix-socket HTTP wire; the C1 and C6 clients build on it.
 - Check: `python3 -m ci.broad_check` from the repository root.

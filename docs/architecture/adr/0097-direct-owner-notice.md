@@ -66,13 +66,58 @@ the chats after it get nothing.
 
 ### 5. The `uncertain` alerter
 
-The alert on `uncertain > 0` is built separately. It runs as a one-shot subcommand of `ulei-tg`
-started by a user timer of its own, not as a thread of the daemon (which would wake an idle
-daemon) and not inside `ulei-inbox` (which would have to reach Telegram from another module).
-It learns the uncertain rows through a new read-only C1 request that lists the events with
-status `uncertain` (id, source, kind, time and reason, no payload), oldest first and bounded,
-added to C1 as an additive change by that work, and sends its notice in process through
-`notify::notify`. It talks to the inbox over C1 only and never to the engine.
+The alert on `uncertain > 0` runs as a one-shot subcommand of `ulei-tg` started by a user timer
+of its own, not as a thread of the daemon (which would wake an idle daemon) and not inside
+`ulei-inbox` (which would have to reach Telegram from another module). It talks to the inbox over
+C1 only and never to the engine, and sends its notice in process through `notify::notify`
+(`ulei_channels::alert`).
+
+- `ulei-tg uncertain [--config PATH] --state PATH` reads the keys of `tg::Transport` (section 1)
+  and the existing key `inbox.socket`; it needs no `engine.c6_socket`. Each run makes one C1
+  `uncertain` call with `limit` 100, C1's largest, and at most one notice.
+- `ulei-uncertain.timer` starts the oneshot `ulei-uncertain.service` every 10 minutes
+  (`OnCalendar=*:0/10`, up to 30 s of random delay). The service has the hardening and the
+  `Slice=ulei.slice` of `ulei-tg.service`, writes only its `StateDirectory=ulei/uncertain` and
+  passes `--state %S/ulei/uncertain/state.json`; no C9 key names the state. `deploy/install.sh`
+  installs both and prints the timer in the enable line of the inbox and the channel.
+- The state file is one line of JSON, `{"reported":[<id>,...],"notice_at":<secs>|null,
+  "fault_at":<secs>|null}` with Unix seconds: the ids of the uncertain events the owner was told
+  of, the last notice of them and the last notice that the inbox could not be read. A missing
+  file is the empty state; its directory must exist. It is written atomically: a temporary file
+  of mode 0600 beside it, synced, renamed over it, then the directory synced. A run whose state
+  is unchanged does not write it.
+- The rules of one run at time `now`:
+  - The inbox answers no events: no notice; `reported` and `notice_at` are cleared.
+  - An event's id is not in `reported`: one notice of all the listed events.
+  - No new id and `notice_at` is 24 h or more before `now`: the same notice again.
+  - Otherwise no notice. After any answer `reported` holds the listed ids, so an event that left
+    `uncertain` is never named again and comes back as new.
+  - Any non-200 answer, an unreachable inbox, a timeout, a peer of another uid or an answer that
+    is not an `UncertainList` within the limit: one "cannot read the inbox" notice when
+    `fault_at` is absent or 24 h or more before `now`, then `fault_at = now`; `reported` and
+    `notice_at` stay. One malformed stored row, which makes C1 answer `internal`, therefore
+    cannot silence the alert. `fault_at` is not cleared by a good answer, so a flapping inbox
+    gives at most one such notice every 24 h.
+  - A clock before the last notice makes that notice due again.
+  - A failed send leaves the state as it was, so the next run sends the notice again.
+- The notice is plain text. The events notice starts `ulei inbox: <count> uncertain events, <k>
+  new. They may not have reached the agent.` (`1 uncertain event`; at 100 events `at least 100
+  uncertain events, the oldest listed`), then, after an empty line, one line per event, oldest
+  first: `<id> | <kind> | from <source> | <reason> | <yyyy-mm-dd HH:MM> UTC`, with ` | new` on a
+  new one. The fault notice is `ulei inbox: cannot read the inbox (<reason>); uncertain events,
+  if any, are not known. This notice repeats every 24 h while it lasts.`, the reason naming the
+  status and C1 error code or the socket failure. Neither carries a payload or the message of a
+  C1 error, which may quote a stored row.
+- Exit codes, as section 4:
+  - `0`: the run did its duty: no notice was due, or the notice went out and the state was
+    written. Stdout is the receipt line of a notice sent, else empty. When the inbox could not
+    be read, stderr is one line, `ulei-tg uncertain: <reason>`, with or without a notice.
+  - `1`: the notice failed after the retries (`sent <k> of <n> messages, then telegram <kind>:
+    <description>`), or the state could not be written; a notice may have gone out before.
+  - `2`: a usage error.
+  - `3`: refused before any C1 call or send: the config is not found or invalid, the token file,
+    the owner ids or `inbox.socket` are missing or invalid, or the state file is unreadable or
+    malformed or its directory is missing.
 
 ## Consequences
 

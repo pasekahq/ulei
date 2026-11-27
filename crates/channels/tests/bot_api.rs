@@ -7,6 +7,7 @@
 mod support {
     pub(crate) mod fake_bot_api;
     pub(crate) mod fake_clock;
+    pub(crate) mod sender;
 }
 
 use std::fs;
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use support::fake_bot_api::{FakeBotApi, Reply, fail, ok};
 use support::fake_clock::FakeClock;
+use support::sender::{sender, sent};
 use ulei_channels::bot_api::{
     Client, Config, DELIVERY_FAILED_NOTICE, ErrorKind, FileInfo, FloodLimiter, MediaKind, Poller,
     Sender, Stop, SystemClock, TextMessage, Upload,
@@ -39,18 +41,9 @@ fn client(fake: &FakeBotApi) -> Client {
     Client::new(config(fake))
 }
 
-fn sender(fake: &FakeBotApi) -> (Sender, Arc<FakeClock>) {
-    let clock = Arc::new(FakeClock::new(Duration::from_millis(250)));
-    (Sender::new(client(fake), clock.clone()), clock)
-}
-
 fn poller(fake: &FakeBotApi) -> (Poller, Arc<FakeClock>) {
     let clock = Arc::new(FakeClock::new(Duration::ZERO));
     (Poller::new(client(fake), clock.clone(), Stop::new()), clock)
-}
-
-fn sent(id: i64) -> Reply {
-    ok(json!({ "message_id": id, "chat": { "id": CHAT } }))
 }
 
 fn update(id: i64) -> Value {
