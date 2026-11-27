@@ -98,6 +98,11 @@
       "name": "counts",
       "input": "#/$defs/CountsRequest",
       "output": "#/$defs/Counts"
+    },
+    {
+      "name": "uncertain",
+      "input": "#/$defs/UncertainRequest",
+      "output": "#/$defs/UncertainList"
     }
   ],
   "x-error": "#/$defs/Error",
@@ -470,6 +475,82 @@
         "processing",
         "deferred",
         "uncertain"
+      ],
+      "additionalProperties": false
+    },
+    "UncertainRequest": {
+      "type": "object",
+      "description": "List the stored events with status `uncertain`, oldest first (by `created`, then `id`), in one read that changes nothing.",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "description": "Most events to answer; 20 when absent. A value outside 1 to 100 is a `bad_request`.",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "UncertainReason": {
+      "type": "string",
+      "description": "Why an event is `uncertain`: the `outcome` of its row. `uncertain` was acknowledged by the consumer, `expired-processing` and `deferred-exhausted` are the recovery outcomes of `RowOutcome`.",
+      "enum": [
+        "uncertain",
+        "expired-processing",
+        "deferred-exhausted"
+      ]
+    },
+    "UncertainEvent": {
+      "type": "object",
+      "description": "One `uncertain` event without its payload: fields of the row and of its stored packet only.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/EventId"
+        },
+        "source": {
+          "type": "string",
+          "description": "The producer: the packet `id` up to its first `:` (`hive` for `hive:<card>:<state>`), the whole `id` when it has no `:`, empty when it starts with one.",
+          "pattern": "^[a-zA-Z0-9_-]{0,96}$"
+        },
+        "kind": {
+          "$ref": "#/$defs/Kind",
+          "description": "The packet `kind`."
+        },
+        "time": {
+          "type": "number",
+          "description": "The row `created`: Unix time the inbox stored the event.",
+          "minimum": 0
+        },
+        "reason": {
+          "$ref": "#/$defs/UncertainReason",
+          "description": "The row `outcome`."
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "kind",
+        "time",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "UncertainList": {
+      "type": "object",
+      "description": "Result of `uncertain`.",
+      "properties": {
+        "events": {
+          "type": "array",
+          "description": "At most `limit` `uncertain` events, oldest first; empty when none is stored. `Counts.uncertain` gives their total.",
+          "items": {
+            "$ref": "#/$defs/UncertainEvent"
+          },
+          "maxItems": 100
+        }
+      },
+      "required": [
+        "events"
       ],
       "additionalProperties": false
     },

@@ -19,7 +19,7 @@ use common::{Scratch, golden, hex, sign, unhex};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c1::{
     Applied, ClaimResponse, Counts, Error as WireError, ErrorCode, GetResponse, Health,
-    PublishResponse, Row, Status,
+    PublishResponse, Row, Status, UncertainEvent, UncertainList, UncertainReason,
 };
 use ulei_core::inbox::{Inbox, canonical, own_uid};
 use ulei_core::serve::{READ_TIMEOUT, Server};
@@ -262,6 +262,78 @@ fn counts_answers_every_status_but_done_and_changes_no_row() {
         error_code(s, "counts", &json!({ "status": "pending" }), 400),
         ErrorCode::BadRequest
     );
+}
+
+#[test]
+fn uncertain_answers_the_oldest_uncertain_events_without_payload_and_changes_no_row() {
+    let scratch = Scratch::new();
+    let (key, vectors) = golden_vectors();
+    let daemon = start(&scratch, &scratch.root_with_key(&key));
+    let s = daemon.socket.as_path();
+    let mut template = vector(&vectors, "int_source_ts");
+    template.as_object_mut().expect("packet").remove("mac");
+    let publish = |id: &str| {
+        let mut packet = template.clone();
+        packet["id"] = json!(id);
+        call::<PublishResponse>(s, "publish", &json!({ "packet": sign(&key, &packet) }), 200);
+    };
+    let settle = |id: &str, outcome: &str| {
+        let held = json!({ "id": id, "lease": claimed(s, id).lease.expect("lease") });
+        let mut start = held.clone();
+        start["session_id"] = json!("session:uncertain");
+        assert!(ok(s, "start", &start));
+        let mut ack = held;
+        ack["outcome"] = json!(outcome);
+        assert!(ok(s, "ack", &ack));
+    };
+    let empty: UncertainList = call(s, "uncertain", &json!({}), 200);
+    assert_eq!(empty.events, Vec::<UncertainEvent>::new());
+    publish("unc:done");
+    settle("unc:done", "success");
+    let uncertain: Vec<String> = (0..21).map(|n| format!("unc:{n:02}")).collect();
+    for id in &uncertain {
+        publish(id);
+        settle(id, "uncertain");
+    }
+    publish("unc:pending");
+    let mut ids: Vec<String> = uncertain.clone();
+    ids.extend(["unc:done".to_owned(), "unc:pending".to_owned()]);
+    let before: Vec<Row> = ids.iter().map(|id| get(s, id)).collect();
+
+    let listed = |body: &Value| -> Vec<String> {
+        let response = post_raw(s, "uncertain", &serde_json::to_vec(body).expect("json"));
+        assert_eq!(response.status, 200);
+        let payload = before[0].packet.payload.as_bytes();
+        assert!(!response.body.windows(payload.len()).any(|w| w == payload));
+        let list: UncertainList = c1(&response.body);
+        for (event, row) in list.events.iter().zip(&before) {
+            assert_eq!(event.id, row.id);
+            assert_eq!(event.source, "unc");
+            assert_eq!(event.kind, row.packet.kind);
+            assert_eq!(event.time, row.created);
+            assert_eq!(event.reason, UncertainReason::Uncertain);
+        }
+        list.events.into_iter().map(|e| e.id).collect()
+    };
+    assert_eq!(listed(&json!({})), uncertain[..20]);
+    assert_eq!(listed(&json!({ "limit": 100 })), uncertain);
+    assert_eq!(listed(&json!({ "limit": 1 })), uncertain[..1]);
+    for body in [
+        json!({ "limit": 0 }),
+        json!({ "limit": 101 }),
+        json!({ "limit": -1 }),
+        json!({ "limit": 2.5 }),
+        json!({ "limit": "5" }),
+        json!({ "status": "pending" }),
+    ] {
+        assert_eq!(
+            error_code(s, "uncertain", &body, 400),
+            ErrorCode::BadRequest,
+            "{body}"
+        );
+    }
+    let after: Vec<Row> = ids.iter().map(|id| get(s, id)).collect();
+    assert_eq!(after, before, "uncertain changed a row");
 }
 
 #[test]

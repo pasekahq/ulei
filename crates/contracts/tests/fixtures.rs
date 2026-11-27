@@ -113,6 +113,10 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::Row>("c1/valid/Row.pending.json");
     roundtrip::<c::RowOutcome>("c1/valid/RowOutcome.deferred_exhausted.json");
     roundtrip::<c::StartRequest>("c1/valid/StartRequest.basic.json");
+    roundtrip::<c::UncertainList>("c1/valid/UncertainList.empty.json");
+    roundtrip::<c::UncertainList>("c1/valid/UncertainList.reasons.json");
+    roundtrip::<c::UncertainRequest>("c1/valid/UncertainRequest.empty.json");
+    roundtrip::<c::UncertainRequest>("c1/valid/UncertainRequest.limit.json");
     roundtrip::<c::Event>("c1/valid/root.gate_preview.json");
     roundtrip::<c::Event>("c1/valid/root.task_result.json");
     refused::<c::PublishRequest>("c1/invalid/PublishRequest.extra_field.json");

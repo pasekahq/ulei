@@ -34,7 +34,7 @@ pub struct Contract {
 pub const CONTRACTS: &[Contract] = &[
     Contract {
         id: "C1",
-        version: "1.2.0",
+        version: "1.3.0",
         file: "c1-event.schema.json",
         title: "Event (owner inbox)",
         status: "stable",

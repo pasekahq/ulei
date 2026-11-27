@@ -15,7 +15,7 @@ use std::time::Duration;
 use hmac::KeyInit;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
-use ulei_contracts::generated::c1::{AckOutcome, Counts};
+use ulei_contracts::generated::c1::{AckOutcome, Counts, UncertainEvent};
 
 pub use packet::{Invalid, canonical};
 use packet::{PacketMac, lower_hex};
@@ -299,6 +299,44 @@ impl Inbox {
             *slot = count.unsigned_abs();
         }
         Ok(counts)
+    }
+
+    /// At most `limit` events with status `uncertain`, oldest first (by `created`, then `id`),
+    /// from one read that changes no row; each carries no payload.
+    ///
+    /// # Errors
+    /// [`Error::StoredPacket`] for a packet without a C1 `kind` or a row without an
+    /// `uncertain` outcome, or [`Error::Sqlite`].
+    pub fn uncertain(&self, limit: u32) -> Result<Vec<UncertainEvent>, Error> {
+        let mut query = self.conn.prepare(
+            "SELECT id, packet, created, outcome FROM events WHERE status = 'uncertain' \
+             ORDER BY created, id LIMIT ?1",
+        )?;
+        let mut rows = query.query([limit])?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let packet: Vec<u8> = row.get(1)?;
+            let outcome: Option<String> = row.get(3)?;
+            let packet: Value = serde_json::from_slice(&packet).map_err(|_| Error::StoredPacket)?;
+            let kind =
+                serde_json::from_value(packet["kind"].clone()).map_err(|_| Error::StoredPacket)?;
+            let reason = outcome
+                .and_then(|outcome| serde_json::from_value(Value::from(outcome)).ok())
+                .ok_or(Error::StoredPacket)?;
+            let source = id
+                .split_once(':')
+                .map_or(id.as_str(), |(head, _)| head)
+                .to_owned();
+            events.push(UncertainEvent {
+                source,
+                kind,
+                time: row.get(2)?,
+                reason,
+                id,
+            });
+        }
+        Ok(events)
     }
 
     /// Python `recover(now)` in one transaction: an expired `leased` event returns to
