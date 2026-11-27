@@ -110,7 +110,7 @@ codex  = { model = "codex-small",  effort = "medium" }
 [vendors.claude]
 disabled = false
 weight = 1.0
-daily_runs = 140
+daily_runs = 0             # optional daily ceiling on head launches per local day; 0 or no key = off (the default). The weekly limit under [budget] is the usual guard
 binary = ["/srv/hive/bin/claude", "claude"]
 home = "/srv/hive/account"
 tag_launcher = true

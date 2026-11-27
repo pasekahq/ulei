@@ -169,8 +169,8 @@ def missing(key):
 
 def check_deployment(cfg):
     """Refuse a config without a deployment value: the keys of REQUIRED_KEYS and TEXTS, the keys the delivery adapter
-    reads, the home and the boolean tag_launcher of each vendor that runs heads, the disk and cgroups of enabled
-    [resources] and the home of a configured limits command."""
+    reads, the home and the boolean tag_launcher of each vendor that runs heads, a daily_runs that is not a non-negative
+    integer, the disk and cgroups of enabled [resources] and the home of a configured limits command."""
     for key in REQUIRED_KEYS:
         if key not in cfg:
             raise missing(key)
@@ -192,6 +192,9 @@ def check_deployment(cfg):
                 raise missing(f'vendors.{name}.{key}')
         if not isinstance(vc['tag_launcher'], bool):
             raise ValueError(f"config: vendors.{name}.tag_launcher must be true or false, got {vc['tag_launcher']!r}")
+        runs = vc.get('daily_runs', 0)
+        if isinstance(runs, bool) or not isinstance(runs, int) or runs < 0:
+            raise ValueError(f'config: vendors.{name}.daily_runs must be a non-negative integer, got {runs!r}')
     res = cfg.get('resources', {})
     if res.get('enabled', False):
         for key in ('disk', 'psi_cgroups'):
