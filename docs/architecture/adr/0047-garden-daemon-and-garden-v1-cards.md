@@ -416,6 +416,7 @@ ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linu
 | `ULEI_GARDEN_MAX_POINTERS_P50_US` | p50 of `pointers`, connect to last byte | 10,000 us | a tenth of the 100 ms target: the lexical path without the query embedding, the model's share |
 | `ULEI_GARDEN_MAX_SEARCH_P50_US` | p50 of `search`, connect to last byte | 20,000 us | a fifth of the 100 ms target, for full facts and up to 50 rows |
 | `ULEI_GARDEN_MAX_WRITE_BYTES` | wchar per `propose` stored in the seedbed and per record of `seedbed_done` | 131,072 B | the inbox's per-event figure (ADR-0007) |
+| `ULEI_GARDEN_MAX_PLACES_SEARCH_P95_US` | p95 of 100 `places_search` calls, connect to last byte, on 1,000 synthetic places in a store and daemon of their own | 100,000 us | the 100 ms of the places bed (ADR-0080 section 5) |
 | `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` | release binary of the helper, which must be dynamically linked, and `ldd` must list only libc, libm, the dynamic loader `ld-linux`, `libgcc_s` (the unwinder a Rust gnu build links, from GCC) and the vDSO: no libstdc++, and ONNX Runtime only through `dlopen` at run time | 2,097,152 B | the engine's helper row (`ulei-web`, ADR-0015) |
 
 The daemon section checks that `ulei-garden` is static, as for the other daemons; the helper is

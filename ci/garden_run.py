@@ -7,7 +7,9 @@ fills the store with fictional facts through C7 `propose` into the seedbed and t
 `pointers`, `search` and `propose`, whose records stay unprocessed and answer the later
 `pointers` and `search` beside the facts (ADR-0055 sections 3 and 8), and measures its idle.
 On a copy of the filled store it then runs the night path over ``NIGHT_RECORDS`` records spread
-over every person and over as many records naming one person. It prints one
+over every person and over as many records naming one person. On a fresh store of a daemon of
+its own it writes ``PLACES_COUNT`` synthetic places through C7 `places_write`, `places_profile`
+and `places_verdict` and times ``PLACES_SEARCHES`` `places_search` calls. It prints one
 ``<name> <value>`` line per measurement. Any non-200 answer or unexpected body is a failure.
 """
 
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -104,6 +107,50 @@ MISSES = [
     for a in ("zorbulent", "quaxifer", "drimbleth", "vorpaxine", "skelluvet")
     for b in ("glimtrove", "pondraxel", "frunsible", "wexhollow")
 ]
+
+C7_SCHEMA = Path(__file__).resolve().parent.parent / "contracts" / "c7-garden.schema.json"
+PLACES_COUNT = 1_000
+PLACES_BATCH = 100
+PLACES_SEARCHES = 100
+# Percent of the searches that must answer at least one place.
+PLACES_HIT_SHARE = 90
+DAY = 86_400
+HOME = (12.25, -31.5)
+# Grid step in degrees, about 165 m, past the 75 m within which the bed pairs two places of
+# different names as possible duplicates.
+GRID_STEP = 0.0015
+GRID_SIDE = 32
+PLACE_ADJECTIVES = [
+    "Amber", "Brass", "Cedar", "Copper", "Dune", "Ember", "Fable", "Gilded", "Harbour", "Indigo",
+    "Juniper", "Kestrel", "Lantern", "Marble", "Nettle", "Opal", "Pebble", "Quill", "Rowan",
+    "Saffron", "Thistle", "Umber", "Velvet", "Willow", "Yarrow",
+]
+PLACE_NOUNS = [
+    "Bowl", "Table", "Kitchen", "Oven", "Ladle", "Hearth", "Spoon", "Corner", "Pantry", "Grill",
+    "Kettle", "Cellar", "Larder", "Terrace", "Courtyard", "Skillet", "Platter", "Barrel", "Wok",
+    "Crust", "Griddle", "Tavern", "Canteen", "Bistro", "Diner", "Saucepan", "Teapot", "Mortar",
+    "Basket", "Crock", "Pitcher", "Trencher", "Tureen", "Galley", "Buffet", "Ramekin", "Sieve",
+    "Cauldron", "Brazier", "Cupboard",
+]
+CUISINES = [
+    "noodles", "dumplings", "grill", "seafood", "pastry", "curry", "pizza", "salads", "soups",
+    "tapas", "bakery",
+]
+BANNED_CUISINE = "offal"
+VIBES = [
+    "quiet", "cosy", "lively", "terrace", "candlelit", "rooftop", "garden", "riverside", "family",
+    "jazz",
+]
+HOURS = [
+    "Mo-Fr 10:00-22:00; Sa,Su 12:00-23:00", "24/7", "Mo-Su 08:00-15:00",
+    "Tu-Su 18:00-02:00; Mo off", "Mo,We,Fr 11:00-14:00,17:00-21:00",
+]
+LOCAL_TIMES = [
+    "2031-03-17T13:00", "2031-03-22T20:00", "2031-03-16T09:30", "2031-03-19T01:30",
+    "2031-03-21T18:30", "2031-03-18T23:00",
+]
+STATUS_SETS = [["active"], ["candidate"], ["candidate", "active", "gone"]]
+PLACES_SOURCE = "synthetic-maps"
 
 
 class FakeInbox:
@@ -321,6 +368,194 @@ def night_phases(garden: str, root: Path, inbox_path: str) -> dict[str, int]:
     }
 
 
+def place(i: int, now: int) -> dict:
+    """The `places_write` entry of synthetic place ``i`` on the grid around ``HOME``, checked
+    at ``now``: hours on nine in ten, stale ratings and counts on one in seven, stale hours on
+    one in six, the banned cuisine on one in fifty and in the warnings of one in forty."""
+    fresh, stale = now - 2 * DAY, now - 40 * DAY
+    lat = HOME[0] + (i // GRID_SIDE - GRID_SIDE // 2) * GRID_STEP
+    lon = HOME[1] + (i % GRID_SIDE - GRID_SIDE // 2) * GRID_STEP
+    cuisine = [CUISINES[i % len(CUISINES)]]
+    if i % 3 == 0 and CUISINES[i // 3 % len(CUISINES)] not in cuisine:
+        cuisine.append(CUISINES[i // 3 % len(CUISINES)])
+    if i % 50 == 7:
+        cuisine.append(BANNED_CUISINE)
+    rated = stale if i % 7 == 3 else fresh
+    observed = [
+        ("location", f"{lat:.6f}, {lon:.6f}", fresh),
+        ("cuisine", ", ".join(cuisine), fresh),
+        ("vibe", f"{VIBES[i % len(VIBES)]}, {VIBES[i // len(VIBES) % len(VIBES)]}", fresh),
+        ("review_count", str(i * 53 % 900 + 5), rated),
+    ]
+    if i % 13 != 5:
+        observed.append(("rating", f"{3 + i * 37 % 21 / 10:.1f}", rated))
+    if i % 9 != 4:
+        low = 15 + i * 7 % 12 * 5
+        observed.append(("price_for_two", f"{low}-{low + 20}", fresh))
+    if i % 10 != 9:
+        observed.append(("hours", HOURS[i % len(HOURS)], now - 10 * DAY if i % 6 == 1 else fresh))
+    if i % 25 == 11:
+        observed.append(("operating_status", "temporarily_closed", fresh))
+    elif i % 7 == 0:
+        observed.append(("operating_status", "open", fresh))
+    if i % 40 == 13:
+        observed.append(("warnings", BANNED_CUISINE, fresh))
+    status = "gone" if i % 60 == 17 else "candidate" if i % 3 == 0 else "active"
+    return {
+        "name": f"{PLACE_ADJECTIVES[i % len(PLACE_ADJECTIVES)]} "
+                f"{PLACE_NOUNS[i // len(PLACE_ADJECTIVES)]}",
+        "status": status,
+        "source": PLACES_SOURCE,
+        "attrs": [
+            {"key": k, "value": v, "checked_at": at, "source": PLACES_SOURCE}
+            for k, v, at in observed
+        ],
+    }
+
+
+def fill_places(path: str, now: int) -> list[str]:
+    """Writes ``PLACES_COUNT`` new places in batches of ``PLACES_BATCH``, the profile's `home`,
+    `min_rating` and a ban, and a verdict on one place in 45; returns the place ids."""
+    ids = []
+    for first in range(0, PLACES_COUNT, PLACES_BATCH):
+        batch = [place(i, now) for i in range(first, first + PLACES_BATCH)]
+        answer, _ = call(path, "places_write", {"places": batch})
+        for i, written in enumerate(answer["places"], first):
+            refused = [a for a in written["attrs"] if a["outcome"] == "refused"]
+            if written["outcome"] != "created" or refused:
+                raise Failure(f"places_write of place {i} answered {written}")
+            ids.append(written["id"])
+    for key, value in (
+        ("home", f"{HOME[0]}, {HOME[1]}"), ("min_rating", "3.5"), ("ban", BANNED_CUISINE),
+    ):
+        answer, _ = call(path, "places_profile", {
+            "key": key, "value": value, "source_ref": "synthetic:profile", "set_at": now - DAY,
+        })
+        if answer["outcome"] != "written":
+            raise Failure(f"places_profile {key} answered {answer}")
+    for i in range(0, PLACES_COUNT, 45):
+        verdict = (1, 0, -1)[i // 45 % 3]
+        body = {"place": ids[i], "verdict": verdict, "said_at": now - 3 * DAY,
+                "source_ref": f"synthetic:verdict-{i}"}
+        if verdict == 1:
+            body["note"] = "quiet terrace, kind staff"
+        answer, _ = call(path, "places_verdict", body)
+        if answer["outcome"] != "written":
+            raise Failure(f"places_verdict of place {i} answered {answer}")
+    return ids
+
+
+def places_query(n: int) -> dict:
+    """`places_search` ``n``: cuisine, distance, rating, price and status filters, `near`,
+    `open_now` with `local_time`, `vibe` and `limit`, each on its own period over ``n``."""
+    filters: dict = {}
+    if n % 2 == 0:
+        filters["cuisine"] = [CUISINES[n % len(CUISINES)]]
+        if n % 4 == 0 and CUISINES[n // 4 % len(CUISINES)] not in filters["cuisine"]:
+            filters["cuisine"].append(CUISINES[n // 4 % len(CUISINES)])
+    if n % 3 != 2:
+        filters["max_distance_m"] = 800 + n % 5 * 600
+    if n % 4 == 1:
+        filters["min_rating"] = 3.5 + n % 3 * 0.5
+    if n % 5 == 3:
+        filters["max_price_for_two"] = 40 + n % 4 * 10
+    if n % 7 == 4:
+        filters["status"] = STATUS_SETS[n % len(STATUS_SETS)]
+    req: dict = {"filters": filters} if filters else {}
+    if n % 6 == 5:
+        req["near"] = {"lat": HOME[0] + n % 17 * GRID_STEP, "lon": HOME[1] - n % 13 * GRID_STEP}
+    if n % 2 == 1:
+        req["open_now"] = True
+        req["local_time"] = LOCAL_TIMES[n // 2 % len(LOCAL_TIMES)]
+    if n % 3 == 1:
+        req["vibe"] = f"{VIBES[n % len(VIBES)]} {VIBES[n // 3 % len(VIBES)]}"
+    if n % 5 != 4:
+        req["limit"] = (5, 10, 20, 50)[n % 5]
+    return req
+
+
+SCHEMA_KEYWORDS = {
+    "type", "description", "enum", "minimum", "maximum", "minLength", "maxLength", "pattern",
+    "items", "minItems", "maxItems", "properties", "required", "additionalProperties", "$ref",
+}
+JSON_TYPES = {
+    "object": dict, "array": list, "string": str, "boolean": bool, "integer": int,
+    "number": (int, float),
+}
+
+
+def conform(value: object, schema: dict, defs: dict, where: str) -> None:
+    """Raises Failure where ``value`` breaks ``schema``; a keyword outside ``SCHEMA_KEYWORDS``
+    fails too, so no part of the schema goes unchecked."""
+    if "$ref" in schema:
+        conform(value, defs[schema["$ref"].removeprefix("#/$defs/")], defs, where)
+        return
+    if unknown := schema.keys() - SCHEMA_KEYWORDS:
+        raise Failure(f"{where}: the schema check does not know {sorted(unknown)}")
+    kind = schema.get("type")
+    if kind is not None and (
+        not isinstance(value, JSON_TYPES[kind])
+        or (isinstance(value, bool) and kind in ("integer", "number"))
+    ):
+        raise Failure(f"{where}: {value!r} is not of type {kind}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise Failure(f"{where}: {value!r} is not one of {schema['enum']}")
+    if isinstance(value, (int, float)) and not (
+        schema.get("minimum", value) <= value <= schema.get("maximum", value)
+    ):
+        raise Failure(f"{where}: {value} is out of range")
+    if isinstance(value, str) and not (
+        schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", len(value))
+        and re.search(schema.get("pattern", ""), value)
+    ):
+        raise Failure(f"{where}: {value!r} breaks its length or pattern")
+    if isinstance(value, list):
+        if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", len(value)):
+            raise Failure(f"{where}: {len(value)} items")
+        for i, item in enumerate(value):
+            conform(item, schema.get("items", {}), defs, f"{where}[{i}]")
+    if isinstance(value, dict):
+        if missing := set(schema.get("required", [])) - value.keys():
+            raise Failure(f"{where}: missing {sorted(missing)}")
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False and (extra := value.keys() - properties):
+            raise Failure(f"{where}: unexpected {sorted(extra)}")
+        for key, item in value.items():
+            if key in properties:
+                conform(item, properties[key], defs, f"{where}.{key}")
+
+
+def places_phase(garden: str, root: Path, inbox_path: str) -> dict[str, int]:
+    """On a fresh store under ``root`` of a daemon of its own: the places fill, then
+    ``PLACES_SEARCHES`` `places_search` calls, each answer checked against C7's
+    `PlacesSearchResponse`; the p95 from connect to last byte and the calls with a hit."""
+    defs = json.loads(C7_SCHEMA.read_text(encoding="utf-8"))["$defs"]
+    path = str(root / "run" / "garden.sock")
+    config = write_config(root, path, inbox_path)
+    daemon, _ = spawn(garden, config, path)
+    try:
+        fill_places(path, int(time.time()))
+        times = []
+        hits = 0
+        for n in range(PLACES_SEARCHES):
+            answer, elapsed = call(path, "places_search", places_query(n))
+            conform(answer, defs["PlacesSearchResponse"], defs, f"places_search {n}")
+            hits += bool(answer["places"])
+            times.append(elapsed)
+        alive(daemon, "during the places search")
+    finally:
+        stop(daemon)
+    if hits * 100 < PLACES_HIT_SHARE * PLACES_SEARCHES:
+        raise Failure(f"{hits} of {PLACES_SEARCHES} places_search calls answered a place, "
+                      f"expected at least {PLACES_HIT_SHARE} %")
+    return {
+        "places_count": PLACES_COUNT,
+        "places_search_calls": PLACES_SEARCHES,
+        "places_search_hits": hits,
+        "places_search_p95_us": p95(times),
+    }
+
+
 def median_ready(garden: str, config: Path, path: str) -> int:
     """Median microseconds from spawn to ready over ``READY_RESTARTS`` starts."""
     samples = []
@@ -331,8 +566,18 @@ def median_ready(garden: str, config: Path, path: str) -> int:
     return p50(samples)
 
 
+def percentile(samples: list[float], pct: int) -> int:
+    """Microseconds of the sorted sample at index ``len(samples) * pct // 100``.
+    Of 100 samples, p95 is the 96th smallest."""
+    return int(sorted(samples)[len(samples) * pct // 100] * 1e6)
+
+
 def p50(samples: list[float]) -> int:
-    return int(sorted(samples)[len(samples) // 2] * 1e6)
+    return percentile(samples, 50)
+
+
+def p95(samples: list[float]) -> int:
+    return percentile(samples, 95)
 
 
 def query(n: int) -> str:
@@ -428,6 +673,9 @@ def measure(garden: str, work: Path) -> dict[str, int | str]:
         finally:
             stop(daemon)
         phases = night_phases(garden, night_root, str(root / "c1.sock"))
+        places_root = work / "garden-places"
+        places_root.mkdir(mode=0o700)
+        places = places_phase(garden, places_root, str(root / "c1.sock"))
     finally:
         inbox.close()
     if before.keys() != after.keys():
@@ -448,6 +696,7 @@ def measure(garden: str, work: Path) -> dict[str, int | str]:
         "idle_threads": len(after),
         "idle_seconds": IDLE_SECONDS,
         **phases,
+        **places,
     }
 
 

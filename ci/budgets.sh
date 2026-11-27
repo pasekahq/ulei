@@ -74,6 +74,11 @@
 # control), then 500 naming one person by its Cyrillic name, its Latin spelling and that
 # spelling with a typo. The p50 of a propose into the seedbed and of `seedbed_done` per batch of
 # 100 in each phase are printed without a limit.
+# The places phase runs a daemon of its own on a fresh store, without the embedder helper:
+# 1000 synthetic places through C7 `places_write` with a profile and a few verdicts, then 100
+# `places_search` calls mixing the filters, `open_now` and `vibe` (ADR-0080 section 5):
+#   ULEI_GARDEN_MAX_PLACES_SEARCH_P95_US p95 places_search, connect to last
+#                                   byte, on 1000 places                   (default 100000 us)
 # The `ulei-garden-embed` section follows ADR-0047 section 7: the helper's glibc build with
 # `onnx`, the one binary checked to be dynamically linked, against glibc's own libraries only:
 #   ULEI_GARDEN_EMBED_MAX_BINARY_BYTES release binary size; `ldd` lists only libc, libm,
@@ -352,6 +357,7 @@ garden_max_idle_wakeups="${ULEI_GARDEN_MAX_IDLE_WAKEUPS:-0}"
 garden_max_pointers_us="${ULEI_GARDEN_MAX_POINTERS_P50_US:-10000}"
 garden_max_search_us="${ULEI_GARDEN_MAX_SEARCH_P50_US:-20000}"
 garden_max_write_bytes="${ULEI_GARDEN_MAX_WRITE_BYTES:-131072}"
+garden_max_places_us="${ULEI_GARDEN_MAX_PLACES_SEARCH_P95_US:-100000}"
 
 size=$(stat -c %s "$garden")
 echo "binary: $garden $size bytes (budget $garden_max_bytes)"
@@ -396,6 +402,12 @@ crowded_bytes=$(measured crowded_write_bytes_per_processed)
 crowded_done=$(measured crowded_done_p50_us)
 echo "ulei-garden crowded night over ${night_records} records of one person: ${crowded_bytes} B per processed record (budget ${garden_max_write_bytes} B), seedbed_done p50 ${crowded_done} us per batch of $(measured night_batch) (no budget)"
 if [ "$crowded_bytes" -gt "$garden_max_write_bytes" ]; then echo "::error::ulei-garden writes ${crowded_bytes} B per processed record of the crowded night > ${garden_max_write_bytes} B"; fail=1; fi
+
+places=$(measured places_search_p95_us)
+places_line="ulei-garden places_search p95 over $(measured places_search_calls) connections on $(measured places_count) places: ${places} us, $(measured places_search_hits) answered with a place (budget ${garden_max_places_us} us)"
+echo "$places_line"
+notice ulei-garden-places "$places_line"
+if [ "$places" -gt "$garden_max_places_us" ]; then echo "::error::ulei-garden places_search p95 ${places} us > ${garden_max_places_us} us"; fail=1; fi
 
 hwm=$(measured vmhwm_kb)
 echo "ulei-garden peak RSS (VmHWM) after ${requests} requests: ${hwm} kB (budget ${garden_max_rss_kb} kB)"
