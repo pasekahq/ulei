@@ -168,13 +168,13 @@
         },
         "acceptance": {
           "type": "string",
-          "description": "Mechanical acceptance: a bash command run in the card workspace, exit 0 = pass. A bare `test -s REPORT.md` needs `review`.",
+          "description": "Mechanical acceptance: a bash command run in the card workspace, exit 0 = pass. A bare `test -s REPORT.md` needs `review`; for criteria a judge checks use `accept_review` instead.",
           "minLength": 1,
           "maxLength": 2000
         },
         "accept_review": {
           "type": "string",
-          "description": "Review criteria a judge checks the report against, instead of `acceptance` (`--accept-review`); implies `review`.",
+          "description": "Criteria the judge checks the report against, instead of `acceptance` (`--accept-review`; the gate is a non-empty `REPORT.md`). Judge only: it adds no reviewer; set `review` for one.",
           "minLength": 1,
           "maxLength": 4000
         },
@@ -200,7 +200,7 @@
         },
         "review": {
           "type": "boolean",
-          "description": "Independent review by the other vendor."
+          "description": "Independent review by the other vendor (`--review`). Off by default; only `review: true` turns it on, never `accept_review`, `kind` or `step`. Set it for code cards (pull requests, code changes) first, for complex research that needs a second check, and for anything else the author decides to review; small errands (look, switch, check a status) go without."
         },
         "hold": {
           "type": "boolean",

@@ -177,7 +177,7 @@ def normalize_panel(cfg, panel, step):
 
 
 def empty_acceptance(command):
-    """Report existence proves no outcome; require independent review."""
+    """Report existence proves no outcome; require judge criteria or an independent review."""
     import shlex
     try:
         words = shlex.split((command or '').strip().rstrip(';'))
@@ -213,8 +213,6 @@ def admission_class(card, cfg):
 
 
 def validate(title, goal, acceptance, step, source, created_by, kind, acceptance_kind, judge_criteria, deny_tools, review=False):
-    if empty_acceptance(acceptance) and not review:
-        raise CardError("test -s REPORT.md requires review")
     if not (title or '').strip():
         raise CardError('title is required')
     if not (goal or '').strip():
@@ -237,6 +235,9 @@ def validate(title, goal, acceptance, step, source, created_by, kind, acceptance
     if acceptance_kind == 'judge':
         if not isinstance(judge_criteria, str) or not judge_criteria.strip():
             raise CardError('judge criteria must be non-blank text for judge acceptance')
+    # The judge's criteria are an acceptance of their own: a bare report gate needs a reviewer only without them.
+    elif empty_acceptance(acceptance) and not review:
+        raise CardError("test -s REPORT.md requires review or judge criteria")
     normalize_deny_tools(deny_tools)
 
 

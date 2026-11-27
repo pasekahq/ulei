@@ -1166,12 +1166,12 @@ fn create_schema() -> Value {
             "title": {"type": "string", "description": "Short title.", "minLength": 1, "maxLength": 200},
             "goal": {"type": "string", "description": "What the head must achieve.", "minLength": 1, "maxLength": 8000},
             "details": {"type": "string", "description": "Further context for the head, the card's body (`--body`).", "maxLength": 32000},
-            "acceptance": {"type": "string", "description": "Mechanical acceptance: a bash command run in the card workspace, exit 0 = pass. A bare `test -s REPORT.md` needs `review`.", "minLength": 1, "maxLength": 2000},
-            "accept_review": {"type": "string", "description": "Review criteria a judge checks the report against, instead of `acceptance` (`--accept-review`); implies `review`.", "minLength": 1, "maxLength": 4000},
+            "acceptance": {"type": "string", "description": "Mechanical acceptance: a bash command run in the card workspace, exit 0 = pass. A bare `test -s REPORT.md` needs `review`; for criteria a judge checks use `accept_review` instead.", "minLength": 1, "maxLength": 2000},
+            "accept_review": {"type": "string", "description": "Criteria the judge checks the report against, instead of `acceptance` (`--accept-review`; the gate is a non-empty `REPORT.md`). Judge only: it adds no reviewer; set `review` for one.", "minLength": 1, "maxLength": 4000},
             "step": {"type": "integer", "description": "Difficulty step 1..5.", "minimum": 1, "maximum": 5},
             "source": {"type": "string", "description": "Where the request came from (`--source`), such as `msg:<id>`, `issue:<n>` or `manual`.", "pattern": LABEL},
             "kind": {"type": "string", "description": "Card class (`--kind`); default `owner_task`. Leave it out with `every` or `cron`: a series is `series_run`.", "enum": ["owner_task", "system", "followup"]},
-            "review": {"type": "boolean", "description": "Independent review by the other vendor."},
+            "review": {"type": "boolean", "description": "Independent review by the other vendor (`--review`). Off by default; only `review: true` turns it on, never `accept_review`, `kind` or `step`. Set it for code cards (pull requests, code changes) first, for complex research that needs a second check, and for anything else the author decides to review; small errands (look, switch, check a status) go without."},
             "hold": {"type": "boolean", "description": "Park the card until the owner runs `hive.py release`. Not with `not_before`, `every` or `cron`."},
             "owner_visible": {"type": "boolean", "description": "Notify the owner about the result; default by class. A series (`series_run`) reports only news unless this is true."},
             "idem_key": {"type": "string", "description": "Idempotency key of the request: a second create with it returns the first card.", "pattern": LABEL},
@@ -1322,6 +1322,19 @@ mod tests {
                 "--idem=req-1"
             ]
         );
+    }
+
+    #[test]
+    fn accept_review_alone_asks_for_no_review() {
+        let mut judged = with(&json!({"accept_review": "criteria"}));
+        judged.as_object_mut().unwrap().remove("acceptance");
+        let args = args_of("hive_create", &judged, false);
+        assert!(args.contains(&"--accept-review=criteria".to_owned()));
+        assert!(!args.contains(&"--review".to_owned()));
+        judged["review"] = json!(false);
+        assert!(!args_of("hive_create", &judged, false).contains(&"--review".to_owned()));
+        judged["review"] = json!(true);
+        assert!(args_of("hive_create", &judged, false).contains(&"--review".to_owned()));
     }
 
     #[test]

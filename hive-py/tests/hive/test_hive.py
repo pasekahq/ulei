@@ -718,7 +718,7 @@ def test_judge_review_delivers_persisted_criteria_and_uses_other_vendor(env, mon
     criteria = 'The result names its evidence.\nThe result explains its conclusion.'
     assert hive_cli(monkeypatch, cfg, 'create', '--title', '[ok] judge review', '--goal', 'make out.txt',
                     '--accept-review', criteria, '--step', '1', '--source', 'manual', '--kind', 'system',
-                    '--created-by', 'secretary') == 0
+                    '--created-by', 'secretary', '--review') == 0
     cid = capsys.readouterr().out.split()[0]
     run_heads_inline(cfg, d)
 
@@ -737,7 +737,7 @@ def test_judge_review_fail_feedback_retries_then_passes(env, monkeypatch, capsys
     cfg, conn, d = env
     assert hive_cli(monkeypatch, cfg, 'create', '--title', '[reviewround2] judge retry', '--goal', 'make out.txt',
                     '--accept-review', 'The result explains the outcome.', '--step', '1', '--source', 'manual', '--kind', 'system',
-                    '--created-by', 'secretary') == 0
+                    '--created-by', 'secretary', '--review') == 0
     cid = capsys.readouterr().out.split()[0]
     run_heads_inline(cfg, d)
 
@@ -755,7 +755,7 @@ def test_judge_review_repeated_failures_block_with_visible_reasons(env, monkeypa
     cfg, conn, d = env
     assert hive_cli(monkeypatch, cfg, 'create', '--title', '[reviewfail] judge blocked', '--goal', 'make out.txt',
                     '--accept-review', 'The result explains the outcome.', '--step', '1', '--source', 'manual', '--kind', 'system',
-                    '--created-by', 'secretary') == 0
+                    '--created-by', 'secretary', '--review') == 0
     cid = capsys.readouterr().out.split()[0]
     run_heads_inline(cfg, d)
 
@@ -1703,7 +1703,8 @@ def card_row(conn, cid):
     return dict(conn.execute('SELECT * FROM cards WHERE id=?', (cid,)).fetchone())
 
 
-def test_create_cli_judge_acceptance_uses_report_gate_and_review(env, monkeypatch, capsys):
+def test_create_cli_judge_acceptance_uses_report_gate_without_review(env, monkeypatch, capsys):
+    """--accept-review is the judge's acceptance only; it turns on no reviewer (owner, 26.11)."""
     cfg, conn, _ = env
     criteria = 'The report explains the result and its evidence.'
     assert hive_cli(monkeypatch, cfg, 'create', '--title', 'judge card', '--goal', 'g',
@@ -1712,7 +1713,28 @@ def test_create_cli_judge_acceptance_uses_report_gate_and_review(env, monkeypatc
     cid = capsys.readouterr().out.split()[0]
     card = api.get(conn, cid)
     assert (card['acceptance_kind'], card['judge_criteria'], card['acceptance'], card['review']) == (
-        'judge', criteria, 'test -s REPORT.md', 1)
+        'judge', criteria, 'test -s REPORT.md', 0)
+
+
+def test_create_cli_judge_acceptance_keeps_explicit_review(env, monkeypatch, capsys):
+    cfg, conn, _ = env
+    assert hive_cli(monkeypatch, cfg, 'create', '--title', 'judge card', '--goal', 'g',
+                    '--accept-review', 'c', '--review', '--step', '1', '--source', 'manual', '--kind', 'system',
+                    '--created-by', 'secretary') == 0
+    cid = capsys.readouterr().out.split()[0]
+    assert (api.get(conn, cid)['acceptance_kind'], api.get(conn, cid)['review']) == ('judge', 1)
+
+
+def test_judge_card_without_review_is_done_by_the_judge_alone(env, monkeypatch, capsys):
+    cfg, conn, d = env
+    assert hive_cli(monkeypatch, cfg, 'create', '--title', '[ok] judge only', '--goal', 'make out.txt',
+                    '--accept-review', 'The result explains the outcome.', '--step', '1', '--source', 'manual',
+                    '--kind', 'system', '--created-by', 'secretary') == 0
+    cid = capsys.readouterr().out.split()[0]
+    run_heads_inline(cfg, d)
+
+    assert tick_until_terminal(d, conn, cid) == 'done'
+    assert [run['role'] for run in api.get(conn, cid)['runs']] == ['worker']
 
 
 def test_create_cli_command_acceptance_keeps_explicit_review(env, monkeypatch, capsys):

@@ -68,7 +68,7 @@ No cargo package and no workspace member; rules: [ADR-0068](adr/0068-python-hive
 | Id | Version | Status | Kind | File | Title | Used by |
 |---|---|---|---|---|---|---|
 | C1 | 1.2.0 | stable | json-schema | `contracts/c1-event.schema.json` | Event (owner inbox) | `ulei-channels`, `ulei-core`, `ulei-garden`, `ulei-glue`, `ulei-hive`, `ulei-runtime-adapters`, `hive-py` |
-| C2 | 0.5.0 | draft | json-schema | `contracts/c2-mcp-tools.json` | MCP facade of the core | `ulei-core`, `ulei-hive-mcp`, `ulei-runtime-adapters` |
+| C2 | 0.5.1 | draft | json-schema | `contracts/c2-mcp-tools.json` | MCP facade of the core | `ulei-core`, `ulei-hive-mcp`, `ulei-runtime-adapters` |
 | C3 | 0.1.0 | draft | json-schema | `contracts/c3-card-head.schema.json` | Card -> head -> report | `ulei-hive` |
 | C4 | 0.3.0 | vendored | openapi | `contracts/c4-qb.openapi.json` | qb /v1 API | `ulei-glue` |
 | C5 | 0.1.0 | draft | openapi | `contracts/c5-gate.openapi.json` | A2A gate owner side | `ulei-glue` |
