@@ -192,6 +192,7 @@ fn initialize_negotiates_the_engine_handshake_versions() {
             "hive_show",
             "hive_steer",
             "hive_cancel",
+            "hive_resolve",
             "hive_inspect",
             "hive_health",
             "hive_file"
@@ -311,6 +312,25 @@ fn each_tool_runs_its_argv_in_a_cleared_environment_and_answers_c2() {
         cancelled["structuredContent"],
         json!({"ok": true, "message": "h_0000000a cancelled"})
     );
+    let resolved = server.call(
+        &session,
+        "hive_resolve",
+        &json!({"card_id": "h_0000000a", "action": "rework", "text": "-- use the notes"}),
+    );
+    assert_eq!(
+        resolved["structuredContent"],
+        json!({"ok": true, "message": "h_0000000a dispute resolved: rework, now queued"})
+    );
+    let undisputed = server.call(
+        &session,
+        "hive_resolve",
+        &json!({"card_id": "h_00000000", "action": "accept", "text": "ok"}),
+    );
+    assert_eq!(undisputed["isError"], true);
+    assert_eq!(
+        undisputed["content"][0]["text"],
+        "resolve rejected: card h_00000000 is not disputed (state done, wait None)"
+    );
 
     let runs = runs(&dir);
     let argv: Vec<Vec<String>> = runs
@@ -358,6 +378,22 @@ fn each_tool_runs_its_argv_in_a_cleared_environment_and_answers_c2() {
                 "--by=secretary",
                 "--",
                 "h_0000000a"
+            ],
+            vec![
+                "resolve",
+                "--by=secretary",
+                "--",
+                "h_0000000a",
+                "rework",
+                "-- use the notes"
+            ],
+            vec![
+                "resolve",
+                "--by=secretary",
+                "--",
+                "h_00000000",
+                "accept",
+                "ok"
             ],
         ]
     );

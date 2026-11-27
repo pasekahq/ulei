@@ -245,7 +245,11 @@ and inside the existing tables: `disk` and `psi_cgroups` in `[resources]` (requi
 in `[admission]`, and `home` and `tag_launcher` in every `[vendors.<v>]`: `tag_launcher = true`
 only for the vendor whose binary is `<TAG_LAUNCHER>`. `inbox` is the root the old hive publishes
 into today. The `[texts]` paths are absolute, so a copy of the config elsewhere reads the same
-files. Then, as `<HIVE_USER>`:
+files. `daily_runs` in `[vendors.<v>]` is an optional ceiling on head launches per local day. It is off by
+default: a config without the key, or with `daily_runs = 0`, has no daily ceiling, and the weekly limit
+(`[budget]`, `limits_command`, `low_weekly_left_pct`) is the only limiter. A positive value turns it on; a
+negative, fractional or non-integer value is refused at load. A config that carries a value from the old hive
+keeps it. Then, as `<HIVE_USER>`:
 
 ```sh
 HIVE_CONFIG=<NEXT_CONFIG> <HIVE_VENV>/bin/python -P -c 'import sys

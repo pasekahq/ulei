@@ -975,6 +975,15 @@ def test_budget_low_weekly_limits_steps(env):
     assert ok == ['claude', 'codex']
 
 
+def spend_daily(conn, cfg, vendor):
+    """Put `vendor` at its daily ceiling: a ceiling of 1 and one run started today."""
+    cfg['vendors'][vendor]['daily_runs'] = 1
+    cid = mk(conn, f'[ok] spent {vendor}')
+    conn.execute("INSERT INTO runs(card_id,round,role,vendor,model,effort,step,prompt,status,started_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                 (cid, 1, 'worker', vendor, 'm', 'e', 1, 'p', 'exited', time.time()))
+    conn.execute("UPDATE cards SET state='cancelled' WHERE id=?", (cid,))
+
+
 def test_budget_daily_runs(env):
     cfg, conn, _ = env
     cfg['vendors']['claude']['daily_runs'] = 1
@@ -983,6 +992,24 @@ def test_budget_daily_runs(env):
                  (cid, 1, 'worker', 'claude', 'm', 'e', 1, 'p', 'exited', time.time()))
     ok, why = heads.allowed_vendors(conn, cfg, 1, {}, tag=None)
     assert ok == ['codex'] and 'daily' in why['claude']
+
+
+@pytest.mark.parametrize('cap', ['absent', 0])
+def test_daily_runs_is_an_optional_feature_off_by_default(env, cap):
+    cfg, conn, _ = env
+    if cap == 'absent':
+        del cfg['vendors']['claude']['daily_runs']
+    else:
+        cfg['vendors']['claude']['daily_runs'] = cap
+    cid = mk(conn, '[ok] x')
+    for _ in range(200):
+        conn.execute("INSERT INTO runs(card_id,round,role,vendor,model,effort,step,prompt,status,started_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (cid, 1, 'worker', 'claude', 'm', 'e', 1, 'p', 'exited', time.time()))
+    ok, why = heads.allowed_vendors(conn, cfg, 1, {}, tag=None)
+    assert ok == ['claude', 'codex'] and why == {}
+    cfg['vendors']['claude']['daily_runs'] = 200
+    ok, why = heads.allowed_vendors(conn, cfg, 1, {}, tag=None)
+    assert ok == ['codex'] and why['claude'] == 'daily runs limit 200 reached'
 
 
 def test_budget_blocks_launch_waits(env):
@@ -1015,7 +1042,7 @@ def test_daily_limit_and_task_failure_do_not_open_provider_episode(env):
     failed = mk(conn, '[exit1] task failure')
     assert tick_until_terminal(d, conn, failed) == 'blocked'
     for vendor in ('claude', 'codex'):
-        cfg['vendors'][vendor]['daily_runs'] = 0
+        spend_daily(conn, cfg, vendor)
     waiting = mk(conn, '[ok] daily limit')
     d.tick()
     assert api.get(conn, waiting)['state'] == 'queued'
@@ -2835,7 +2862,7 @@ def test_provider_failure_of_assignee_waits_without_failover(env):
 def test_wait_policy_parks_card_lets_others_run_and_launches_on_recovery(env, monkeypatch, capsys):
     cfg, conn, d = env
     cfg['concurrency'] = 1
-    cfg['vendors']['codex']['daily_runs'] = 0
+    spend_daily(conn, cfg, 'codex')
     spawned = record_spawns(d)
     pinned = mk(conn, '[ok] pinned', assignee='codex', priority=5, executors=EXECUTORS)
     other = mk(conn, '[ok] other')
@@ -2843,19 +2870,19 @@ def test_wait_policy_parks_card_lets_others_run_and_launches_on_recovery(env, mo
     d.tick()
     card = api.get(conn, pinned)
     assert (card['state'], card['round'], card['runs']) == ('queued', 0, [])
-    assert card['executor_wait'] == {'executor': 'codex', 'reason': 'daily runs limit 0 reached'}
+    assert card['executor_wait'] == {'executor': 'codex', 'reason': 'daily runs limit 1 reached'}
     assert worker_vendors(conn, other) == ['claude'] and len(spawned) == 1
     assert kinds(conn, pinned).count('executor_wait') == 1 and 'budget_wait' not in kinds(conn, pinned)
     assert {'kind': 'executor_wait', 'card': pinned, 'executor': 'codex',
-            'reason': 'daily runs limit 0 reached'} in dispatcher.observe(conn, cfg)
+            'reason': 'daily runs limit 1 reached'} in dispatcher.observe(conn, cfg)
     assert hive_cli(monkeypatch, cfg, 'show', pinned) == 0
-    assert 'waiting for executor codex: daily runs limit 0 reached' in capsys.readouterr().out
+    assert 'waiting for executor codex: daily runs limit 1 reached' in capsys.readouterr().out
 
     cfg['concurrency'] = 2
     cfg['vendors']['codex']['disabled'] = True
     d.tick()
     assert [e['data'] for e in api.get(conn, pinned)['events'] if e['kind'] == 'executor_wait'] == [
-        {'executor': 'codex', 'reason': 'daily runs limit 0 reached'}, {'executor': 'codex', 'reason': 'disabled'}]
+        {'executor': 'codex', 'reason': 'daily runs limit 1 reached'}, {'executor': 'codex', 'reason': 'disabled'}]
 
     cfg['vendors']['codex'].update(disabled=False, daily_runs=100)
     d.tick()
@@ -2867,14 +2894,14 @@ def test_wait_policy_parks_card_lets_others_run_and_launches_on_recovery(env, mo
 def test_fallback_policy_takes_ladder_pick_with_event_and_keeps_assignment(env):
     cfg, conn, d = env
     run_heads_inline(cfg, d)
-    cfg['vendors']['codex']['daily_runs'] = 0
+    spend_daily(conn, cfg, 'codex')
     cid = mk(conn, '[round2] pinned fallback', assignee='codex', on_unavailable='fallback', executors=EXECUTORS)
     d.tick()
     c = api.get(conn, cid)
     assert c['state'] == 'queued' and c['round'] == 1 and worker_vendors(conn, cid) == ['claude']
     assert [e['data'] for e in c['events'] if e['kind'] == 'assignee_fallback'] == [
         {'run': workers(c)[0]['id'], 'round': 1, 'assigned': 'codex', 'actual': 'claude',
-         'reason': 'daily runs limit 0 reached'}]
+         'reason': 'daily runs limit 1 reached'}]
     assert c['assignee'] == 'codex' and c['executor_wait'] is None
     cfg['vendors']['codex']['daily_runs'] = 100
     assert tick_until_terminal(d, conn, cid) == 'done'
@@ -3082,7 +3109,10 @@ def test_model_pin_waits_for_vendor_and_recovers_with_stored_head(env, unavailab
     elif unavailable == 'cooldown':
         store.meta_set(conn, 'provider_cooldown:codex', {'until': 1010.0, 'failures': 1})
     else:
-        cfg['vendors']['codex'][unavailable] = True if unavailable == 'disabled' else 0
+        if unavailable == 'disabled':
+            cfg['vendors']['codex']['disabled'] = True
+        else:
+            spend_daily(conn, cfg, 'codex')
     d.advance()
     assert d.start_run(api.card_row(conn, cid), limits) is None
     card = api.get(conn, cid)
@@ -3130,7 +3160,7 @@ def test_model_pin_provider_failure_obeys_policy(env, policy):
 def test_model_pin_unavailable_fallback_is_journaled_and_retry_restores_pin(env):
     cfg, conn, d = env
     run_heads_inline(cfg, d)
-    cfg['vendors']['codex']['daily_runs'] = 0
+    spend_daily(conn, cfg, 'codex')
     cid = mk(conn, '[round2] model fallback', model='gpt-6-astra', effort='high', on_unavailable='fallback')
     d.tick()
     card = api.get(conn, cid)
@@ -3393,7 +3423,7 @@ def test_panel_member_waits_without_substitution_and_recovers(env, monkeypatch, 
     limits = {'claude': 100, 'codex': 100}
     d.limits_fetcher = lambda c: limits
     if unavailable == 'daily':
-        cfg['vendors']['codex']['daily_runs'] = 0
+        spend_daily(conn, cfg, 'codex')
     elif unavailable == 'weekly':
         limits['codex'] = 1
     elif unavailable == 'disabled':
@@ -3561,7 +3591,7 @@ def test_panel_synthesis_waits_for_admission(env, monkeypatch, wait):
     else:
         for vendor in cfg['vendors']:
             if wait == 'daily':
-                cfg['vendors'][vendor]['daily_runs'] = 1
+                spend_daily(conn, cfg, vendor)
             elif wait == 'disabled':
                 cfg['vendors'][vendor]['disabled'] = True
             else:
@@ -3589,7 +3619,8 @@ def test_panel_synthesis_waits_for_admission(env, monkeypatch, wait):
     assert synthesis['member'] == store.SYNTHESIS and len(card['runs']) == 3
     assert {k: synthesis[k] for k in ('vendor', 'model', 'effort')} == heads.head_for(cfg, 5, synthesis['vendor'])
     assert d.active_runs('task') == 1
-    assert sum(heads.runs_today(conn, v, cfg['owner_tz']) for v in cfg['vendors']) == (4 if wait == 'slot' else 3)
+    spent = len(cfg['vendors']) if wait == 'daily' else 0  # the runs spend_daily put each vendor at its ceiling with
+    assert sum(heads.runs_today(conn, v, cfg['owner_tz']) for v in cfg['vendors']) == (4 if wait == 'slot' else 3) + spent
 
 
 @pytest.mark.parametrize('phase', ['before', 'starting', 'running', 'reported', 'handled'])

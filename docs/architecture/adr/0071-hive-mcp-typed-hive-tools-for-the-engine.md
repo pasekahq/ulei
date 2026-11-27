@@ -114,6 +114,7 @@ Values go as `--flag=value` and positionals after `--`, so no value is read as a
 | `hive_show` | `show --json -- <id>` | `CardStatus`; exit 1 `no such card` is the tool error `no such card <id>` |
 | `hive_steer` | `steer --by=<actor> -- <id> <note>` | `Ack` with the CLI's line (whether and how it was delivered) |
 | `hive_cancel` | `cancel --reason=.. --by=<actor> -- <id>` | `Ack` with the CLI's line (`cancelled` or `already cancelled`) |
+| `hive_resolve` (ADR-0095) | `resolve --by=<actor> -- <id> <accept\|rework> <text>` | `Ack` with the CLI's line (`dispute resolved: <action>, now <state>`) |
 
 `--hold` is added to every create when `hive_mcp.hold` is true. The server mirrors the CLI's
 cheap checks before it runs anything, so the model gets a typed error rather than a traceback:

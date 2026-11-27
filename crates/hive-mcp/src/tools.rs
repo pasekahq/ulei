@@ -7,19 +7,20 @@ use ulei_contracts::generated::c2::{
     Ack, CardRef, CardStatus, Empty, HiveCancelInput, HiveCreateInput, HiveCreateInputKind,
     HiveCreateOutput, HiveFileInput, HiveFileOutput, HiveHealthOutput, HiveInspectOutput,
     HiveListInput, HiveListInputCardClass, HiveListInputPlacement, HiveListInputState,
-    HiveListOutput, HiveSteerInput,
+    HiveListOutput, HiveResolveInput, HiveSteerInput,
 };
 
 use crate::config::Settings;
 use crate::hive::Exit;
 
 /// The tool names in the order `tools/list` serves them.
-pub const NAMES: [&str; 8] = [
+pub const NAMES: [&str; 9] = [
     "hive_create",
     "hive_list",
     "hive_show",
     "hive_steer",
     "hive_cancel",
+    "hive_resolve",
     "hive_inspect",
     "hive_health",
     "hive_file",
@@ -84,6 +85,8 @@ pub enum Call {
     Steer(HiveSteerInput),
     /// `hive_cancel`.
     Cancel(HiveCancelInput),
+    /// `hive_resolve`.
+    Resolve(HiveResolveInput),
     /// `hive_inspect`.
     Inspect(CardRef),
     /// `hive_health`.
@@ -101,6 +104,7 @@ impl Call {
             Self::Show(_) => "hive_show",
             Self::Steer(_) => "hive_steer",
             Self::Cancel(_) => "hive_cancel",
+            Self::Resolve(_) => "hive_resolve",
             Self::Inspect(_) => "hive_inspect",
             Self::Health => "hive_health",
             Self::File(_) => "hive_file",
@@ -113,6 +117,7 @@ impl Call {
             Self::Show(c) | Self::Inspect(c) => Some(&c.card_id),
             Self::Steer(c) => Some(&c.card_id),
             Self::Cancel(c) => Some(&c.card_id),
+            Self::Resolve(c) => Some(&c.card_id),
             Self::File(c) => Some(&c.card_id),
             Self::Create(_) | Self::List(_) | Self::Health => None,
         }
@@ -154,6 +159,7 @@ pub fn parse(name: &str, arguments: &Value) -> Option<Result<Call, Refusal>> {
         "hive_show" => decode(name).and_then(|a| typed!(name, a).and_then(show)),
         "hive_steer" => decode(name).and_then(|a| typed!(name, a).and_then(steer)),
         "hive_cancel" => decode(name).and_then(|a| typed!(name, a).and_then(cancel)),
+        "hive_resolve" => decode(name).and_then(|a| typed!(name, a).and_then(resolve)),
         "hive_inspect" => decode(name).and_then(|a| typed!(name, a).and_then(inspect)),
         "hive_health" => decode(name).and_then(|a| typed!(name, a).map(|_: Empty| Call::Health)),
         "hive_file" => decode(name).and_then(|a| typed!(name, a).and_then(file)),
@@ -560,6 +566,13 @@ fn cancel(input: HiveCancelInput) -> Result<Call, Refusal> {
     Ok(Call::Cancel(input))
 }
 
+fn resolve(input: HiveResolveInput) -> Result<Call, Refusal> {
+    card_id(&input.card_id)?;
+    bounded("text", &input.text, 1, 4000)?;
+    not_blank("text", &input.text)?;
+    Ok(Call::Resolve(input))
+}
+
 fn kind_name(kind: HiveCreateInputKind) -> &'static str {
     kind.as_str()
 }
@@ -645,10 +658,22 @@ pub fn argv(call: &Call, settings: &Settings) -> Vec<String> {
                 s.card_id.clone(),
             ]);
         }
+        Call::Steer(_) | Call::Cancel(_) | Call::Resolve(_) => {
+            write_argv(call, settings, &mut args);
+        }
+    }
+    args
+}
+
+/// The arguments of the commands that change a card (`steer`, `cancel`, `resolve`): the
+/// server's actor as `--by`, the input's values as one word each.
+fn write_argv(call: &Call, settings: &Settings, args: &mut Vec<String>) {
+    let by = format!("--by={}", settings.actor);
+    match call {
         Call::Steer(s) => {
             args.extend([
                 "steer".into(),
-                flag("by", &settings.actor),
+                by,
                 "--".into(),
                 s.card_id.clone(),
                 s.note.clone(),
@@ -657,14 +682,24 @@ pub fn argv(call: &Call, settings: &Settings) -> Vec<String> {
         Call::Cancel(c) => {
             args.extend([
                 "cancel".into(),
-                flag("reason", &c.reason),
-                flag("by", &settings.actor),
+                format!("--reason={}", c.reason),
+                by,
                 "--".into(),
                 c.card_id.clone(),
             ]);
         }
+        Call::Resolve(r) => {
+            args.extend([
+                "resolve".into(),
+                by,
+                "--".into(),
+                r.card_id.clone(),
+                r.action.as_str().into(),
+                r.text.clone(),
+            ]);
+        }
+        _ => {}
     }
-    args
 }
 
 /// The arguments of `list` after its command: each filter given, and the limit.
@@ -844,7 +879,7 @@ pub fn answer(call: &Call, exit: &Exit) -> Result<Value, Refusal> {
                 serde_json::from_str(&stdout).map_err(|_| bad_answer(call, "no JSON file"))?;
             to_value!(&out)
         }
-        Call::Steer(_) | Call::Cancel(_) => to_value!(&Ack {
+        Call::Steer(_) | Call::Cancel(_) | Call::Resolve(_) => to_value!(&Ack {
             ok: true,
             message: first_line(&stdout, MAX_LINE_CHARS),
         }),
@@ -967,7 +1002,7 @@ fn card_id_schema() -> Value {
 
 /// The input schema of each tool: the C2 definitions, `HiveCreateInput` without its top-level
 /// `oneOf`, which the server enforces.
-pub fn input_schemas() -> [(&'static str, Value); 8] {
+pub fn input_schemas() -> [(&'static str, Value); 9] {
     [
         ("hive_create", create_schema()),
         ("hive_list", list_schema()),
@@ -1014,6 +1049,29 @@ pub fn input_schemas() -> [(&'static str, Value); 8] {
                     }
                 },
                 "required": ["card_id", "reason"],
+                "additionalProperties": false
+            }),
+        ),
+        (
+            "hive_resolve",
+            json!({
+                "type": "object",
+                "description": "Decide a disputed card (state blocked, wait disputed) as its author: accept finishes it done with the head's result, rework queues a new round.",
+                "properties": {
+                    "card_id": card_id_schema(),
+                    "action": {
+                        "type": "string",
+                        "description": "`accept`: the dispute is right, the card is done. `rework`: a new round follows `text`.",
+                        "enum": ["accept", "rework"]
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Why (accept) or the instructions of the next round (rework), kept on the card.",
+                        "minLength": 1,
+                        "maxLength": 4000
+                    }
+                },
+                "required": ["card_id", "action", "text"],
                 "additionalProperties": false
             }),
         ),
@@ -1148,6 +1206,9 @@ fn description(name: &str) -> &'static str {
             "Send a clarification to the head working on a hive card; a card without a live head gets it in its next round."
         }
         "hive_cancel" => "Cancel a hive card with a reason; its active heads are stopped.",
+        "hive_resolve" => {
+            "Decide a disputed hive card (a head answered `RESULT: disputed`; the card is `blocked`, waiting `disputed` for its author). `accept`: the head is right, the card finishes done with its result; `text` says why. `rework`: the card goes back to the queue and its next round follows `text` as instructions. Only the card's author, the secretary or the owner may decide; any other card or state is refused."
+        }
         "hive_inspect" => {
             "Look inside a hive card, read-only, as of now: every round with its runs (worker or reviewer, model, effort, unit, start, end, outcome, report), the gate's result, the judge's or reviewer's verdict and reason (why a round was sent back); the live heads (systemd unit, the command each waits on and for how long, its last actions with their times, the units it started, the pull requests and CI runs it waits on with their checks; command lines and actions have credentials masked); the workspace's repositories (branch, last commit, latest pull request); where the card waits (board column, queue position, who holds the slots, hold, backoff, blockers, budget); its chain (parent, children, followup_of, followups, blockers); steers with their text and delivery; whether its result reached your inbox and your ACK; the workspace's files for `hive_file`. `waiting_on` is the one-line answer to «is it working or stuck»."
         }
@@ -1303,6 +1364,21 @@ mod tests {
                 "--by=secretary",
                 "--",
                 "h_0123abcd"
+            ]
+        );
+        assert_eq!(
+            args_of(
+                "hive_resolve",
+                &json!({"card_id": "h_0123abcd", "action": "rework", "text": "--by=owner -x"}),
+                false
+            ),
+            [
+                "resolve",
+                "--by=secretary",
+                "--",
+                "h_0123abcd",
+                "rework",
+                "--by=owner -x"
             ]
         );
         assert_eq!(
@@ -1731,6 +1807,93 @@ mod tests {
         );
         assert!(refused("hive_create", &json!("text")).contains("object"));
         assert!(parse("hive_nope", &json!({})).is_none());
+    }
+
+    #[test]
+    fn resolve_takes_only_a_card_an_action_and_a_text() {
+        let ok = json!({"card_id": "h_0123abcd", "action": "accept", "text": "The head is right."});
+        assert!(parse("hive_resolve", &ok).unwrap().is_ok());
+        for bad in ["--by=owner", "h_0123ABCD", ""] {
+            assert!(
+                refused(
+                    "hive_resolve",
+                    &json!({"card_id": bad, "action": "accept", "text": "t"})
+                )
+                .contains("card_id"),
+                "{bad}"
+            );
+        }
+        for action in ["close", "Accept", "", "done"] {
+            assert!(
+                refused(
+                    "hive_resolve",
+                    &json!({"card_id": "h_0123abcd", "action": action, "text": "t"})
+                )
+                .contains("invalid arguments"),
+                "{action}"
+            );
+        }
+        assert!(
+            refused(
+                "hive_resolve",
+                &json!({"card_id": "h_0123abcd", "action": "accept"})
+            )
+            .contains("missing field `text`")
+        );
+        assert_eq!(
+            refused(
+                "hive_resolve",
+                &json!({"card_id": "h_0123abcd", "action": "rework", "text": " \n "})
+            ),
+            "text is required"
+        );
+        assert!(
+            refused(
+                "hive_resolve",
+                &json!({"card_id": "h_0123abcd", "action": "rework", "text": "x".repeat(4001)})
+            )
+            .contains("text must be 1 to 4000")
+        );
+        assert!(
+            refused(
+                "hive_resolve",
+                &json!({"card_id": "h_0123abcd", "action": "rework", "text": "a\u{0}b"})
+            )
+            .contains("NUL")
+        );
+        for extra in ["by", "decision", "owner"] {
+            assert!(
+                refused(
+                    "hive_resolve",
+                    &json!({"card_id": "h_0123abcd", "action": "accept", "text": "t", extra: "owner"})
+                )
+                .contains("unknown field"),
+                "{extra}"
+            );
+        }
+        let call = parse("hive_resolve", &ok).unwrap().unwrap();
+        assert_eq!(call.card(), Some("h_0123abcd"));
+        assert_eq!(
+            answer(
+                &call,
+                &exit(0, "h_0123abcd dispute resolved: accept, now done\n", "")
+            )
+            .unwrap(),
+            json!({"ok": true, "message": "h_0123abcd dispute resolved: accept, now done"})
+        );
+        assert_eq!(
+            answer(
+                &call,
+                &exit(
+                    2,
+                    "",
+                    "hive: resolve rejected: card h_0123abcd is not disputed (state done, wait None)\n"
+                )
+            )
+            .unwrap_err()
+            .0,
+            "resolve rejected: card h_0123abcd is not disputed (state done, wait None)"
+        );
     }
 
     #[test]
