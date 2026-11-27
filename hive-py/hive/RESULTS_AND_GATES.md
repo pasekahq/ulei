@@ -67,8 +67,18 @@ maps from the card's step, with `[judge] max_tokens` and `[judge] timeout_s` for
 The turn carries the card's user tag in the field `tag` when the card has one (`create --tag`,
 `hive.py tag`), and has no such field otherwise. Its prompt holds the task (title, goal,
 details, acceptance command, `judge_criteria`), the worker report of the round, the gate output,
-and the reviewer's verdict and text. The first `VERDICT:` line of the answer decides: `done`
-finishes the card (a steer that arrived meanwhile queues a steer round instead); `rework`
+and the reviewer's verdict and text. The judge and the reviewer judge substance, not form: a
+rework or a FAIL is for work that falls short (a goal not met, a wrong result, a claim without
+evidence, a change, test, doc, check or merged PR the criteria require and the work lacks, a
+broken rule of the task). A gap only in how the report presents finished work is a note, and so
+is, for a question or a research, an item that widens the owner's question; a record (an issue,
+a ref) missing next to a finished and correct deliverable is a note that names it. The owner's
+clarifications outrank the criteria: after a request for speed or a minimal change, everything
+beyond the deliverable it names is a note. The first `VERDICT:` line of the
+answer decides: `done` finishes the card (a steer that arrived meanwhile queues a steer round
+instead); the text after it is the judge's notes on minor gaps, kept as the `reason` of the
+`judge` event and handed to the author as `judge_notes` of the result with the reason
+`judge done with notes`, and it starts no round; `rework`
 followed by a reason fails the round through the normal retry path with the reason as the next
 worker's feedback, spending `max_rounds`; it takes no backoff, so the next round starts on the
 next tick (a failed worker round or gate still waits `[retry_backoff]`). A failed turn is no

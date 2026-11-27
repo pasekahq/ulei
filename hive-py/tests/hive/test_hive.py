@@ -729,8 +729,9 @@ def test_judge_review_delivers_persisted_criteria_and_uses_other_vendor(env, mon
     assert worker['vendor'] != reviewer['vendor']
     assert reviewer['verdict'] == 'PASS' and reviewer['report'] == 'VERDICT: PASS\nlooks right\n'
     assert '## Persisted judge criteria\n```text\n' + criteria + '\n```' in reviewer['prompt']
-    assert 'Issue `VERDICT: PASS` only when every persisted judge criterion is satisfied.' in reviewer['prompt']
-    assert 'Otherwise issue `VERDICT: FAIL` with actionable reasons.' in reviewer['prompt']
+    assert 'every persisted judge criterion is satisfied' not in reviewer['prompt']
+    assert 'work a criterion requires was not done' in reviewer['prompt']
+    assert 'A gap only in how the report presents finished work goes under `Notes` after `VERDICT: PASS`' in reviewer['prompt']
 
 
 def test_judge_review_fail_feedback_retries_then_passes(env, monkeypatch, capsys):
@@ -777,7 +778,24 @@ def test_command_reviewer_prompt_stays_compatible(env):
         '## Worker report (round 1)', 'worker evidence', '', '## Mechanical gate', 'exit 0: accepted', '',
         'Check the result (read files, run read-only commands). Then write REVIEW.md here whose',
         'FIRST line is exactly `VERDICT: PASS` or `VERDICT: FAIL`, followed by reasons.',
-        'FAIL only for concrete defects against the goal/acceptance; list what must change.',
+        'Review substance, not form: a FAIL costs the owner another round of waiting. Issue `VERDICT: FAIL` when',
+        'the work itself falls short: the goal is not met, the result is wrong, a claim the owner will act on has',
+        'no evidence, or work a criterion requires was not done (a change of code, configuration or docs, a test, a',
+        'check that proves the change works, a merged PR, a part of the answer the goal asks for), or a rule of the',
+        'task was broken. List what must change, the missing work first.',
+        'A record about the work (an issue, a ref, a link) is required work when the goal asks for it or the review',
+        'fails anyway. Next to a finished and correct deliverable, a missing record is a note that names it.',
+        'For a change (code, configuration, docs, a PR), every change, test and doc the criteria require is required',
+        'work. For a question or a research, an answer that covers only part of what the goal asks about fails; but an',
+        'item that widens the question is a note even when the criteria list it: other subjects next to the one the',
+        'owner asked about, the CI of an already merged PR, extra statistics, extra context.',
+        'A gap only in how the report presents finished work goes under `Notes` after `VERDICT: PASS`: a list instead',
+        'of a table, wording, length, order, a statement left implicit that the evidence shows, raw output next to a',
+        'result with its source.',
+        "The owner's clarifications outrank the criteria: when the owner asked for speed or a minimal change,",
+        'everything beyond the deliverable they name (records, tables, statements) is a note.',
+        'Before a FAIL, ask whether the owner would wait another round for the missing items. When the deliverable is',
+        'done and correct and only notes are missing, the answer is no: `VERDICT: PASS` with the notes.',
         'Judge the result, not the artifacts: a PR, test or file the card names is the means of its goal. A worker',
         'who shows by a reproduction on the layer the user sees that the goal already holds needs no artifact;',
         'one who skipped it by reading code alone does. If the worker disputes the task itself (`RESULT: disputed`),',

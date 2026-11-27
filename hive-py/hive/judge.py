@@ -1,7 +1,9 @@
 """One-shot judge of a head card: one C4G turn on the route alias the config maps from the card's step.
 
-The answer's first `VERDICT:` line gives `done`, or `rework` or `disputed` followed by the reason. `disputed` is no
-failure: the worker's evidence says the task itself is wrong, and the card's author decides.
+The answer's first `VERDICT:` line gives `done`, optionally followed by notes, or `rework` or `disputed` followed by the
+reason. A rework is only for missing or wrong work; gaps in how the report presents it are notes on a `done`, which
+start no round. `disputed` is no failure: the worker's evidence says the task itself is wrong, and the card's author
+decides.
 """
 import re
 import uuid
@@ -19,9 +21,32 @@ SYSTEM = '\n'.join([
     'Judge the result, not the artifacts: a PR, a test or a file the task names is the means of its goal, not the',
     'goal. A worker who shows, by a reproduction on the layer the user sees, that the goal already holds and the',
     'artifact is not needed has met the goal. A worker who skips an artifact by reading code alone has not.',
+    'Judge substance, not form. A rework costs the owner another round of waiting; ask for one when the work itself',
+    'falls short: the goal is not met, the result is wrong, a claim the owner will act on has no evidence, or work a',
+    'criterion requires was not done (a change of code, configuration or docs, a test, a check that proves the change',
+    'works such as a test turn or a measurement, a merged PR, a part of the answer the goal asks for), or a rule of',
+    'the task was broken.',
+    'A record about the work (an issue, a ref, a link) is required work when the goal asks for it or a rework is due',
+    'anyway. Next to a finished and correct deliverable, a missing record is a note that names it, for the author.',
+    'For a change (code, configuration, docs, a PR), every change, test and doc the criteria require is required work.',
+    'For a question or a research, the answer to what the owner asked is the goal, and an answer that covers only part',
+    'of what the goal asks about is not done; but an item that widens the question is a note even when the criteria',
+    'list it: other subjects next to the one the owner asked about, the CI of an already merged PR, extra statistics,',
+    'extra context.',
+    'A gap only in how the report presents finished work is a note, not a rework: a list instead of a table, wording,',
+    'length, order, missing headings, a statement left implicit that the evidence already shows, raw command output',
+    'next to a result with its source.',
+    "The owner's clarifications (quoted in the report or in the details) outrank the criteria: when the owner asked",
+    'for speed or a minimal change, everything beyond the deliverable they name (records, tables, statements) is a note.',
+    'Before a rework, ask whether the owner would wait another round for the missing items. When the deliverable is',
+    'done and correct and only notes are missing, the answer is no: `VERDICT: done` with the notes.',
+    "Do not accept a worker's reason for skipping required work unless its evidence shows the work is not needed.",
+    'A review FAIL is weighed by the same rule: a FAIL that lists only notes is `VERDICT: done` with the notes.',
     'The FIRST line of your answer is exactly `VERDICT: done`, `VERDICT: rework` or `VERDICT: disputed`.',
+    'After `VERDICT: done`, you may add short notes on minor gaps for the card author; they start no new round.',
     'After `VERDICT: rework`, the next lines say what is missing or wrong and what must change; the next worker',
-    'reads them as its instructions. Ask for rework only for concrete defects of the work against the task.',
+    'reads them as its instructions. Name the essential defects first; then list the minor gaps as optional, so one',
+    'round fixes everything.',
     'Answer `VERDICT: disputed` when the dispute is about the task itself, not the work: the worker reports',
     '`RESULT: disputed`, or its evidence says the premise, a required artifact or the criteria are wrong and the',
     'task text cannot settle it. Do not fail it and do not ask for rework: the card goes to its author, who decides.',
@@ -54,16 +79,16 @@ def prompt(card, report, gate, review):
 
 
 def verdict(text):
-    """('done', ''), ('rework', reason) or ('disputed', reason) from the first VERDICT line; None without one or for a
-    rework or a dispute without a reason."""
+    """('done', notes), ('rework', reason) or ('disputed', reason) from the first VERDICT line, `notes` being the text
+    after a `done` ('' without any); None without a VERDICT line or for a rework or a dispute without a reason."""
     lines = (text or '').splitlines()
     for i, line in enumerate(lines):
         m = VERDICT_RE.match(line.strip().lstrip('*`# '))
         if not m:
             continue
-        if m.group(1).lower() == 'done':
-            return 'done', ''
         reason = '\n'.join([m.group(2)] + lines[i + 1:]).strip()
+        if m.group(1).lower() == 'done':
+            return 'done', reason
         return (m.group(1).lower(), reason) if reason else None
     return None
 
