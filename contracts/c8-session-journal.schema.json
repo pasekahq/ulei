@@ -25,7 +25,7 @@
         },
         "route": {
           "type": "string",
-          "description": "Route alias C6 `set_route` stored, on which the session's turns run; absent means the engine's default route. A new session of the key starts without one.",
+          "description": "Route alias C6 `set_route` stored, on which the session's turns run; absent means the engine's default route (the `DefaultRoute`, else the configured one). A new session of the key starts without one.",
           "pattern": "^[a-z][a-z0-9_-]{0,63}$"
         }
       },
@@ -223,6 +223,21 @@
         "at",
         "reason",
         "provenance"
+      ],
+      "additionalProperties": false
+    },
+    "DefaultRoute": {
+      "type": "object",
+      "description": "The engine's default route alias a global C6 `set_route` stored, at most one per journal: a session that stores no route runs on it instead of the configured `engine.default_route`, across new sessions and restarts. Absent means the configured one.",
+      "properties": {
+        "route": {
+          "type": "string",
+          "description": "Route alias, as C4G `TurnRequest.route`.",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        }
+      },
+      "required": [
+        "route"
       ],
       "additionalProperties": false
     }

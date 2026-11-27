@@ -763,10 +763,19 @@ Fail: a missing or repeated part, or a send error in the `ulei-tg` journal.
 
 ### 4.6 Delegation to the hive and its return
 
-The engine reaches the hive only through `ulei-hive-mcp` and its five tools (ADR-0071); it gets no
-path of the hive. Set it up once, as `<ULEI_USER>`, before the first run of this item. The token
-goes into the engine's state directory, which the engine (and its `terminal`) can read: it opens
-only the same five typed calls.
+The engine reaches the hive only through `ulei-hive-mcp` and its typed tools: the five of ADR-0071
+(`hive_create`, `hive_list`, `hive_show`, `hive_steer`, `hive_cancel`) and the three read-only
+snapshots of ADR-0086 (`hive_inspect`, `hive_health`, `hive_file`); it gets no path of the hive.
+Set it up once, as `<ULEI_USER>`, before the first run of this item. The token goes into the
+engine's state directory, which the engine (and its `terminal`) can read: it opens only the same
+typed calls.
+
+The release ships the server (`ulei-hive-mcp` in `ci/release.sh`, its unit in `deploy/install.sh`)
+and every tool is on by default: the server has no per-tool switch, and `[engine.mcp.hive]` with
+no `tools.include` registers every tool the server lists. An upgrade therefore needs no config change:
+the release's `ulei-hive-mcp` and the hive's CLI at the same commit, then `systemctl --user
+try-restart ulei-hive-mcp.service`; the engine lists the tools again on its next run. A
+`tools.include` that names tools one by one must add the three snapshot tools itself.
 
 ```sh
 umask 077

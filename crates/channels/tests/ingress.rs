@@ -996,15 +996,18 @@ fn an_owner_reaction_wakes_the_agent_after_fifteen_seconds() {
         panic!("{out:?}")
     };
     assert!(turn.internal);
-    assert_eq!(turn.text, ReactionConfig::default().wake_text);
+    // The block is in the journaled prompt, not ephemeral context: later turns still see it.
     assert_eq!(
-        turn.context.as_deref(),
-        Some(
+        turn.text,
+        format!(
+            "{}\n\n{}",
+            ReactionConfig::default().wake_text,
             "Реакции владельца в Telegram с прошлого хода (текстом не писали, только поставили реакцию):\n\
              - 2026-09-21T14:13 👍 премиум-эмодзи (id 5368324170671202286, картинку не вижу) на его же сообщение \
              #10 «Привет, как дела?»"
         )
     );
+    assert_eq!(turn.context, None);
     assert_eq!(h.ingress.next_deadline(), None);
 }
 
@@ -1097,11 +1100,15 @@ impl Engine for FakeEngine {
         })
     }
 
-    fn set_route(&mut self, alias: &str) -> Result<RouteSwitch, EngineError> {
-        self.calls.borrow_mut().push(format!("set_route {alias}"));
+    fn set_route(&mut self, alias: &str, global: bool) -> Result<RouteSwitch, EngineError> {
+        let flag = if global { " --global" } else { "" };
+        self.calls
+            .borrow_mut()
+            .push(format!("set_route {alias}{flag}"));
         if alias == "fast" {
             Ok(RouteSwitch {
                 alias: alias.to_owned(),
+                global,
                 context_total: Some(128_000),
             })
         } else {
@@ -1253,8 +1260,7 @@ fn command_replies_follow_the_reference() {
             }
         ),
         "Модель изменена на `fast`\nКонтекст: 128,000 токенов\n\
-         _(`--global` пока не поддерживается: модель действует до `/new`, \
-         затем снова маршрут по умолчанию)_"
+         Сохранено как модель по умолчанию (`--global`): действует и после `/new`"
     );
     assert_eq!(
         reply(
@@ -1284,7 +1290,7 @@ fn command_replies_follow_the_reference() {
             "interrupt",
             "interrupt",
             "set_route fast",
-            "set_route fast",
+            "set_route fast --global",
             "set_route bad",
             "status"
         ]

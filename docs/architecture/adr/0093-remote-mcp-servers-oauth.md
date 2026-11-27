@@ -129,6 +129,11 @@ On the request path, per server, as `OAuthClientProvider.async_auth_flow`:
    shows it as an MCP call error (ADR-0026) and its recovery ladder treats it as any server
    error. The daemon never starts an interactive flow by itself (the reference's
    `OAuthNonInteractiveError` path for a background process).
+   A token endpoint that answers 5xx, times out or cannot be reached leaves the stored grant
+   untouched. The server turns `refresh_failed`, and the relay answers with a JSON-RPC error
+   whose text is `MCP server '<server>' could not refresh its token (<host>: <status>)`. The
+   next request tries again, and a success turns the server `ok`. Section 11 says how both
+   states reach the engine's callers.
 4. On 403 with `WWW-Authenticate: ... error="insufficient_scope"`: the server turns
    `needs_login` with the union of the stored and the challenged scopes recorded, so the next
    login asks for them (the reference's step-up, SEP-2350); no automatic re-authorization.
@@ -245,10 +250,129 @@ from the well-known URLs, a resource or issuer mismatch refused, dynamic registr
 `state` and `iss` checks, refresh before expiry, a 401 with one refresh for concurrent calls, a
 rotated refresh token persisted before use and the old one never sent again, `invalid_grant`
 turning `needs_login` with the error text the engine relays, the 403 step-up, the event stream
-relayed chunked with notifications before the response, an interrupt dropping the upstream
-call, the peer-uid refusal, `relay_allow` on list and call, no secret in any output (a scan of
-stderr, journal and status for the fakes' token values), the budgets of section 8, and the unit
-in the `systemd-units` job.
+relayed chunked with notifications before the response, a `GET` answered 405 and a legacy-only
+server (its `initialize` `POST` answered 405) reading `unreachable` (section 10), an interrupt
+dropping the upstream call, the peer-uid refusal, `relay_allow` on list and call, no secret in
+any output (a scan of stderr, journal and status for the fakes' token values), the budgets of
+section 8, and the unit in the `systemd-units` job.
+
+### 10. Transports
+
+The MCP specification (2025-06-18) names two HTTP transports. Each case is decided here.
+
+| Transport or part of one | Decision | Reason |
+|---|---|---|
+| Streamable HTTP, `POST` answered with `application/json` | Supported, relayed with its length (section 2) | The base case of ADR-0026. |
+| Streamable HTTP, `POST` answered with `text/event-stream` (notifications and requests before the response) | Supported, relayed chunked event by event (section 2) | The prototype's server answers every `POST` this way. The engine reads the stream up to the response with the request's `id` and drops notifications (ADR-0015 section 3, ADR-0026). |
+| Streamable HTTP, `DELETE` of the session | Supported, relayed | The engine ends every session this way (ADR-0026). |
+| Streamable HTTP, the server-initiated `GET` event stream (a standing stream for server notifications and server-to-client requests) | Not supported. The engine never opens it (ADR-0026, differences table). The daemon answers a `GET /<server>/mcp` on its socket with `405 Method Not Allowed`, which the specification gives as the answer of a server without such a stream. It never opens one upstream by itself. | A standing stream is an open connection, and the daemon's reads on it would be wake-ups while the engine is idle (ADR-0010: no wake-ups when idle). A changed tool list takes effect at the next run because the engine reconnects every turn (ADR-0026). Server-to-client requests (sampling, elicitation, roots) need an owner approval surface the engine does not have (section 5). So the stream would carry nothing the engine can use. Resumption with `Last-Event-ID` is not supported for the same reasons. |
+| The legacy HTTP+SSE transport (protocol 2024-11-05: a `GET` stream that first sends an `endpoint` event, then `POST`s to that endpoint answered `202`, with all responses arriving on the stream) | Rejected. The daemon makes no backwards-compatibility fallback. When a server answers the `initialize` `POST` with `400`, `404` or `405`, that status is relayed to the engine as a connect failure. The server reads `unreachable` in `GET /status`, with the detail `legacy HTTP+SSE (2024-11-05) is not supported`. | Every response would arrive on one long-lived stream shared by all requests. The daemon would have to hold that stream, keep it alive and match responses to requests across connections, which breaks one request per engine connection and the zero-idle-wake-up rule. The specification deprecated this transport in 2025-03-26. Hosted OAuth servers, the prototype's server among them, speak Streamable HTTP. A server that speaks only the legacy transport needs its own record with measurements. |
+
+### 11. Contracts: C6 unchanged, C9 extended
+
+- **C9 (`ulei.toml`)** gets the keys of section 7, with a version bump and a `CHANGELOG.md` entry
+  in `contracts/`, in the implementing change (ADR-0041). It is the only contract this
+  mechanism changes.
+- **C6 (core ↔ runtime adapter, ADR-0005 and ADR-0008) stays unchanged: no new method, field,
+  enum value or error code.** Each remote-MCP state already reaches C6's callers through a
+  field C6 has:
+  - `needs_login` and `refresh_failed` during a call. The daemon answers the engine's MCP
+    request with a JSON-RPC error whose text names the state and the command (section 3,
+    step 3). The engine turns it into an MCP tool error (ADR-0026), and the model gets it as
+    the tool's result. The model then tells the owner in its reply, which C6 carries as
+    `interim`/`final` turn events (ADR-0031), like any other tool failure. The turn's
+    `TurnOutcome` does not change: a failed tool call leaves it `completed`, as it does for a
+    local MCP server. So C6 `status` and `turn_events` need nothing new.
+  - The relay socket is absent, or the daemon is down, at connect. The engine writes the usual
+    startup warning naming `engine.mcp_remote_socket` to stderr (ADR-0026; Consequences below). It
+    offers the turn no tools of that server. Nothing crosses C6.
+  - Server status (`ok`, `needs_login`, `refresh_failed`, `unreachable`, `down`). `ulei status`
+    reads the daemon's own `GET /status` on the relay socket, as it reads `ulei-hive-mcp`
+    directly (ADR-0074). Status therefore does not pass through the engine or C6. C6
+    `SessionStatus` describes sessions and turns, not tool servers. Adding a per-server status
+    there would make every C6 runtime, foreign adapters included, report a daemon it does not
+    own.
+  - C6 `Error` and `ErrorCode` classify failures of the C6 wire itself (ADR-0008). A remote-MCP
+    failure happens inside a turn and never fails a C6 request, so it gets no C6 error code.
+  - C6 `mcp_register` with `McpTransport` (`stdio`, `uds`) registers the core's C2 facade in a
+    foreign runtime. Remote servers are configured for the engine in C9 and never registered
+    over C6, so `McpTransport` gets no `https` value. A foreign runtime behind C6 brings its own
+    MCP client and its own OAuth.
+- C6 changes, with its own record, only when the owner can be asked through the channel. That
+  covers a login from the owner chat and a structured `needs_login` notice instead of the
+  model's words (open questions).
+
+### 12. Migration from the prototype bridge `contra-mcp-bridge` (card h_e0e84034)
+
+The bridge runs as the user unit `ulei-contra-mcp.service`. Its code is
+`~/.local/lib/contra-mcp-bridge/bridge.py`, and its state is in
+`~/.local/state/contra-mcp-bridge/`: `tokens.json`, `client.json`, `meta.json`, `allow.txt`,
+`local.token` and `bridge.json`. The engine reaches it as `[engine.mcp.contra]` with
+`url = "http://127.0.0.1:8745/mcp"` and an `env_file` holding the local bearer. The grant
+rotates, so it must have exactly one holder at every moment. The steps therefore stop the old
+holder before the new one starts, in both directions. The implementing change ships this plan
+as a runbook. The owner's host runs it after the released `ulei-mcp-remote` is installed and
+its unit is enabled.
+
+1. **Stop the bridge**: `systemctl --user stop ulei-contra-mcp.service`. From here until step 6,
+   the `contra` tools answer the connect failure. Nothing else is affected.
+2. **Copy the token files**: with `ulei-mcp-remote.service` stopped, copy the bridge's three
+   files into the new store `$XDG_STATE_HOME/ulei/mcp-remote/contra/` (directory 0700, files
+   0600, the name is the server key of `engine.mcp.<server>`). Format mapping:
+
+   | Bridge file | Store file | Fields | Handling |
+   |---|---|---|---|
+   | `tokens.json` | `tokens.json` | `access_token`, `token_type`, `expires_in`, `refresh_token`, `refresh_token_expires_in`, `scope`, `expires_at` | Same names, copied as is. `expires_at` is absolute Unix time in both. If `expires_at` is missing (a file never refreshed by the bridge), the daemon treats the access token as expired and refreshes first (section 3, step 1). Unknown fields are kept. |
+   | `client.json` | `client.json` | `client_id`, `client_name`, `client_id_issued_at`, `redirect_uris`, `grant_types`, `response_types`, `token_endpoint_auth_method`, `scope`, `issuer` | Same names. `issuer` binds the client to its authorization server (section 3). If it is missing, it is set from `meta.json`'s `issuer`. |
+   | `meta.json` | `meta.json` | The RFC 8414 authorization server metadata: `issuer`, `authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `introspection_endpoint`, `scopes_supported`, ... | Copied as is. The daemon checks that its `issuer` equals `client.json`'s. |
+   | `allow.txt` | none | The tool allowlist | Goes to `relay_allow` (step 4). |
+   | `local.token`, `bridge.json` | none | The engine's local bearer and the bridge's listen config | Not copied. |
+
+   The bridge seeded its files from the reference's token store, whose names are
+   `<server>.json`, `<server>.client.json` and `<server>.meta.json`. Those names map to the
+   same three files, so a grant held by the reference moves the same way, after the reference
+   stops using it.
+3. **Disable the bridge**: `systemctl --user disable ulei-contra-mcp.service`. The unit file,
+   the code and the state directory stay in place until step 7, for a rollback.
+4. **Change the server's config** in `[engine.mcp.contra]`:
+   - set `url = "https://contra.com/mcp"` and `auth = "oauth"`;
+   - remove `env_file` (a static header plus OAuth fails the connect, section 2) and delete
+     `~/.local/state/ulei/engine/contra-mcp.env`;
+   - **map the allowlist to `relay_allow`**: take the non-comment, non-empty lines of
+     `allow.txt` (text after `#` is a comment) and join them with `,`. At card h_e0e84034 the
+     file held 33 tool names. It may have grown since, and the count of names is the check
+     in step 6. The bridge matched with Python `fnmatchcase`, and `relay_allow` takes names
+     and `*`. The bridge's file holds plain names only, so the mapping is one to one. An
+     entry using `?` or `[...]` must be rewritten as names before the move;
+   - keep `[engine.mcp.contra.tools]` (`tools.include`, `resources`, `prompts`) as it is.
+5. **Start**: `systemctl --user start ulei-mcp-remote.service`, then restart the engine by the
+   host's usual procedure.
+6. **Check**:
+   - `ulei status` prints `mcp-remote: ... contra ok`;
+   - one turn calls `whoami`;
+   - the engine's `tools/list` for `contra` has as many tools as `relay_allow` has names;
+   - a call of a tool outside `relay_allow` is answered `tool <name> is not enabled on this
+     relay`;
+   - the daemon's journal shows no token.
+7. **Clean up**, after a week without a rollback:
+   - delete the bridge's state directory, which holds a refresh token the first rotation has
+     made stale;
+   - remove the unit file and `~/.local/lib/contra-mcp-bridge/`;
+   - `systemctl --user daemon-reload`.
+
+**Rollback** (at any point before step 7, again with one holder at a time):
+
+1. Stop `ulei-mcp-remote.service`.
+2. Copy the store's current `tokens.json`, `client.json` and `meta.json` back to
+   `~/.local/state/contra-mcp-bridge/`. The daemon has rotated the refresh token, so the
+   bridge's old copy is no longer valid. The format is the same in both directions.
+3. Restore `url = "http://127.0.0.1:8745/mcp"` and `env_file`, recreating it from
+   `local.token`. Remove `auth` and `relay_allow`.
+4. `systemctl --user enable --now ulei-contra-mcp.service`, then restart the engine.
+
+If the grant is already invalid (`needs_login`), the bridge cannot recover it, because it has
+no login. In that case, run `ulei-mcp-remote login contra` with the daemon stopped, then copy
+the new files back as in rollback step 2.
 
 ### Differences from the reference
 
@@ -267,6 +391,44 @@ The port map has no entry for the OAuth modules yet; the implementing card adds 
 `tools/mcp_oauth.py`, `tools/mcp_oauth_manager.py` and the SDK's `mcp/client/auth/` with the
 rows above as its recorded changes (AGENTS.md, reference implementation section).
 
+## Threat model
+
+### Assets
+
+- **Refresh tokens**: long-lived, rotating, one per grant. Whoever holds one acts as the owner
+  on the service until it is revoked. It is the main asset.
+- **Access tokens**: short-lived (the prototype's server: one hour), sent on every upstream
+  request.
+- **Client secrets**: `client_secret_file` of a confidential client, and a `client_secret` or
+  registration access token returned by dynamic registration (`client.json`). Static API-key
+  headers in the daemon's env-files have the same value.
+- Transient secrets of a login: the authorization code, the PKCE verifier and `state`. Session
+  ids, which ADR-0026 already redacts.
+- The owner's account on the service itself, through tool calls. A paying or publishing tool
+  called against the owner's will is a harm even when no token leaks.
+
+### Adversaries and the measures against them
+
+| Adversary and threat | Measures (section) | What remains |
+|---|---|---|
+| **A prompt-injected engine tool** (a terminal command the model was led to run) reads the tokens or the client secret | The engine never holds an OAuth token (section 1). The store and the daemon's env-files are in `InaccessiblePaths=` of the engine's unit (section 4, ADR-0069). The engine's `ProtectHome=read-only` keeps `ulei.toml` unwritable from its tools. | Only where the unit's namespace applies. Where the user manager cannot create it, the system unit of ADR-0069 is required. |
+| The same tool calls a dangerous tool of the service, directly on the relay socket or through the model | `relay_allow` is enforced in the daemon on `tools/list` and `tools/call`, before a request leaves the host (section 6). Its config is read only by the daemon, from a file the engine cannot write. | The relay socket is in `%t/ulei`, which the engine may write, and it serves the engine's own uid. A tool can therefore call any tool inside `relay_allow`, bypassing `tools.include`. It could also replace the socket and feed the engine false tool results, though it gets no secret that way. `relay_allow` is the boundary, so it must hold only what the owner accepts the model calling. |
+| The same tool runs `ulei-mcp-remote login` or `logout` | `login` needs the owner's browser and consent and writes to a store the sandbox cannot reach. `logout` fails for the same reason. | None beyond the phishing row below. |
+| **Another local uid** connects to the relay socket, reads the store, or answers the login's loopback callback | The socket is 0600 in a 0700 directory, and the daemon checks `SO_PEERCRED` uid equality (section 2). The store is 0700/0600 (section 4). The callback checks `state` in constant time and `iss`, and PKCE `S256` makes a captured code useless without the verifier (section 3). | Another uid can take the redirect port first, or send junk to the listener. That makes the login fail, a denial of service, and the paste fallback still works. root is out of scope. |
+| **A malicious or compromised MCP server** tries to get a token for another resource, steer discovery to an endpoint of its choice, or exhaust the daemon | `resource` must match the server URL (`_validate_resource_match`). `resource` is sent on every authorization, token and refresh request, so the token is bound to that server (RFC 8707). Discovery and OAuth endpoints are `https://` only. Redirects are not followed (section 2). Limits: head 8 KiB, event line and body 4 MiB, connect 60 s, idle 300 s, 16 connections. Token values are redacted from every output (section 4, ADR-0026). The engine's description scan (ADR-0026) runs on what `relay_allow` lets through. | The server legitimately receives its own access token. Its tool descriptions and results can still carry prompt injection to the model; `relay_allow` narrows that surface but does not remove it. It can name any authorization server in its resource metadata, so the owner trusts the server they configured. Discovery can reach any `https://` host the server names, a narrow request forgery that cannot carry a token. |
+| **A malicious or compromised authorization server** mixes up issuers, or swaps metadata to capture codes or client credentials | The metadata `issuer` must equal the discovered one (`validate_metadata_issuer`). The `iss` parameter is checked (RFC 9207). Client credentials are bound to their issuer and dropped when it changes (SEP-2352). `https://` only. | An authorization server compromised at the service itself controls that grant anyway. That is outside this host's control, and the service's revocation is the remedy. |
+| **A network MITM** reads or alters the traffic, or downgrades it | `https://` only in the shipped build. Certificates are checked against the bundled `webpki-roots`, with no platform verifier (ADR-0015 section 1). No redirects. The `http://` test switch exists only in CI builds (section 2). | A mis-issued certificate from a trusted CA. There is no pinning, since hosted services rotate certificates. |
+| **A phishing authorization URL or pasted redirect**: an attacker sends the owner a lookalike login link, or gets the owner to paste a redirect from another session (code injection, login CSRF) | `login` builds the URL only from metadata discovered over `https://` for the configured server, and prints it itself; it never accepts a URL from outside. A pasted redirect is accepted only with this login's `state` and `iss`, and the code only works with this login's PKCE verifier (section 3). The daemon never starts a flow by itself (section 3, step 3), so no automatic process sends the owner a login link. | The owner can still be fooled by a link that did not come from `login`. The rule for the owner is to log in only from a URL their own `login` printed. A login from the owner chat would widen this surface and needs its own record (open questions). |
+
+### Residual risks, in short
+
+- A tool inside `relay_allow` can be called by a prompt-injected command through the relay
+  socket. `relay_allow` must therefore list only what the owner accepts the model calling.
+- Prompt injection through the remote server's tool descriptions and results.
+- No certificate pinning. A compromised CA, authorization server or service is out of scope.
+- Isolation of the tokens from the engine's tools depends on the unit's namespace (ADR-0069).
+- Denial of service of a login by another local uid that takes the redirect port.
+
 ## Consequences
 
 - Any owner can add a remote MCP server with one `[engine.mcp.<server>]` section, an `https://`
@@ -278,8 +440,37 @@ rows above as its recorded changes (AGENTS.md, reference implementation section)
   Hosts without remote servers need not install it. When the socket is absent, an `https://`
   server fails its connect at the start of the run with the usual startup warning (ADR-0026),
   naming `engine.mcp_remote_socket`; the other servers connect as before.
-- A grant moves between holders only by moving its files and stopping the old holder; the
-  runbook of the implementing change describes the move from the prototype bridge (copy its
-  token files, stop and disable the bridge, point the server's `url` at the HTTPS endpoint).
+- A grant moves between holders only by moving its files and stopping the old holder. The
+  move from the prototype bridge, with its rollback, is the plan of section 12.
 - A refresh token that expires while the server is unused (lazy refresh, no timer) surfaces as
-  `needs_login` on the next call and in `ulei status`.
+  `needs_login` on the next call and in `ulei status`; whether to report it earlier is an open
+  question.
+
+## Open questions
+
+Each is left for a later record or for the implementing change. None blocks the mechanism
+above.
+
+- **Login from the owner chat.** The assistant would send the authorization URL, and the owner
+  would paste the redirect back. That needs an owner approval surface in the channel, C6 fields
+  to carry it (section 11), and a rule against phishing, since the chat would then carry login
+  links (threat model). Until then, login is the terminal command only (section 5).
+- **A published paseka Client ID Metadata Document.** The paseka publishes none in this step,
+  so CIMD works only with an owner-configured `client_metadata_url` (section 3). A shared
+  document would spare each owner the dynamic registration. It would also need a URL that the
+  paseka controls and keeps stable, a review of its `redirect_uris` (loopback ports), and a
+  decision on who may change it.
+- **The call-RSS budget is not measured yet.** The peak RSS of one relayed call whose event line
+  is at the 4 MiB cap (`ULEI_MCP_REMOTE_MAX_CALL_RSS_KB`, section 8) has no number. The
+  implementing change measures it and fixes it with its margin. If it or the idle limits do not
+  hold, it comes back with the measurements and the owner's word (ADR-0053).
+- **A refresh token that expires while the server is idle.** The daemon refreshes only on the
+  request path and has no timer (ADR-0010), so a grant whose refresh token lapses during a long
+  pause reads `needs_login` only at the next call. The prototype's server reports
+  `refresh_token_expires_in`. Still open:
+  - whether `GET /status` should report `needs_login` ahead of time from that field, without a
+    wake-up;
+  - whether `ulei status` should warn some days before expiry;
+  - or whether a rare scheduled refresh (a timer unit, not a thread) is worth its wake-ups.
+- Whether the relay socket should move out of the engine's writable `%t/ulei`, or the engine
+  should check more than the peer uid, to close the socket replacement in the threat model.

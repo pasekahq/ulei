@@ -36,12 +36,72 @@ ROUND_EVENTS = ('gate', 'judge', 'review_requested', 'retry', 'blocked', 'done',
 PULL = [re.compile(r'\bgh\s+pr\s+(?:checks|view|merge|ready|diff)\s+(?:(?:-R|--repo)[= ]?\S+\s+)?#?(\d+)\b'),
         re.compile(r'github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)')]
 RUN_WATCH = re.compile(r'\bgh\s+run\s+(?:watch|view)\s+(?:(?:-R|--repo)[= ]?\S+\s+)?(\d+)\b')
-# What a vendor CLI puts before the command a head asked for (sourcing its shell snapshot, unaliasing): the snapshot
-# shows the command from its `eval '`.
-PREAMBLE = re.compile(r"^/bin/(?:ba)?sh -c source \S+ .*?&& eval '", re.DOTALL)
+# What a vendor CLI puts around the command a head asked for (sourcing its shell snapshot, unaliasing, a `case` on the
+# shell version; after it, stdin from /dev/null for a background command and saving the working directory): the
+# snapshot shows the command inside `eval '…'`.
+PREAMBLE = re.compile(r"^/bin/(?:ba|z)?sh -c (?:source \S+ |\{ ?case |[^\n]{0,400}?shell-snapshots)[\s\S]{0,8000}?&& eval '")
+POSTAMBLE = re.compile(r"'(?: < /dev/null)?(?: \\?&& pwd -P >\| \S+)?(?: ?\})?\s*$")
+ACTIONS = 10              # recent actions of a head read from the tail of its log
+ACTION_CHARS = 300        # one action's text
+LOG_TAIL = 512 * 1024     # the bytes of a head's log read for its recent actions
+MAX_REPOS = 4             # git repositories of a workspace described in a snapshot
+GIT_TIMEOUT_S = 5
 REPO_FLAG = re.compile(r'(?:--repo[= ]|-R\s+)([\w.-]+/[\w.-]+)')
 # A unit name as a word of its own: not part of a path (`/srv/name/x`) or of an `owner/name` repository.
 UNIT_TOKEN = re.compile(r'(?<![\w@.:/-])[A-Za-z0-9@_.:-]+(?![\w@.:/-])')
+
+
+# ── secrets ───────────────────────────────────────────────────────────────────
+# A command line or a head's action can carry a credential (`curl -H "Authorization: Bearer …"`, `GH_TOKEN=… gh`,
+# `psql postgres://user:pass@…`); `redact` replaces each with MASK before a snapshot shows the text.
+MASK = '[REDACTED]'
+SECRET_TEXT = [
+    # a private key block, whole
+    (re.compile(r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)'), MASK),
+    # an Authorization (or Proxy-Authorization) header: its scheme kept, its credential masked
+    (re.compile(r'(?i)(\b(?:proxy-)?authorization\s*[:=]\s*)(?:(bearer|basic|token|digest)\s+)?[^\s\'",;]+'),
+     lambda m: m.group(1) + (m.group(2) + ' ' if m.group(2) else '') + MASK),
+    (re.compile(r'(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}'), lambda m: m.group(1) + ' ' + MASK),
+    # credentials in a URL: scheme://user:pass@host, scheme://token@host
+    (re.compile(r'(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@\'"]+:[^/\s@\'"]*@'), r'\1' + MASK + '@'),
+    (re.compile(r'(?i)\b((?:https?|git|ssh)://)[A-Za-z0-9_-]{20,}@'), r'\1' + MASK + '@'),
+    # NAME=value where the name speaks of a secret: GH_TOKEN=, API_KEY=, AWS_SECRET_ACCESS_KEY=, PGPASSWORD=
+    (re.compile(r'(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|_KEY|APIKEY|CREDENTIALS?|_PAT|_AUTH)'
+                r'[A-Z0-9_]*)=("[^"]*"|\'[^\']*\'|[^\s\'";&|]+)'), r'\1=' + MASK),
+    (re.compile(r'(?i)(?<![\w-])(key|secret|password|token)=("[^"]*"|\'[^\']*\'|[^\s\'";&|]+)'), r'\1=' + MASK),
+    # "password": "…" in JSON, password: … in YAML
+    (re.compile(r'(?i)(["\']?\b(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|'
+                r'private[_-]?key)["\']?\s*:\s*)("[^"]*"|\'[^\']*\'|[^\s,\'"}]+)'), r'\1' + MASK),
+    # --token X, --password=X, --api-key X, -p'X' of mysql
+    (re.compile(r'(?i)(--(?:[a-z-]*-)?(?:token|password|passwd|secret|api-key|access-key|auth)(?:=|\s+))'
+                r'("[^"]*"|\'[^\']*\'|[^\s\'"]+)'), r'\1' + MASK),
+    # token formats that are secrets on their own, wherever they stand
+    (re.compile(r'\b(?:gh[opusr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|'
+                r'sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|'
+                r'(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|ya29\.[0-9A-Za-z_-]{20,}|'
+                r'npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{50,}|hf_[A-Za-z0-9]{30,}|'
+                r'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})'), MASK),
+    # a Telegram bot token: 123456789:AA…
+    (re.compile(r'(?<![0-9])\d{8,10}:AA[A-Za-z0-9_-]{30,}'), MASK),
+]
+
+
+def redact(text):
+    """`text` with the credentials SECRET_TEXT knows replaced by MASK; None stays None."""
+    if not text:
+        return text
+    for pattern, repl in SECRET_TEXT:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def unwrap(cmdline):
+    """The command a head asked for, without the vendor CLI's shell wrapper around it."""
+    m = PREAMBLE.match(cmdline)
+    if not m:
+        return cmdline
+    inner = POSTAMBLE.sub('', cmdline[m.end():], count=1)
+    return inner.replace("'\"'\"'", "'").replace("'\\''", "'")
 
 
 def cut(text, n):
@@ -123,7 +183,7 @@ class Probe:
         except OSError:
             cwd = None
         full = raw.rstrip(b'\0').replace(b'\0', b' ').decode(errors='replace')[:SCAN_CHARS]
-        shown = PREAMBLE.sub('', full, count=1)
+        shown = redact(unwrap(full))
         return {'pid': pid, 'ppid': int(rest[1]), 'cmdline': shown[:CMDLINE_CHARS], 'scan': full, 'age_s': age,
                 'cwd': cwd}
 
@@ -137,6 +197,14 @@ class Probe:
         argv = ['run', 'view', str(run_id), '--json', 'name,status,conclusion,url,headBranch,createdAt,updatedAt']
         return gh_json(self, argv + (['--repo', repo] if repo else []), cwd)
 
+    def branch_pull(self, branch, repo, cwd):
+        """The latest pull request (any state) whose head is `branch`, through `gh pr list`; None when there is none."""
+        found = gh_json(self, ['pr', 'list', '--repo', repo, '--head', branch, '--state', 'all', '--limit', '1',
+                               '--json', 'number,url,state,title,updatedAt,mergedAt'], cwd)
+        if isinstance(found, dict):
+            return found
+        return found[0] if found else None
+
 
 def gh_json(probe, argv, cwd):
     if not probe.gh:
@@ -147,7 +215,7 @@ def gh_json(probe, argv, cwd):
     except (OSError, subprocess.TimeoutExpired) as e:
         return {'error': f'gh: {e.__class__.__name__}: {e}'[:300]}
     if out.returncode != 0:
-        return {'error': f'gh exit {out.returncode}: {out.stderr.strip()[:300]}'}
+        return {'error': redact(f'gh exit {out.returncode}: {out.stderr.strip()[:300]}')}
     try:
         return json.loads(out.stdout)
     except ValueError:
@@ -291,12 +359,174 @@ def pulse(conn, card, probe, now):
                                waiting_s=p['age_s'], command=p['cmdline']))
         entry['workflow_runs'] = wf
         entry['waiting_on'] = waiting_on(entry)
+        entry.update(recent_actions(r['run_dir'], r['vendor']))
         heads.append(entry)
     jobs = [dict(j) for j in conn.execute('SELECT version, mode, started_at FROM gate_jobs WHERE card_id=?',
                                           (card['id'],))]
     for j in jobs:
         j['running_s'] = round(now - j['started_at'], 1)
-    return {'heads': heads, 'gate_jobs': jobs}
+    return {'heads': heads, 'gate_jobs': jobs, 'repos': repos(card['workdir'], probe)}
+
+
+# ── what a head did last ──────────────────────────────────────────────────────
+
+def log_tail(path, size=LOG_TAIL):
+    """The last `size` bytes of the file as lines, the first (cut) line dropped; [] when it cannot be read."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            f.seek(max(0, end - size))
+            raw = f.read(size)
+    except OSError:
+        return []
+    lines = raw.decode(errors='replace').splitlines()
+    return lines[1:] if end > size and lines else lines
+
+
+def iso_ts(value):
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 1e11 else float(value)
+    if not isinstance(value, str):
+        return None
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return None
+
+
+def tool_text(name, args):
+    """One line for a tool call: the command of a shell, the path of a file tool, else its arguments."""
+    if not isinstance(args, dict):
+        return f'{name} {args}'
+    for key in ('command', 'cmd', 'file_path', 'path', 'pattern', 'url', 'query', 'description', 'prompt'):
+        if isinstance(args.get(key), str):
+            value = args[key] if key != 'command' else unwrap(args[key])
+            return f'{name}: {value}'
+        if isinstance(args.get(key), list):
+            return f'{name}: {" ".join(map(str, args[key]))}'
+    return f'{name} {json.dumps(args, ensure_ascii=False)}'
+
+
+def claude_actions(d):
+    """[(kind, text)] of one line of a Claude stream: its tool calls and texts; tool results are left out."""
+    if d.get('type') != 'assistant' or d.get('parent_tool_use_id') is not None:
+        return []
+    out = []
+    for c in (d.get('message') or {}).get('content') or []:
+        if not isinstance(c, dict):
+            continue
+        if c.get('type') == 'tool_use':
+            out.append(('tool', tool_text(c.get('name') or '?', c.get('input'))))
+        elif c.get('type') == 'text' and (c.get('text') or '').strip():
+            out.append(('text', c['text']))
+    return out
+
+
+CODEX_ITEMS = {'commandExecution': 'tool', 'command_execution': 'tool', 'mcpToolCall': 'tool', 'mcp_tool_call': 'tool',
+               'fileChange': 'tool', 'file_change': 'tool', 'webSearch': 'tool', 'web_search': 'tool',
+               'agentMessage': 'text', 'agent_message': 'text'}
+
+
+def codex_actions(d):
+    """[(kind, text)] of one line of a Codex stream (`exec --json` or the app server): its started items."""
+    kind = d.get('type') or d.get('method')
+    if kind not in ('item.started', 'item/started', 'item.completed', 'item/completed'):
+        return []
+    item = d.get('item') or (d.get('params') or {}).get('item') or {}
+    what = CODEX_ITEMS.get(item.get('type'))
+    if what is None:
+        return []
+    # A tool shows when it starts, a message when it is complete.
+    if (what == 'tool') != kind.endswith('started'):
+        return []
+    if what == 'text':
+        return [('text', item.get('text') or '')]
+    t = item.get('type')
+    if t in ('commandExecution', 'command_execution'):
+        return [('tool', tool_text('shell', {'command': item.get('command')}))]
+    if t in ('fileChange', 'file_change'):
+        return [('tool', 'edit: ' + ', '.join(ch.get('path', '?') for ch in item.get('changes') or []))]
+    if t in ('webSearch', 'web_search'):
+        return [('tool', f"search: {item.get('query')}")]
+    return [('tool', tool_text(f"{item.get('server')}.{item.get('tool')}", item.get('arguments')))]
+
+
+def recent_actions(run_dir, vendor, n=ACTIONS):
+    """The head's last `n` actions read from the tail of its log, oldest first: {at, kind tool|text, text}, every text
+    cut and redacted; with the log's size and last write. A snapshot of the file, not a stream."""
+    if not run_dir:
+        return {'actions': [], 'log': None}
+    path = Path(run_dir) / 'head.log'
+    try:
+        st = path.stat()
+    except OSError:
+        return {'actions': [], 'log': None}
+    found = []
+    for line in log_tail(path):
+        if not line.startswith('{'):
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        acts = claude_actions(d) if vendor == 'claude' or 'session_id' in d else codex_actions(d)
+        at = iso_ts(d.get('timestamp') or d.get('emittedAtMs') or d.get('ts'))
+        for kind, text in acts:
+            found.append({'at': at, 'kind': kind, 'text': redact(cut(' '.join(text.split()), ACTION_CHARS))})
+    return {'actions': found[-n:], 'log': {'size': st.st_size, 'updated_at': st.st_mtime}}
+
+
+# ── the workspace's repositories ──────────────────────────────────────────────
+
+def git(cwd, *argv):
+    try:
+        out = subprocess.run(['git', '-C', str(cwd), *argv], capture_output=True, text=True, timeout=GIT_TIMEOUT_S,
+                             env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0'})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+GITHUB_REMOTE = re.compile(r'github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$')
+
+
+def repos(workdir, probe):
+    """The git repositories of the card's workspace (the workspace itself and its top-level directories): branch,
+    last commit, how far it is ahead of its upstream, dirty or not, and the latest pull request of the branch — what
+    the head last committed and pushed, whatever it waits on now."""
+    if not workdir or not os.path.isdir(workdir):
+        return []
+    root = Path(workdir)
+    subdirs = sorted(d for d in root.iterdir() if d.is_dir() and not d.is_symlink() and (d / '.git').exists())
+    candidates = ([root] if (root / '.git').exists() else []) + subdirs
+    out = []
+    for d in candidates[:MAX_REPOS]:
+        head = git(d, 'log', '-1', '--format=%H%x1f%ct%x1f%an%x1f%s')
+        if head is None:
+            continue
+        sha, ct, author, subject = (head.split('\x1f') + ['', '', '', ''])[:4]
+        branch = git(d, 'rev-parse', '--abbrev-ref', 'HEAD')
+        upstream = git(d, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}')
+        ahead = git(d, 'rev-list', '--count', '@{upstream}..HEAD') if upstream else None
+        status = git(d, 'status', '--porcelain', '--untracked-files=no')
+        remote = git(d, 'remote', 'get-url', 'origin')
+        m = GITHUB_REMOTE.search(remote or '')
+        entry = {'path': str(d.relative_to(root)) if d != root else '.', 'branch': branch, 'upstream': upstream,
+                 'ahead': int(ahead) if ahead and ahead.isdigit() else None, 'dirty': bool(status),
+                 'remote': redact(remote), 'repo': m.group(1) if m else None,
+                 'last_commit': {'sha': sha[:12], 'at': float(ct) if ct.isdigit() else None, 'author': author,
+                                 'subject': redact(cut(subject, ACTION_CHARS))},
+                 'pull_request': None}
+        if m and branch and branch != 'HEAD':
+            pr = probe.branch_pull(branch, m.group(1), str(d))
+            entry['pull_request'] = pr if pr is None or 'error' in pr else {
+                k: pr.get(k) for k in ('number', 'url', 'state', 'title', 'updatedAt', 'mergedAt')}
+        out.append(entry)
+    return out
 
 
 def waiting_on(head):
@@ -489,6 +719,11 @@ def queue(conn, cfg, card, now, cgroup_root=liveness.CGROUP_ROOT):
         out['slots'] = slots(cfg, card, heads)
     # The dispatcher's last word on why no vendor took the card; kept after the card moved on, so only while it waits.
     budget, at = store.meta_get(conn, f"budget_wait:{card['id']}")
+    # A head launched after the note: the note is about an earlier wait (a store written before the dispatcher
+    # cleared notes at launch keeps it), not why the card waits now.
+    last_start = conn.execute('SELECT max(started_at) FROM runs WHERE card_id=?', (card['id'],)).fetchone()[0]
+    if budget and last_start is not None and last_start >= at:
+        budget = None
     waits = card['state'] in ('queued', 'review', 'created') or column == 'waiting'
     # A note older than the config file came from a dispatcher that ran the old limits: `stale`.
     mtime = config_mtime(cfg)
@@ -628,7 +863,8 @@ def resolve(cfg, c, rel):
 
 
 def read_file(cfg, c, rel, offset=0, limit=FILE_CHARS):
-    """{path, size, offset, text, truncated} of a file, or {path, entries} of a directory, of the card's workspace."""
+    """{path, size, offset, text, truncated} of a file, or {path, entries} of a directory, of the card's workspace;
+    the text with the credentials `redact` knows masked (a head's log can hold one)."""
     path = resolve(cfg, c, rel)
     if path.is_dir():
         names = sorted(os.listdir(path))[:LIST_ENTRIES]
@@ -641,7 +877,7 @@ def read_file(cfg, c, rel, offset=0, limit=FILE_CHARS):
         size = os.fstat(f.fileno()).st_size
         f.seek(offset)
         raw = f.read(limit)
-    return {'path': rel, 'size': size, 'offset': offset, 'text': raw.decode(errors='replace'),
+    return {'path': rel, 'size': size, 'offset': offset, 'text': redact(raw.decode(errors='replace')),
             'truncated': offset + len(raw) < size}
 
 

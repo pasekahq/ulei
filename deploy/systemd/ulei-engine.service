@@ -8,6 +8,8 @@ Description=ulei engine
 StartLimitIntervalSec=0
 
 [Service]
+# On the owner turn's path, outside any IO-capped slice (ADR-0042 section 11).
+Slice=ulei.slice
 Type=exec
 Environment=ULEI_CONFIG=%E/ulei/ulei.toml
 ExecStart=%h/.local/bin/ulei-engine serve

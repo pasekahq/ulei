@@ -590,6 +590,7 @@ fn an_injected_event_reaches_the_owner_chat_once_and_its_turn_reports_sent() {
         .set_route(&SetRouteRequest {
             session: OWNER_SESSION.to_owned(),
             route: "main".to_owned(),
+            global: None,
         })
         .expect("the owner's session in the journal");
     let turn = inject_when_free(&socket, EVENT);
@@ -782,6 +783,7 @@ fn a_redelivered_inbox_event_sends_its_files_once() {
         .set_route(&SetRouteRequest {
             session: OWNER_SESSION.to_owned(),
             route: "main".to_owned(),
+            global: None,
         })
         .expect("the owner's session in the journal");
     let turn = inject_when_free(&socket, EVENT);

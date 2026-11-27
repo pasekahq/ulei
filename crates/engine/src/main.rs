@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -59,6 +59,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A model may think for minutes before its first event.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long a turn waits for the journal lock another connection holds to read the default route.
+const JOURNAL_WAIT: Duration = Duration::from_secs(10);
 const EXIT_FAILURE: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 /// `serve` refused its config: the status of a usage error, which the unit's
@@ -93,7 +95,8 @@ struct Run {
 enum Route {
     /// This alias, whatever the session stores (`run --route`).
     Given(String),
-    /// The alias the session stores, else this default (`serve`).
+    /// The alias the session stores, else the default route the journal stores (a global C6
+    /// `set_route`), else this configured default (`serve`).
     Stored(String),
 }
 
@@ -436,6 +439,17 @@ impl Runner for Turns {
             reactions,
         }
     }
+
+    fn lists_route(&self, alias: &str) -> Result<bool, String> {
+        let socket = self
+            .config
+            .path(config::QB_SOCKET, env(config::QB_SOCKET.env))
+            .map_err(|e| e.to_string())?;
+        let routes = Client::new(socket, CONNECT_TIMEOUT, CONNECT_TIMEOUT)
+            .routes()
+            .map_err(|e| e.to_string())?;
+        Ok(routes.routes.iter().any(|r| r.alias == alias))
+    }
 }
 
 /// Runs and journals one turn under the settings of `config` and the prompt cache mode `cache`
@@ -483,17 +497,13 @@ fn journaled(
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
     let mut journal = Journal::open(&db).map_err(|e| fail(&e))?;
-    let session = if run.new {
-        journal.new_session(&run.session)
-    } else {
-        journal.session(&run.session)
-    }
-    .map_err(|e| fail(&e))?;
-    let route = route_of(run, &session);
+    let (session, base) = session_of(&mut journal, run).map_err(|e| fail(&e))?;
+    let route = route_of(run, &session, &base);
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
     let stores = stores(config).map_err(|e| fail(&e))?;
     let (context, trace) = turn_context(config, stores.garden.as_ref(), run, (next, route));
-    journal_tools(&mut tools, &db, &socket, stores, (next, run), origin).map_err(|e| fail(&e))?;
+    journal_tools(&mut tools, &db, &socket, stores, (next, run, &base), origin)
+        .map_err(|e| fail(&e))?;
     let ids = next
         .request_ids()
         .map_err(|e| fail(&format!("request ids: {e}")))?;
@@ -798,17 +808,18 @@ struct Stores {
     archive: Option<archive::Client>,
 }
 
-/// The `set_model` tool of `run`, whose prompt has `origin`: it stores an alias with the current
-/// session of the run's key in the journal file `db`, checked against the routes of the gateway
-/// at `socket`.
-fn set_model(db: &Path, run: &Run, socket: &Path, origin: Origin) -> SetModel {
-    let default_route = match &run.route {
+/// The `set_model` tool of `run`, whose prompt has `origin` and whose sessions without a stored
+/// route run on `default`: it stores an alias with the current session of the run's key, and
+/// when asked as the default route, in the journal file `db`, checked against the routes of the
+/// gateway at `socket`; `configured` is the default a stored one equal to it clears.
+fn set_model(db: &Path, run: &Run, socket: &Path, default: &str, origin: Origin) -> SetModel {
+    let configured = match &run.route {
         Route::Given(alias) | Route::Stored(alias) => alias.clone(),
     };
     SetModel::new(
         db.to_path_buf(),
         run.session.clone(),
-        default_route,
+        (default.to_owned(), configured),
         Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT),
         origin,
     )
@@ -826,14 +837,14 @@ fn journaled_prompt(run: &Run) -> String {
 
 /// Registers `session_search`, `forget`, `archive_search` and `archive_read` over the journal
 /// file `db` and `stores` for turn `turn` of `run`, whose prompt has `origin`, then `set_model`
-/// over the gateway at `socket`, then `react_to_message` when the run records reactions, then
+/// over the gateway at `socket` with the run's default route `default`, then `react_to_message` when the run records reactions, then
 /// `garden_search` and `garden_propose` when the garden is configured.
 fn journal_tools(
     tools: &mut Registry,
     db: &Path,
     socket: &Path,
     stores: Stores,
-    (turn, run): (journal::Turn, &Run),
+    (turn, run, default): (journal::Turn, &Run, &String),
     origin: Origin,
 ) -> Result<(), DuplicateTool> {
     tools.register(Box::new(SessionSearch::new(db.to_path_buf(), turn.session)))?;
@@ -851,7 +862,7 @@ fn journal_tools(
         stores.archive.clone(),
     )))?;
     tools.register(Box::new(ArchiveRead::new(stores.archive)))?;
-    tools.register(Box::new(set_model(db, run, socket, origin)))?;
+    tools.register(Box::new(set_model(db, run, socket, default, origin)))?;
     if let Some(reactions) = &run.reactions {
         tools.register(Box::new(ReactToMessage::new(
             run.message_id,
@@ -865,11 +876,33 @@ fn journal_tools(
     Ok(())
 }
 
-/// The route alias of `run` in `session`: the one it gives, else the session's, else the default.
-fn route_of<'a>(run: &'a Run, session: &'a Session) -> &'a String {
+/// The session `run` runs in, a new one of its key for `run.new`, and the route alias a session
+/// of `run` that stores none runs on ([`default_of`]).
+fn session_of(journal: &mut Journal, run: &Run) -> Result<(Session, String), journal::Error> {
+    let session = if run.new {
+        journal.new_session(&run.session)
+    } else {
+        journal.session(&run.session)
+    }?;
+    Ok((session, default_of(run, journal)?))
+}
+
+/// The route alias a session of `run` that stores none runs on: the one `run` gives, else the
+/// default route `journal` stores, else the configured one (ADR-0094).
+fn default_of(run: &Run, journal: &Journal) -> Result<String, journal::Error> {
+    Ok(match &run.route {
+        Route::Given(alias) => alias.clone(),
+        Route::Stored(configured) => journal
+            .default_route(JOURNAL_WAIT)?
+            .unwrap_or_else(|| configured.clone()),
+    })
+}
+
+/// The route alias of `run` in `session`: the one it gives, else the session's, else `default`.
+fn route_of<'a>(run: &'a Run, session: &'a Session, default: &'a String) -> &'a String {
     match &run.route {
         Route::Given(alias) => alias,
-        Route::Stored(default) => session.route.as_ref().unwrap_or(default),
+        Route::Stored(_) => session.route.as_ref().unwrap_or(default),
     }
 }
 
@@ -994,8 +1027,11 @@ fn archive(config: &Config) -> Result<Option<archive::Client>, config::Error> {
 /// Registers the tools of every server of `servers` that connects before `interrupt` fires into
 /// `tools`; each warning goes to stderr as one line.
 fn connect_mcp(servers: &[Server], tools: &mut Registry, interrupt: &Interrupt) -> mcp::Sessions {
+    /// The failed first connects of this process: a server that is down costs one turn its
+    /// connect retries, the next turns a single attempt (`mcp::FAILED_CONNECT_MEMORY`).
+    static FAILED: LazyLock<mcp::FailedConnects> = LazyLock::new(mcp::FailedConnects::new);
     let clock: Arc<dyn mcp::Clock> = Arc::new(mcp::SystemClock);
-    let (sessions, warnings) = mcp::connect(servers, tools, &clock, interrupt);
+    let (sessions, warnings) = mcp::connect_remembering(servers, tools, &clock, interrupt, &FAILED);
     for warning in warnings {
         let _ = writeln!(
             std::io::stderr().lock(),

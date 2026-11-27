@@ -232,6 +232,7 @@ fn the_engine_registers_and_calls_the_five_hive_tools() {
             "mcp__hive__hive_show",
             "mcp__hive__hive_steer",
             "mcp__hive__hive_cancel",
+            "mcp__hive__hive_resolve",
             "mcp__hive__hive_inspect",
             "mcp__hive__hive_health",
             "mcp__hive__hive_file"

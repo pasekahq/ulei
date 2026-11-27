@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use ulei_memory::archive::{
     Archive, Begun, Caller, DEFAULT_LIST_TEXT_CHARS, Error, Item, MAX_LIST_BODY, MAX_LIST_LIMIT,
-    MAX_LIST_TEXT_CHARS, MAX_PART, MAX_RANGE, MAX_UPLOAD_TEXT, Page, Skip, Upload,
+    MAX_LIST_TEXT_CHARS, MAX_PART, MAX_RANGE, MAX_UPLOAD_TEXT, Page, Skip, UPLOAD_TTL, Upload,
 };
 use ulei_memory::wire::c10::{ErrorCode, ListRequest, ListResponse, PutStatus, SearchRequest};
 
@@ -924,12 +924,18 @@ fn an_abandoned_upload_does_not_block_a_new_one_and_expires_with_its_parts() {
     );
     let other = noise(MAX_PART + 10);
     let other_id = sha(&other);
-    let next = send(
-        &mut archive,
-        &upload("library/e.bin", "e", &other, &other_id),
-        &other,
-        MAX_PART,
-    );
+    let Begun::Upload(next) = archive
+        .begin(&upload("library/e.bin", "e", &other, &other_id))
+        .unwrap()
+    else {
+        panic!("no upload opened");
+    };
+    // The short lifetime has done its part in this `begin`; under it a slow part would expire
+    // the new upload too.
+    archive.set_upload_ttl(UPLOAD_TTL);
+    for (i, chunk) in other.chunks(MAX_PART).enumerate() {
+        archive.part(next, i as u64, chunk).unwrap();
+    }
     assert_eq!(
         archive.uploads().unwrap(),
         1,

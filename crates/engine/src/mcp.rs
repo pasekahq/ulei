@@ -12,16 +12,16 @@ mod tools;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use ulei_contracts::generated::c4g;
 
 pub use client::Endpoint;
-use recovery::Link;
 pub use recovery::{Clock, SystemClock};
+use recovery::{Link, MAX_INITIAL_CONNECT_RETRIES};
 use tools::Utility;
 
 use crate::config::{self, Config, Fault, ItemSetting};
@@ -218,6 +218,45 @@ impl Sessions {
     }
 }
 
+/// How long a failed first connect of a server shortens the next ones to a single attempt.
+pub const FAILED_CONNECT_MEMORY: Duration = Duration::from_secs(300);
+
+/// The servers whose first connect failed lately, by name, kept across the runs of one engine
+/// process. Every run connects every server anew, and the first connect of a server that is
+/// down retries with backoff up to its connect timeout (about 8 s with three retries) before
+/// the turn's first model request: a dead server would add that to every owner turn. A server
+/// whose first connect failed less than [`FAILED_CONNECT_MEMORY`] ago gets one attempt
+/// without retries; a success forgets the failure.
+#[derive(Debug, Default)]
+pub struct FailedConnects(Mutex<HashMap<String, Instant>>);
+
+impl FailedConnects {
+    /// No failure remembered.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The retries of the first connect of `server` at `now`.
+    fn retries(&self, server: &str, now: Instant) -> u32 {
+        let failed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match failed.get(server) {
+            Some(at) if now.saturating_duration_since(*at) < FAILED_CONNECT_MEMORY => 0,
+            _ => MAX_INITIAL_CONNECT_RETRIES,
+        }
+    }
+
+    /// Records the outcome of the first connect of `server` at `now`.
+    fn record(&self, server: &str, now: Instant, connected: bool) {
+        let mut failed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if connected {
+            failed.remove(server);
+        } else {
+            failed.insert(server.to_owned(), now);
+        }
+    }
+}
+
 /// Connects every server of `servers` at once, each retrying on `clock` until `interrupt`
 /// fires, then registers the tools of each that connected into `registry` in their order. The
 /// warnings name each server that failed and each tool skipped.
@@ -227,10 +266,26 @@ pub fn connect(
     clock: &Arc<dyn Clock>,
     interrupt: &Interrupt,
 ) -> (Sessions, Vec<String>) {
+    connect_remembering(servers, registry, clock, interrupt, &FailedConnects::new())
+}
+
+/// [`connect`], with a server that `failed` lists as failed lately tried once without retries;
+/// every outcome updates `failed`.
+pub fn connect_remembering(
+    servers: &[Server],
+    registry: &mut Registry,
+    clock: &Arc<dyn Clock>,
+    interrupt: &Interrupt,
+    failed: &FailedConnects,
+) -> (Sessions, Vec<String>) {
+    let now = clock.now();
     let opened: Vec<Result<(Link, Vec<Value>), String>> = thread::scope(|scope| {
         let handles: Vec<_> = servers
             .iter()
-            .map(|server| scope.spawn(|| Link::start(server, Arc::clone(clock), interrupt)))
+            .map(|server| {
+                let retries = failed.retries(&server.name, now);
+                scope.spawn(move || Link::start(server, Arc::clone(clock), interrupt, retries))
+            })
             .collect();
         handles
             .into_iter()
@@ -245,6 +300,9 @@ pub fn connect(
     let mut warnings = Vec::new();
     let mut owners: HashMap<String, String> = HashMap::new();
     for (server, opened) in servers.iter().zip(opened) {
+        if !interrupt.is_interrupted() {
+            failed.record(&server.name, clock.now(), opened.is_ok());
+        }
         match opened {
             Ok((link, listed)) => {
                 let link = Arc::new(link);

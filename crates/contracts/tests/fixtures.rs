@@ -141,6 +141,7 @@ fn c2_fixtures_match_the_types() {
     roundtrip::<c::HiveListInput>("c2/valid/HiveListInput.filters.json");
     roundtrip::<c::HiveListInput>("c2/valid/HiveListInput.state.json");
     roundtrip::<c::HiveListOutput>("c2/valid/HiveListOutput.two.json");
+    roundtrip::<c::HiveResolveInput>("c2/valid/HiveResolveInput.rework.json");
     roundtrip::<c::HiveSteerInput>("c2/valid/HiveSteerInput.note.json");
     roundtrip::<c::InboxAckInput>("c2/valid/InboxAckInput.success.json");
     refused::<c::HiveCreateInput>("c2/invalid/HiveCreateInput.extra_deliver.json");
@@ -221,11 +222,13 @@ fn c6_fixtures_match_the_types() {
     roundtrip::<c::RawSkipped>("c6/valid/RawSkipped.without_ts.json");
     roundtrip::<c::RouteAlias>("c6/valid/RouteAlias.chat.json");
     roundtrip::<c::RouteSet>("c6/valid/RouteSet.alias.json");
+    roundtrip::<c::RouteSet>("c6/valid/RouteSet.global.json");
     roundtrip::<c::SessionKey>("c6/valid/SessionKey.owner.json");
     roundtrip::<c::SessionStatus>("c6/valid/SessionStatus.fresh.json");
     roundtrip::<c::SessionStatus>("c6/valid/SessionStatus.quota_exhausted.json");
     roundtrip::<c::SessionStatus>("c6/valid/SessionStatus.running_with_turn.json");
     roundtrip::<c::SetRouteRequest>("c6/valid/SetRouteRequest.alias.json");
+    roundtrip::<c::SetRouteRequest>("c6/valid/SetRouteRequest.global.json");
     roundtrip::<c::StatusRequest>("c6/valid/StatusRequest.session.json");
     roundtrip::<c::StatusRequest>("c6/valid/StatusRequest.turn.json");
     roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.context.json");
@@ -336,6 +339,7 @@ fn c7_fixtures_match_the_types() {
 #[test]
 fn c8_fixtures_match_the_types() {
     use ulei_contracts::generated::c8 as c;
+    roundtrip::<c::DefaultRoute>("c8/valid/DefaultRoute.deep.json");
     roundtrip::<c::InboxDelivery>("c8/valid/InboxDelivery.accepted.json");
     roundtrip::<c::InboxDelivery>("c8/valid/InboxDelivery.silent.json");
     roundtrip::<c::Mark>("c8/valid/Mark.lifted.json");
@@ -352,6 +356,7 @@ fn c8_fixtures_match_the_types() {
     roundtrip::<c::Session>("c8/valid/Session.system_prompt.json");
     roundtrip::<c::Step>("c8/valid/Step.routed.json");
     roundtrip::<c::Step>("c8/valid/Step.unrouted.json");
+    refused::<c::DefaultRoute>("c8/invalid/DefaultRoute.extra_field.json");
     refused::<c::Message>("c8/invalid/Message.extra_field.json");
 }
 

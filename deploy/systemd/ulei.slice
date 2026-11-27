@@ -1,0 +1,8 @@
+# ulei interactive slice (user unit, ADR-0042 section 11): the units on the path of an owner turn,
+# ulei-engine, ulei-inbox, ulei-tg, ulei-memory, ulei-hive-mcp and ulei-garden. It sets no IO, CPU or
+# memory limit: each unit keeps its own MemoryMax and TasksMax, and a deployment that caps the IO of
+# its background work in another slice keeps the owner's turn out of that budget. A hive_create of
+# the engine's hive tools waited about 100 s for its SQLite writes in a slice capped at 80 read and
+# 60 write IOPS.
+[Unit]
+Description=ulei units on the path of an owner turn

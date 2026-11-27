@@ -139,6 +139,9 @@ fn create_list_show_steer_cancel_on_the_real_hive_without_a_dispatcher() {
     assert_eq!(inspected["state"], "created");
     assert_eq!(inspected["snapshot"]["card_id"], id.as_str());
     assert_eq!(inspected["snapshot"]["queue"]["column"], "waiting");
+    // accept_review is the judge's acceptance only: no reviewer unless `review: true`.
+    assert_eq!(inspected["snapshot"]["card"]["acceptance_kind"], "judge");
+    assert_eq!(inspected["snapshot"]["card"]["review"], 0, "{inspected}");
     assert!(inspected.get("waiting_on").is_none(), "{inspected}");
     let health = ok("hive_health", json!({}));
     assert_eq!(health["ticking"], false, "no dispatcher runs");
@@ -371,4 +374,147 @@ fn reminders_and_series_on_the_real_hive() {
         zone["content"][0]["text"],
         "card rejected: invalid cron expression or time zone"
     );
+}
+
+/// Puts card `id` of the scratch store into the wait a head's `RESULT: disputed` leaves: state
+/// `blocked`, wait `disputed`, round 1 (the store is the hive's SQLite file; no dispatcher runs).
+fn dispute(dir: &Path, id: &str) {
+    let out = Command::new(python())
+        .args([
+            "-c",
+            "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE cards SET state='blocked', wait_reason='disputed', block_reason='disputed by the worker: synthetic', round=1, version=version+1 WHERE id=?\", (sys.argv[2],)); c.commit(); print(c.total_changes)",
+            &dir.join("srv/data/hive.db").display().to_string(),
+            id,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1", "{out:?}");
+}
+
+#[test]
+fn resolve_decides_only_a_disputed_card_of_its_author_on_the_real_hive() {
+    let dir = Scratch::new();
+    let command = format!(
+        "{} {}",
+        python().display(),
+        repo().join("hive-py/scripts/hive.py").display()
+    );
+    let hive = hive_config(&dir.0);
+    let server = Running::start(&write_config(
+        &dir.0,
+        &command,
+        &hive,
+        "timeout = 60\n",
+        0o600,
+    ));
+    let session = server.session();
+    let call = |name: &str, args: Value| server.call(&session, name, &args);
+    let show = |id: &str| -> Value {
+        let out = Command::new(python())
+            .arg(repo().join("hive-py/scripts/hive.py"))
+            .args(["show", "--json", id])
+            .env("HIVE_CONFIG", &hive)
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let create = |title: &str| -> String {
+        let card = call(
+            "hive_create",
+            json!({"title": title, "goal": "Write a synthetic summary.", "accept_review": "The report names the notes.",
+                "step": 2, "source": "msg:1003"}),
+        );
+        assert_eq!(card["isError"], false, "{card}");
+        card["structuredContent"]["card_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    // A card that is not disputed is refused with the hive's own text, and stays as it was.
+    let id = create("Synthetic disputed card");
+    let early = call(
+        "hive_resolve",
+        json!({"card_id": id, "action": "accept", "text": "ok"}),
+    );
+    assert_eq!(early["isError"], true, "{early}");
+    let said = early["content"][0]["text"].as_str().unwrap();
+    assert!(
+        said.starts_with(&format!("resolve rejected: card {id} is not disputed")),
+        "{said}"
+    );
+    assert_eq!(show(&id)["state"], "created");
+
+    // rework: back to the queue, the text is the next round's instructions; an option-like text
+    // stays the text.
+    dispute(&dir.0, &id);
+    let reworked = call(
+        "hive_resolve",
+        json!({"card_id": id, "action": "rework", "text": "--by=owner Work in the synthetic notes."}),
+    );
+    assert_eq!(reworked["isError"], false, "{reworked}");
+    assert_eq!(
+        reworked["structuredContent"],
+        json!({"ok": true, "message": format!("{id} dispute resolved: rework, now queued")})
+    );
+    let card = show(&id);
+    assert_eq!(card["state"], "queued");
+    assert!(
+        card["feedback"]
+            .as_str()
+            .unwrap()
+            .ends_with("Follow these instructions:\n--by=owner Work in the synthetic notes."),
+        "{card}"
+    );
+    let resolved = card["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "dispute_resolved")
+        .unwrap();
+    assert_eq!(resolved["data"]["by"], "secretary");
+    assert_eq!(resolved["data"]["decision"], "rework");
+
+    // accept: done with the reason.
+    dispute(&dir.0, &id);
+    let accepted = call(
+        "hive_resolve",
+        json!({"card_id": id, "action": "accept", "text": "The head is right."}),
+    );
+    assert_eq!(accepted["isError"], false, "{accepted}");
+    assert_eq!(
+        accepted["structuredContent"]["message"],
+        format!("{id} dispute resolved: accept, now done")
+    );
+    let card = show(&id);
+    assert_eq!(card["state"], "done");
+    assert_eq!(
+        card["result"],
+        "dispute resolved by secretary: accepted: The head is right."
+    );
+
+    // The server's actor decides only its own cards: another actor is refused by the hive.
+    let other = create("Synthetic disputed card of the secretary");
+    dispute(&dir.0, &other);
+    drop(server);
+    let stranger = Running::start(&write_config(
+        &dir.0,
+        &command,
+        &hive,
+        "timeout = 60\nactor = \"synthetic-bot\"\n",
+        0o600,
+    ));
+    let session = stranger.session();
+    let refused = stranger.call(
+        &session,
+        "hive_resolve",
+        &json!({"card_id": other, "action": "accept", "text": "ok"}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    let said = refused["content"][0]["text"].as_str().unwrap();
+    assert!(
+        said.starts_with("resolve rejected: a dispute is decided by the card's author secretary"),
+        "{said}"
+    );
+    assert_eq!(show(&other)["wait_reason"], "disputed");
 }

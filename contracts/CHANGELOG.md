@@ -32,6 +32,19 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `source`, `owner_visible` and `priority` from the product shape are not fields yet (adding
   them would break the Python consumers, which reject unknown fields): planned for C1 2.0.0 in S1.
 
+## C2 0.5.1
+- Descriptions of `HiveCreateInput` only (no keyword changes): `accept_review` is the judge's
+  acceptance and no longer implies `review`; `review` is off by default and only `review: true`
+  turns it on, with the author's three cases for it (code cards, complex research, the author's
+  own choice). The hive CLI `create --accept-review` no longer sets `--review` (owner, 26.11.2026).
+
+## C2 0.5.0
+- New tool `hive_resolve` (additive, ADR-0095): `HiveResolveInput` (`card_id`, `action` one of
+  `accept` and `rework`, a required `text` of 1 to 4000 characters) answered by `Ack`. The
+  author's decision on a disputed card (`blocked`, wait `disputed`): `accept` finishes it done,
+  `rework` queues a new round with `text` as its instructions; it runs `hive.py resolve` with the
+  server's actor as `--by`, never an input.
+
 ## C2 0.4.0
 - Read-only snapshot tools of the hive (additive, ADR-0086): `hive_inspect` (`CardRef` →
   `HiveInspectOutput`: state, round, title, result and report lines, `waiting_on`, one line on
@@ -152,6 +165,15 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C5 0.1.0
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
+
+## C6 0.12.0
+- A global `set_route` (additive, ADR-0094): `SetRouteRequest` gains optional `global`. With it
+  the runtime stores the alias with the session as before and also as its default route, which
+  every session that stores no route runs on, a new session of the key included, and which
+  survives a restart; an alias equal to the configured default clears the stored default. The
+  runtime answers `bad_request` for a global alias its model gateway does not list. `RouteSet`
+  gains optional `global`, which the engine always sends. `SetRouteRequest` and `RouteSet` are
+  closed, so `ulei-tg` and `ulei-engine` deploy together for C6 0.12.0.
 
 ## C6 0.11.0
 - Reactions of the agent (additive, ADR-0088): `SubmitTurnRequest` gains optional `message_id`,
@@ -382,6 +404,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 
 ## C7 0.1.0
 - Draft garden search and proposals.
+
+## C8 0.9.0
+- `DefaultRoute` (additive, ADR-0094): at most one per journal, the route alias a global C6
+  `set_route` made the engine's default; a session that stores no route runs on it instead of
+  the configured `engine.default_route`. A 0.8.0 journal migrates without one.
 
 ## C8 0.8.0
 - `Mark` (additive; ADR-0051 section 5): a forget mark on one message, with `id`, the message

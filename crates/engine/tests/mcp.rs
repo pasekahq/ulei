@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -104,6 +104,48 @@ impl Clock for FakeClock {
     fn jitter(&self) -> f64 {
         self.jitters.lock().unwrap().pop_front().unwrap_or(0.5)
     }
+}
+
+/// Bounds every wait on a fake or a [`Stretched`] clock, so a broken test fails instead of
+/// hanging.
+const HANG: Duration = Duration::from_secs(60);
+
+/// The system clock with every wait lasting [`HANG`] unless interrupted; it tells `waiting` as
+/// each wait starts.
+struct Stretched {
+    waiting: Mutex<mpsc::Sender<()>>,
+}
+
+impl Clock for Stretched {
+    fn now(&self) -> Instant {
+        SystemClock.now()
+    }
+
+    fn wait(&self, _: Duration, interrupt: &Interrupt) -> bool {
+        self.waiting.lock().unwrap().send(()).unwrap();
+        SystemClock.wait(HANG, interrupt)
+    }
+
+    fn jitter(&self) -> f64 {
+        SystemClock.jitter()
+    }
+}
+
+/// A [`Stretched`] clock and the receiver of its wait starts.
+fn stretched() -> (Arc<dyn Clock>, mpsc::Receiver<()>) {
+    let (waiting, waits) = mpsc::channel();
+    let clock = Arc::new(Stretched {
+        waiting: Mutex::new(waiting),
+    });
+    (clock as Arc<dyn Clock>, waits)
+}
+
+/// Interrupts `interrupt` once `waits` tells of a wait; when it did.
+fn interrupt_the_wait(waits: &mpsc::Receiver<()>, interrupt: &Interrupt) -> Instant {
+    waits.recv_timeout(HANG).unwrap();
+    let at = Instant::now();
+    interrupt.interrupt();
+    at
 }
 
 fn dynamic(clock: &Arc<FakeClock>) -> Arc<dyn Clock> {
@@ -540,17 +582,25 @@ fn a_hanging_call_ends_at_the_configured_tool_timeout_with_the_reference_text() 
     ));
     let start = Instant::now();
     let out = run(&registry, "mcp__fake__stuck", json!({}));
+    // Without its configured timeout the call would wait 300 s; the rest is room for a loaded
+    // host.
     assert!(
-        start.elapsed() < Duration::from_secs(3),
+        start.elapsed() < Duration::from_secs(30),
         "{:?}",
         start.elapsed()
     );
     assert!(out.is_error);
     let body = unframed("mcp__fake__stuck", &out.content);
+    let after = body
+        .strip_prefix(r#"{"error": "MCP call failed: TimeoutError: MCP call timed out after "#)
+        .and_then(|rest| rest.strip_suffix(r#"s (configured timeout: 0.3s)"}"#))
+        .unwrap_or_else(|| panic!("{body}"));
+    let waited: f64 = after.parse().unwrap_or_else(|_| panic!("{body}"));
     assert!(
-        body.starts_with(
-            r#"{"error": "MCP call failed: TimeoutError: MCP call timed out after 0."#
-        ) && body.ends_with(r#"s (configured timeout: 0.3s)"}"#),
+        after
+            .split_once('.')
+            .is_some_and(|(_, tenths)| tenths.len() == 1)
+            && waited >= 0.3,
         "{body}"
     );
 }
@@ -564,7 +614,7 @@ fn an_interrupt_ends_a_running_call_with_the_reference_text() {
     let interrupt = Interrupt::new();
     let out = thread::scope(|scope| {
         scope.spawn(|| {
-            assert!(fake.wait_for("tools/call"));
+            assert!(fake.wait_for("tools/call", 1));
             interrupt.interrupt();
         });
         registry.execute(
@@ -696,11 +746,7 @@ impl Policy for DenyTool {
 /// One turn on `gateway` with the tools of `registry` and the policies of `chain`; the tool
 /// results the model got back.
 fn turn(gateway: &FakeGateway, registry: &Registry, chain: &mut Chain) -> Vec<(bool, String)> {
-    let client = Client::new(
-        gateway.socket(),
-        Duration::from_secs(2),
-        Duration::from_secs(2),
-    );
+    let client = Client::new(gateway.socket(), HANG, HANG);
     let template = Template {
         route: "chat".into(),
         system: None,
@@ -910,27 +956,82 @@ fn the_first_connect_retries_three_times_with_jittered_backoff_within_its_timeou
 }
 
 #[test]
+fn a_server_whose_first_connect_failed_lately_gets_one_attempt_in_the_next_runs() {
+    let dir = Scratch::new();
+    let fake = FakeMcp::start(Spec::new(vec![echo_tool()]));
+    fake.set_down(usize::MAX);
+    let config = servers(&dir, &tools_only(&fake.url(), ""));
+    let clock = FakeClock::new(&[]);
+    let failed = mcp::FailedConnects::new();
+    let run = |failed: &mcp::FailedConnects| {
+        let mut registry = Registry::new();
+        let (_s, warnings) = mcp::connect_remembering(
+            &config,
+            &mut registry,
+            &dynamic(&clock),
+            &Interrupt::new(),
+            failed,
+        );
+        (names(&registry), warnings)
+    };
+
+    // The first run of a down server pays its retries with backoff.
+    let (_, warnings) = run(&failed);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(count(&fake, "initialize"), 4);
+    assert!(
+        close_to(&clock.waits(), &[1.0, 2.0, 4.0]),
+        "{:?}",
+        clock.waits()
+    );
+
+    // The next run within the memory tries once and does not wait.
+    let (_, warnings) = run(&failed);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(count(&fake, "initialize"), 5);
+    assert_eq!(clock.waits().len(), 3, "{:?}", clock.waits());
+
+    // Its single attempt still connects a server that came back, and forgets the failure.
+    fake.set_down(0);
+    let (tools, warnings) = run(&failed);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(tools, ["mcp__fake__echo"]);
+
+    // Down again: the failure was forgotten, so the full retries come back.
+    fake.set_down(usize::MAX);
+    let before = count(&fake, "initialize");
+    let (_, warnings) = run(&failed);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(count(&fake, "initialize"), before + 4);
+
+    // Past the memory a failed server gets its full retries again.
+    clock.advance(mcp::FAILED_CONNECT_MEMORY.as_secs());
+    let before = count(&fake, "initialize");
+    let _ = run(&failed);
+    assert_eq!(count(&fake, "initialize"), before + 4);
+}
+
+#[test]
 fn an_interrupt_during_a_first_connect_backoff_ends_the_connect_at_once() {
     let dir = Scratch::new();
     let fake = FakeMcp::start(Spec::new(vec![echo_tool()]));
     fake.set_down(usize::MAX);
     let config = servers(&dir, &tools_only(&fake.url(), ""));
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let (clock, waits) = stretched();
     let interrupt = Interrupt::new();
     let mut registry = Registry::new();
-    let start = Instant::now();
-    let (_s, warnings) = thread::scope(|scope| {
-        scope.spawn(|| {
-            thread::sleep(Duration::from_millis(300));
-            interrupt.interrupt();
-        });
-        mcp::connect(&config, &mut registry, &clock, &interrupt)
+    let ((_s, warnings), interrupted) = thread::scope(|scope| {
+        let fired = {
+            let interrupt = &interrupt;
+            scope.spawn(move || interrupt_the_wait(&waits, interrupt))
+        };
+        let connected = mcp::connect(&config, &mut registry, &clock, &interrupt);
+        (connected, fired.join().unwrap())
     });
-    // The first backoff is at least 0.8 s and the whole ladder about 7 s.
     assert!(
-        start.elapsed() < Duration::from_millis(750),
+        interrupted.elapsed() < HANG / 2,
         "{:?}",
-        start.elapsed()
+        interrupted.elapsed()
     );
     assert_eq!(count(&fake, "initialize"), 1);
     assert_eq!(
@@ -1019,29 +1120,30 @@ fn an_interrupt_during_a_reconnect_backoff_ends_the_call_at_once() {
     let dir = Scratch::new();
     let fake = FakeMcp::start(Spec::new(vec![echo_tool()]).reply("echo", text_result("hi")));
     let config = servers(&dir, &tools_only(&fake.url(), ""));
-    let (registry, _s, _) = connect_on(&config, &(Arc::new(SystemClock) as Arc<dyn Clock>));
+    let (clock, waits) = stretched();
+    let (registry, _s, _) = connect_on(&config, &clock);
     assert!(!run(&registry, "mcp__fake__echo", json!({})).is_error);
     fake.set_down(usize::MAX);
     let interrupt = Interrupt::new();
-    let start = Instant::now();
-    let out = thread::scope(|scope| {
-        scope.spawn(|| {
-            thread::sleep(Duration::from_millis(300));
-            interrupt.interrupt();
-        });
-        registry.execute(
+    let (out, interrupted) = thread::scope(|scope| {
+        let fired = {
+            let interrupt = &interrupt;
+            scope.spawn(move || interrupt_the_wait(&waits, interrupt))
+        };
+        let out = registry.execute(
             "mcp__fake__echo",
             &Map::new(),
             Context {
                 cwd: Path::new("."),
                 interrupt: &interrupt,
             },
-        )
+        );
+        (out, fired.join().unwrap())
     });
     assert!(
-        start.elapsed() < Duration::from_millis(750),
+        interrupted.elapsed() < HANG / 2,
         "{:?}",
-        start.elapsed()
+        interrupted.elapsed()
     );
     assert_eq!(
         error_of("mcp__fake__echo", &out),
@@ -1117,7 +1219,9 @@ fn a_call_whose_request_write_fails_leaves_no_socket_with_the_interrupt() {
     });
     let (registry, _s, _) = connect(&servers(
         &dir,
-        &tools_only(&fake.url(), "timeout = \"2.5\""),
+        // The deadline covers building and serializing the 16 MiB request, which a loaded host
+        // may stretch to seconds; the write must start before it passes.
+        &tools_only(&fake.url(), "timeout = 20"),
     ));
     let Value::Object(input) = json!({"text": "x".repeat(16 * 1024 * 1024)}) else {
         unreachable!()

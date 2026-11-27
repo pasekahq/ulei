@@ -176,18 +176,20 @@ impl Ingress {
         if let Some((_, chat_id)) = self.wake.filter(|(at, _)| *at <= now) {
             self.wake = None;
             // Reactions an owner turn already showed do not wake the agent again.
-            if let Some(context) =
-                context_block(&self.config.reactions.context_header, &self.unseen)
+            if let Some(block) = context_block(&self.config.reactions.context_header, &self.unseen)
             {
                 self.unseen.clear();
+                // The block is the wake-up turn's prompt, not its ephemeral context: the engine
+                // journals it, so later turns and `session_search` still see which message got
+                // which emoji (ADR-0088), as the reference's reaction log keeps it.
                 out.push(Output::Turn(Turn {
                     chat_id,
                     message_id: None,
                     update_id: 0,
                     date: 0,
                     kind: MessageKind::Text,
-                    text: self.config.reactions.wake_text.clone(),
-                    context: Some(context),
+                    text: format!("{}\n\n{block}", self.config.reactions.wake_text),
+                    context: None,
                     attachments: Vec::new(),
                     transcripts: Vec::new(),
                     reply: None,

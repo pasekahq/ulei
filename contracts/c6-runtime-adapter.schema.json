@@ -369,7 +369,7 @@
         },
         "route": {
           "$ref": "#/$defs/RouteAlias",
-          "description": "The route alias the session's next turn runs on: the one `set_route` stored, else the runtime's default."
+          "description": "The route alias the session's next turn runs on: the one `set_route` stored, else the runtime's default (the one a global `set_route` stored, else the configured one)."
         },
         "last_turn": {
           "$ref": "#/$defs/TurnReport",
@@ -775,7 +775,7 @@
     },
     "SetRouteRequest": {
       "type": "object",
-      "description": "Run the session's later turns on a route alias. Stored with the session (C8 `Session.route`) until a new session of the key.",
+      "description": "Run the session's later turns on a route alias. Stored with the session (C8 `Session.route`) until a new session of the key; with `global` also stored as the runtime's default route (C8 `DefaultRoute`), on which every session that stores no route runs, across new sessions and restarts (ADR-0094).",
       "properties": {
         "session": {
           "$ref": "#/$defs/SessionKey",
@@ -784,6 +784,10 @@
         "route": {
           "$ref": "#/$defs/RouteAlias",
           "description": "The alias."
+        },
+        "global": {
+          "type": "boolean",
+          "description": "Also make the alias the runtime's default route, kept until the next global `set_route`. An alias equal to the configured default clears the stored default. The runtime refuses with `bad_request` an alias its model gateway does not list. Absent means false."
         }
       },
       "required": [
@@ -794,7 +798,7 @@
     },
     "RouteSet": {
       "type": "object",
-      "description": "Result of `set_route`: the alias in force for the session's next turn.",
+      "description": "Result of `set_route`: the alias in force for the session's next turn, and whether it is now the runtime's default route.",
       "properties": {
         "session": {
           "$ref": "#/$defs/SessionKey",
@@ -803,6 +807,10 @@
         "route": {
           "$ref": "#/$defs/RouteAlias",
           "description": "The stored alias."
+        },
+        "global": {
+          "type": "boolean",
+          "description": "The alias is now the runtime's default route. The engine always sends it."
         }
       },
       "required": [

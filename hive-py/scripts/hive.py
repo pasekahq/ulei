@@ -142,6 +142,17 @@ def print_inspect(s, tz):
         for wr in h['workflow_runs']:
             print(f"    workflow run {wr['run']} {wr['repo'] or ''} {wr.get('name') or ''} {wr.get('status') or ''} "
                   f"{wr.get('conclusion') or ''}{wr.get('error') or ''}")
+        if h.get('log'):
+            print(f"    log {h['log']['size']} bytes, last write {ts(h['log']['updated_at'], tz)}; last actions:")
+        for a in h.get('actions') or []:
+            print(f"      {ts(a['at'], tz) if a['at'] else '?'} {a['kind']}: {a['text'][:200]}")
+    for r in s['heads'].get('repos') or []:
+        lc = r['last_commit']
+        pr = r['pull_request']
+        print(f"  repo {r['path']} {r['repo'] or ''} branch {r['branch']}{' (dirty)' if r['dirty'] else ''}"
+              f"{' ahead ' + str(r['ahead']) if r['ahead'] else ''}: {lc['sha'][:9]} {ts(lc['at'], tz)} {lc['subject'][:120]}")
+        if pr:
+            print(f"    PR #{pr['number']} {pr['state']} {pr['url']}" if 'error' not in pr else f"    PR: {pr['error'][:160]}")
     for r in s['rounds']:
         v = r['verdict']
         print(f"  round {r['round']}: {v['result'] + ' by ' + v['by'] + ' (' + str(v['detail']) + ')' if v else 'no verdict'}")
@@ -192,14 +203,14 @@ def main(argv=None):
     c.add_argument('--goal', required=True)
     acceptance = c.add_mutually_exclusive_group()
     acceptance.add_argument('--acceptance', help='bash command; exit 0 = accepted')
-    acceptance.add_argument('--accept-review', help='review criteria; REPORT.md must be non-empty')
+    acceptance.add_argument('--accept-review', help='criteria the judge checks the report against (gate: REPORT.md non-empty); adds no reviewer, see --review')
     c.add_argument('--step', type=int, required=True, choices=range(1, 6))
     c.add_argument('--kind', choices=api.CLASSES, dest='card_class')
     c.add_argument('--owner-visible', action=argparse.BooleanOptionalAction, default=None)
     c.add_argument('--followup-of')
     c.add_argument('--source', required=True)
     c.add_argument('--created-by', required=True)
-    c.add_argument('--review', action='store_true', help='independent review by the other vendor (off by default)')
+    c.add_argument('--review', action='store_true', help='independent review by the other vendor; off by default, only this flag turns it on (--accept-review does not)')
     c.add_argument('--deny-tools', type=parse_deny_tools, default=(),
                    help='comma-separated tool denials: browser,network,write')
     c.add_argument('--body', default='')
@@ -377,7 +388,7 @@ def main(argv=None):
             cid, created = api.create(conn, title=a.title, goal=a.goal,
                                       acceptance='test -s REPORT.md' if judge else a.acceptance, step=a.step,
                                       source=a.source, created_by=a.created_by, card_class=a.card_class,
-                                      owner_visible=a.owner_visible, followup_of=a.followup_of, review=a.review or judge, body=body,
+                                      owner_visible=a.owner_visible, followup_of=a.followup_of, review=a.review, body=body,
                                       task_type=a.task_type, idem_key=a.idem_key, priority=a.priority,
                                       not_before=time.time() + 10 * 365 * 86400 if a.hold else a.not_before,
                                       acceptance_kind='judge' if judge else 'command',

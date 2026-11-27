@@ -806,10 +806,10 @@ fn a_reaction_to_a_sent_reply_shows_its_text_to_the_agent() {
     out.finish().expect("finished");
     fake.queue_updates(&[reaction_to(77)]);
     let turn = first_turn(&fake, &config, texts);
-    let context = turn.context.expect("reaction context");
     assert!(
-        context.contains("👍 на моё сообщение #77 «Report ready»"),
-        "{context}"
+        turn.text.contains("👍 на моё сообщение #77 «Report ready»"),
+        "{}",
+        turn.text
     );
 }
 
@@ -822,9 +822,12 @@ fn configured_reaction_wording_reaches_the_wake_turn() {
     let config = write_config(&dir, &fake, 0o600, true, extra);
     fake.queue_updates(&[reaction_to(10)]);
     let turn = first_turn(&fake, &config, SentTexts::new());
-    assert_eq!(turn.text, "[reaction event]");
-    let context = turn.context.expect("reaction context");
-    assert!(context.starts_with("Reactions:\n"), "{context}");
+    assert!(
+        turn.text.starts_with("[reaction event]\n\nReactions:\n"),
+        "{}",
+        turn.text
+    );
+    assert_eq!(turn.context, None);
 }
 
 #[test]

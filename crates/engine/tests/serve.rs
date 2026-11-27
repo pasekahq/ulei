@@ -439,15 +439,16 @@ fn an_interrupt_during_the_first_mcp_connect_ends_the_turn_at_once() {
     let engine = start(&dir.0, &path);
     let s = &engine.socket;
     let turn = prompt(s, "chat", "first");
-    assert!(mcp.wait_for("initialize"));
+    assert!(mcp.wait_for("initialize", 1));
 
     let started = Instant::now();
     assert!(interrupt(s, "chat").interrupted);
     let report = ended(s, "chat", &turn);
     assert_eq!(report.outcome, Some(TurnOutcome::Interrupted));
-    // The three backoffs of the first connect wait at least 5.6 s together.
+    // The three backoffs of the first connect wait at least 5.6 s together; the rest of the
+    // margin is room for a loaded host.
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(5),
         "{:?}",
         started.elapsed()
     );
@@ -916,8 +917,8 @@ fn a_journal_locked_past_the_request_deadline_answers_500_within_it() {
     let (raw, elapsed) = serve_pair(&server, &request("status", body.as_bytes()));
     let response = parse(&raw);
     assert_eq!(response.status, 500, "{}", response.head);
-    // The journal's own lock wait is 10 s.
-    assert!(elapsed < deadline * 2, "{elapsed:?}");
+    // The journal's own lock wait is 10 s; the rest of the margin is room for a loaded host.
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     lock.execute_batch("ROLLBACK").unwrap();
     let (raw, _) = serve_pair(&server, &request("status", body.as_bytes()));
     assert_eq!(parse(&raw).status, 200);
@@ -1531,6 +1532,7 @@ fn a_stored_route_reaches_the_queued_and_later_turns_and_the_running_turn_keeps_
         RouteSet {
             session: "chat".to_owned(),
             route: "deep".to_owned(),
+            global: Some(false),
         }
     );
     assert_eq!(status(s, "chat", None).route, "deep");
@@ -1573,6 +1575,57 @@ fn a_stored_route_survives_a_restart_and_a_new_session_starts_on_the_default() {
 }
 
 #[test]
+fn a_global_route_is_the_default_of_new_sessions_and_other_keys_across_a_restart() {
+    let listed = serde_json::from_value(json!({
+        "routes": [{"alias": "main", "state": "ready"}, {"alias": "deep", "state": "ready"}]
+    }))
+    .unwrap();
+    let fake = FakeGateway::with_routes(
+        vec![text_step("one"), text_step("two"), text_step("three")],
+        listed,
+    );
+    let dir = Scratch::new();
+    let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
+    let journal = || Journal::open(&dir.path("journal.sqlite3")).unwrap();
+    let engine = start(&dir.0, &config);
+    let s = &engine.socket;
+    let global = |route: &str| json!({"session": "chat", "route": route, "global": true});
+
+    let refused = c6_wire::post(s, "set_route", &global("nowhere"));
+    let error: WireError = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!((refused.status, error.code), (400, ErrorCode::BadRequest));
+    assert_eq!(status(s, "chat", None).route, "main");
+    assert_eq!(journal().default_route(READ_TIMEOUT).unwrap(), None);
+
+    let set: RouteSet =
+        serde_json::from_slice(c6_wire::ok(&c6_wire::post(s, "set_route", &global("deep"))))
+            .unwrap();
+    assert_eq!(set.global, Some(true));
+    assert_eq!(status(s, "chat", None).route, "deep");
+    assert_eq!(status(s, "other", None).route, "deep");
+    drop(engine);
+
+    let engine = start(&dir.0, &config);
+    let s = &engine.socket;
+    assert_eq!(status(s, "other", None).route, "deep");
+    let fresh = submit(
+        s,
+        &json!({"session": "chat", "prompt": "fresh", "new": true}),
+    );
+    ended(s, "chat", &fresh.turn.unwrap());
+    let other = prompt(s, "other", "hi");
+    ended(s, "other", &other);
+    assert_eq!(journal().route("chat", READ_TIMEOUT).unwrap(), None);
+    assert_eq!(status(s, "chat", None).route, "deep");
+
+    c6_wire::ok(&c6_wire::post(s, "set_route", &global("main")));
+    assert_eq!(journal().default_route(READ_TIMEOUT).unwrap(), None);
+    let back = prompt(s, "other", "back");
+    ended(s, "other", &back);
+    assert_eq!(routes(&fake), ["deep", "deep", "main"]);
+}
+
+#[test]
 fn an_alias_the_gateway_refuses_fails_the_turn_and_stays_stored() {
     let mut unknown = gateway_error(ErrorClass::BadRequest);
     unknown.message = Some("unknown route alias".to_owned());
@@ -1609,10 +1662,13 @@ fn an_unanswered_qb_cancel_holds_an_interrupted_turn_at_most_the_cancel_timeout(
         Some(TurnOutcome::Interrupted)
     );
     let elapsed = started.elapsed();
-    assert!(
-        elapsed >= CANCEL_TIMEOUT && elapsed < CANCEL_TIMEOUT + Duration::from_secs(1),
-        "{elapsed:?}"
-    );
+    assert!(elapsed >= CANCEL_TIMEOUT, "{elapsed:?}");
+    let held = fake
+        .wait_cancel_hold()
+        .expect("the engine closed the unanswered cancel");
+    // Without the cancel timeout the engine would wait out its 600 s idle timeout on qb; the
+    // margin past the cancel timeout is room for a loaded host.
+    assert!(held < CANCEL_TIMEOUT * 2, "{held:?}");
 }
 
 /// The first turn finishes its handle and then waits for a release, as a turn does between
@@ -2563,7 +2619,9 @@ fn a_turn_ends_and_its_held_events_are_answered_while_an_inject_waits_for_the_jo
         release: Mutex::new(on_release),
         runs: Mutex::new(0),
     });
-    let deadline = Duration::from_millis(1500);
+    // The page is read on another thread while the inject waits out this deadline; a loaded
+    // host needs the room.
+    let deadline = Duration::from_secs(5);
     let server = server_with(&dir, runner, own_uid(), deadline);
     let call = |method: &str, body: Value| {
         let (raw, _) = serve_pair(&server, &request(method, body.to_string().as_bytes()));
