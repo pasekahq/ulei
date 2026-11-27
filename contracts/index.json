@@ -2,7 +2,7 @@
   "C1": {
     "file": "c1-event.schema.json",
     "kind": "json-schema",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "status": "stable",
     "title": "Event (owner inbox)",
     "source": "secretary-agent brain/event_inbox/inbox.py + Hermes patch 0014 (packet version 1)"

@@ -21,10 +21,12 @@ def canonical(value):
 
 
 class FakeInbox:
-    """Keeps every stored packet in `packets` by event id; `get` returns the stored row."""
+    """Keeps every stored packet in `packets` by event id; `get` returns the stored row. `kinds` are the packet kinds it
+    accepts, the library's by default."""
 
-    def __init__(self, key=None):
+    def __init__(self, key=None, kinds=KINDS):
         self._key = secrets.token_bytes(32) if key is None else key
+        self.kinds = frozenset(kinds)
         if len(self._key) != 32:
             raise ValueError('invalid producer key')
         self.packets = {}
@@ -45,7 +47,7 @@ class FakeInbox:
         body = {k: v for k, v in packet.items() if k != 'mac'}
         if not isinstance(packet['mac'], str) or not hmac.compare_digest(packet['mac'], self._mac(body)):
             raise ValueError('unauthenticated packet')
-        if (packet['version'] != 1 or packet['kind'] not in KINDS
+        if (packet['version'] != 1 or packet['kind'] not in self.kinds
                 or packet['trust'] != 'untrusted-source-data'
                 or not isinstance(packet['id'], str) or not ID.fullmatch(packet['id'])
                 or not isinstance(packet['payload'], str) or not packet['payload'].strip()

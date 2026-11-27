@@ -30,6 +30,10 @@ WAIT_TAG = 'tag'
 # rework; the card waits for its author's decision (Dispatcher.resolve).
 WAIT_DISPUTED = 'disputed'
 RESOLUTIONS = ('accept', 'rework')
+# A reminder card fell due and waits for the secretary or the direct fallback (hive/reminder.py, ADR-0100).
+WAIT_REMINDER = 'reminder'
+# ulei-tg notify's limit of one notice.
+REMINDER_MAX_BYTES = 32 * 1024
 WAITS = {'epic': WAIT_CHILDREN, 'recurring': WAIT_SCHEDULE}   # kind -> the wait it starts and stays in
 OVERLAP = ('skip', 'queue')
 NO_HEADS = ('epic', 'recurring')
@@ -80,6 +84,14 @@ def normalize_recheck_policy(recheck_every, recheck_until, recheck_max, not_befo
         raise CardError('not_before must be before recheck_until')
     return {'every': float(recheck_every), 'until': recheck_until, 'max': recheck_max,
             'due': due, 'attempts': 0}
+
+
+def check_reminder_text(text):
+    """Refuse a reminder text that is blank or longer than REMINDER_MAX_BYTES of UTF-8."""
+    if not isinstance(text, str) or not text.strip():
+        raise CardError('reminder text must not be blank')
+    if len(text.encode()) > REMINDER_MAX_BYTES:
+        raise CardError(f'reminder text must be at most {REMINDER_MAX_BYTES} bytes of UTF-8')
 
 
 def validate_tag(tag):
@@ -316,10 +328,11 @@ def create(conn, *, title, goal, acceptance=None, step, source, created_by, revi
            assignee=None, on_unavailable='wait', executors=(), every=None, max_runs=None, until=None,
            overlap=None, model=None, effort=None, cfg=None, panel=None, executor=None,
            cron=None, tz=None, misfire=None, start_window=None, script=None, script_timeout=None, deliver=None, gate_timeout=None,
-           card_class=None, owner_visible=None, followup_of=None, tag=None):
+           card_class=None, owner_visible=None, followup_of=None, tag=None, reminder=None):
     """Return (card_id, created), inserting a validated card and its initial dependency or schedule waits atomically.
     A model pin resolves vendor and effort from cfg (or the loaded config); assignee alone uses executors.
     An external executor must be configured under [executors.*] in cfg and excludes every head pin.
+    A `reminder` text makes a reminder: no head, due at not_before or each period of its schedule.
     Idempotency is decided by the UNIQUE key inside the transaction."""
     if isinstance(blocked_by, str) or not isinstance(blocked_by, (list, tuple)):
         raise CardError('blocked_by must be a list or tuple of card ids')
@@ -367,6 +380,15 @@ def create(conn, *, title, goal, acceptance=None, step, source, created_by, revi
             raise CardError('step must be 1..5')
         members = normalize_panel(cfg, panel, step)
     recheck = recheck_every is not None or recheck_until is not None or recheck_max is not None
+    if reminder is not None:
+        check_reminder_text(reminder)
+        if (kind == 'epic' or review or recheck or blocked_by or acceptance_kind != 'command'
+                or any(v is not None for v in (script, executor, model, effort, panel, assignee, parent))):
+            raise CardError('a reminder runs no head: it takes no script, executor, model, effort, panel, assignee, '
+                            'review, judge acceptance, recheck policy, dependency, epic or parent')
+        if kind != 'recurring' and not_before is None:
+            raise CardError('a reminder needs not_before or a schedule')
+        acceptance = acceptance or 'true'
     if kind == 'epic':
         if acceptance_kind != 'command':
             raise CardError('an epic takes a command acceptance only')
@@ -431,7 +453,7 @@ def create(conn, *, title, goal, acceptance=None, step, source, created_by, revi
                   idem_key=idem_key, priority=int(priority) if priority is not None else (100 if card_class == 'owner_task' and kind == 'task' else 0), assignee=assignee, on_unavailable=on_unavailable,
                   model=model, effort=effort, panel=json.dumps(members) if members is not None else None,
                   executor=executor, script=script, script_timeout=script_timeout, gate_timeout=gate_timeout,
-                  deliver=deliver or 'owner-inbox', tag=tag)
+                  deliver=deliver or 'owner-inbox', tag=tag, reminder=reminder)
     with store.tx(conn):
         cid, created = insert_card(conn, card_id or 'h_' + secrets.token_hex(4), fields, blocked_by, parent, optional, now)
         if created and followup_of is not None:
@@ -846,6 +868,8 @@ def get(conn, card_id):
                      for r in conn.execute('SELECT * FROM events WHERE card_id=? ORDER BY id', (card_id,))]
     out['outbox'] = [dict(r) for r in conn.execute('SELECT * FROM outbox WHERE card_id=?', (card_id,))]
     out['steers'] = steer_deliveries(conn, card_id)
+    row = conn.execute('SELECT * FROM reminders WHERE card_id=?', (card_id,)).fetchone()
+    out['reminder_state'] = dict(row, receipt=json.loads(row['receipt']) if row['receipt'] else None) if row else None
     return out
 
 
@@ -931,6 +955,9 @@ def placement(conn, card, now, alive):
         return waiting('external', 'failure', card['block_reason'])
     if state == 'blocked' and reason in (WAIT_STUCK, WAIT_PROCESS, WAIT_JUDGE, WAIT_TAG, WAIT_DISPUTED):
         return waiting('external', reason, card['block_reason'])
+    if state == 'blocked' and reason == WAIT_REMINDER:
+        row = conn.execute('SELECT state FROM reminders WHERE card_id=?', (card['id'],)).fetchone()
+        return waiting('external', WAIT_REMINDER, row['state'])
     if state == 'blocked' and reason in (WAIT_DEPENDENCY, WAIT_CHILDREN):
         reasons = {r['kind']: r for r in block_reasons(card, store.blockers(conn, card['id']),
                                                          store.children(conn, card['id']))}
@@ -960,6 +987,7 @@ WAITING_SINCE_EVENTS = {
     ('blocked', WAIT_PROCESS): ('process_wait',),
     ('blocked', WAIT_DEPENDENCY): ('dependency_wait',),
     ('blocked', WAIT_CHILDREN): ('children_wait',),
+    ('blocked', WAIT_REMINDER): ('reminder_due',),
 }
 
 

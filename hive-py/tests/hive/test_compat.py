@@ -12,10 +12,18 @@ HERE = Path(__file__).resolve().parent
 EXAMPLE = HERE.parents[1] / 'config.example.toml'
 TOML_TYPES = {str: 'string', int: 'integer', float: 'float', bool: 'boolean', list: 'array'}
 # Nullable columns the reform adds to the source cards table (ADR-0068 section 5), appended by the add-column path.
-REFORM_CARD_COLUMNS = ', tag TEXT'
+REFORM_CARD_COLUMNS = ', tag TEXT, reminder TEXT'
 # Indexes the reform adds (ADR-0068 section 5: additive, through CREATE INDEX IF NOT EXISTS): the board's (store.BOARD_INDEXES).
 REFORM_INDEXES = [['index', 'cards_board', 'cards', 'CREATE INDEX cards_board ON cards(card_class, kind, id)'],
                   ['index', 'links_followup', 'links', "CREATE INDEX links_followup ON links(card_id) WHERE kind='followup'"]]
+# The reminders' table and its index (ADR-0100, store.REMINDERS: additive, through CREATE ... IF NOT EXISTS).
+REFORM_TABLES = [
+    ['table', 'reminders', 'reminders', "CREATE TABLE reminders(card_id TEXT PRIMARY KEY REFERENCES cards(id), state TEXT "
+     "NOT NULL CHECK(state IN ('due', 'claimed', 'delivered', 'withdrawn', 'failed')), due_at REAL NOT NULL, claimed_at "
+     "REAL, claimed_by TEXT, attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL, error TEXT, sent_by TEXT, sent_text "
+     "TEXT, receipt TEXT, sent_at REAL, reason TEXT, updated_at REAL NOT NULL)"],
+    ['index', 'sqlite_autoindex_reminders_1', 'reminders', None],
+    ['index', 'reminders_open', 'reminders', "CREATE INDEX reminders_open ON reminders(state) WHERE state IN ('due', 'claimed')"]]
 
 
 def flat(table, prefix=''):
@@ -37,9 +45,11 @@ def schema(path):
 
 
 def source_schema_with_reform_columns():
-    """The schema the source store creates, its cards table extended by REFORM_CARD_COLUMNS and REFORM_INDEXES only."""
+    """The schema the source store creates, its cards table extended by REFORM_CARD_COLUMNS, REFORM_INDEXES and
+    REFORM_TABLES only."""
     return sorted([[kind, name, table, sql[:-1] + REFORM_CARD_COLUMNS + ')' if (kind, name) == ('table', 'cards') else sql]
-                   for kind, name, table, sql in json.loads((HERE / 'source_schema.json').read_text())] + REFORM_INDEXES,
+                   for kind, name, table, sql in json.loads((HERE / 'source_schema.json').read_text())]
+                  + REFORM_INDEXES + REFORM_TABLES,
                   key=lambda r: (r[0], r[1]))
 
 

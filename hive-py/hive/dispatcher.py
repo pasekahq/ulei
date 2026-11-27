@@ -1,6 +1,7 @@
 """Dispatcher: the ONLY component that moves cards.
 
-tick() = lock → reap runs whose process is gone or past their timeout → advance cards (stop workers that missed a steer, poll external
+tick() = lock → reap runs whose process is gone or past their timeout → advance cards (make reminders due and send overdue ones
+directly (hive/reminder.py), stop workers that missed a steer, poll external
 executors, wake cards whose waited processes ended, handle finished runs, gate, judge, retry/steer round/block) → send admitted external-executor cards and
 launch heads into free slots → publish outbox to the owner inbox.
 Every transition is a CAS inside BEGIN IMMEDIATE; the outbox row for a final
@@ -21,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import api, c4g, delivery, inspect, judge, liveness, store, heads, resources, wait_nudge
+from . import api, c4g, delivery, inspect, judge, liveness, store, heads, reminder, resources, wait_nudge
 
 REPO = Path(__file__).resolve().parents[1]
 EXCERPT = 2500
@@ -258,10 +259,14 @@ class Dispatcher:
         for c in self.conn.execute("SELECT * FROM cards WHERE state='created'").fetchall():
             if c['not_before'] and c['not_before'] > now:
                 continue
+            if c['reminder'] is not None:
+                n += reminder.make_due(self, c)
+                continue
             with store.tx(self.conn):
                 if store.cas_card(self.conn, c, 'queued'):
                     store.event(self.conn, c['id'], 'queued')
                     n += 1
+        n += reminder.fallback(self)
         n += self.stop_for_steers()
         n += self.poll_external(now)
         n += self.wake_after_processes()
@@ -432,7 +437,8 @@ class Dispatcher:
         fields = {k: s[k] for k in ('kind', 'lane', 'title', 'goal', 'acceptance', 'acceptance_kind', 'judge_criteria',
                                     'deny_tools', 'body', 'step', 'review', 'task_type', 'source', 'created_by',
                                     'priority', 'assignee', 'on_unavailable', 'model', 'effort', 'panel', 'executor',
-                                    'script', 'script_timeout', 'deliver', 'gate_timeout', 'owner_visible', 'tag')}
+                                    'script', 'script_timeout', 'deliver', 'gate_timeout', 'owner_visible', 'tag',
+                                    'reminder')}
         fields.update(card_class='series_run', kind='task', lane=api.KINDS['task'], idem_key=f"series:{s['id']}:{period}", not_before=start,
                       series_period=period)
         if s['series_start_window'] is not None:
@@ -2226,8 +2232,8 @@ class Dispatcher:
                 if destination == 'telegram':
                     destination = 'owner-inbox'
                 payload = json.loads(o['payload'])
-                if (o['kind'].startswith('provider_') or payload.get('loop_stopped') or payload.get('state') == 'missed'
-                        or payload.get('disputed')):
+                if (o['kind'].startswith(('provider_', 'reminder_')) or payload.get('loop_stopped')
+                        or payload.get('state') == 'missed' or payload.get('disputed')):
                     destination = 'owner-inbox'  # global provider episodes keep their existing inbox contract
                 # Pending pre-deploy rows obey the same explicit metadata contract.
                 result = payload.get('result', {})

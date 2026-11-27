@@ -104,6 +104,8 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::Health>("c1/valid/Health.ok.json");
     roundtrip::<c::HealthRequest>("c1/valid/HealthRequest.empty.json");
     roundtrip::<c::Kind>("c1/valid/Kind.quota_dead.json");
+    roundtrip::<c::Kind>("c1/valid/Kind.reminder_due.json");
+    roundtrip::<c::Kind>("c1/valid/Kind.reminder_fallback.json");
     roundtrip::<c::Lease>("c1/valid/Lease.hex.json");
     roundtrip::<c::PublishRequest>("c1/valid/PublishRequest.task_result.json");
     roundtrip::<c::PublishResponse>("c1/valid/PublishResponse.id.json");
@@ -122,6 +124,7 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::UncertainRequest>("c1/valid/UncertainRequest.empty.json");
     roundtrip::<c::UncertainRequest>("c1/valid/UncertainRequest.limit.json");
     roundtrip::<c::Event>("c1/valid/root.gate_preview.json");
+    roundtrip::<c::Event>("c1/valid/root.reminder_due.json");
     roundtrip::<c::Event>("c1/valid/root.task_result.json");
     refused::<c::PublishRequest>("c1/invalid/PublishRequest.extra_field.json");
     refused::<c::Event>("c1/invalid/root.extra_field.json");

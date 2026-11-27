@@ -29,9 +29,9 @@ Read the root `AGENTS.md` first. Rules specific to this tree:
 
 | Path | What |
 |---|---|
-| `hive/` | The package, imported as `hive`: store, API, dispatcher, delivery interface, run liveness probe, heads, runner, the wait nudge (`wait_nudge.py`), gate, judge and its C4G client, schedules, steward, watch, and the read-only snapshots `inspect.py` (ADR-0086). |
+| `hive/` | The package, imported as `hive`: store, API, dispatcher, delivery interface, run liveness probe, heads, runner, the wait nudge (`wait_nudge.py`), reminders (`reminder.py`, ADR-0100), gate, judge and its C4G client, schedules, steward, watch, and the read-only snapshots `inspect.py` (ADR-0086). |
 | `scripts/hive.py` | The CLI; `hive_steward.py`, `hive_worktree_rotation.py` and the two store migrations `hive_migrate_*.py`. Each puts this directory on `sys.path` itself. |
-| `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `fake_c1_inbox.py` is the owner inbox's C1 daemon on a unix socket the `ulei` adapter's tests use, checking every request against C1; `fake_delivery.py` is a delivery adapter that keeps the events it is handed; `journal_watch.py` checks the journal contract (below) on every store connection of a test; `fake_gateway.py` is the scripted qb gateway on a unix socket the judge's and the steward's tests and the tests' config use; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the SOURCE schema, which a fresh store extends only by the reform columns, and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
+| `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `fake_c1_inbox.py` is the owner inbox's C1 daemon on a unix socket the `ulei` adapter's tests use, checking every request against C1 and accepting every C1 kind; `fake_delivery.py` is a delivery adapter that keeps the events it is handed; `fake_ulei_tg.py` is the `ulei-tg notify` the tests' config names, recording each call's argv and stdin and answering a receipt or a scripted failure; `journal_watch.py` checks the journal contract (below) on every store connection of a test; `fake_gateway.py` is the scripted qb gateway on a unix socket the judge's and the steward's tests and the tests' config use; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the SOURCE schema, which a fresh store extends only by the reform columns, and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
 | `config.example.toml` | Every config key with a synthetic value. |
 | `texts/` | Neutral samples of the texts the config names under `[texts]`. |
 
@@ -44,7 +44,8 @@ default, and a config without it is refused with the key's name. `delivery` name
 `hive/delivery.py`, and any other value is refused at load. `drop` publishes through the inbox
 library and reads `inbox` and `inbox_library`; `ulei` is the C1 client of the owner inbox and reads
 `inbox_socket` and `inbox_producer_key_file`, a 32-byte key file open to no group or other user.
-Only the selected adapter's keys are required. `[head_wait_nudge]` (`interval_s`, `text`) has defaults (1200 s, an English text) and is checked at load:
+Only the selected adapter's keys are required. `[reminders]` is required: `tg_binary` and `tg_config` have no default,
+its timings do (Reminders, below). `[head_wait_nudge]` (`interval_s`, `text`) has defaults (1200 s, an English text) and is checked at load:
 a non-negative interval, 0 for off, and a text naming no placeholder but `{minutes}` and `{command}` (`hive/LIVE_STEER.md`, Wait nudge). `HIVE_DB` overrides `db`. The live config and texts
 are the deployment's and are never in the tree; `config.example.toml` lists every key.
 
@@ -104,6 +105,7 @@ Every other card is placed by the first matching row:
 | `blocked` | `wait_reason` `disputed` (the worker or the judge disputes the task itself; its author decides with `resolve`) | `waiting` | `external` | `disputed` | `reason`: `block_reason`, `disputed:` and who disputes what |
 | `blocked` | `wait_reason` `dependency` | `waiting` | `card` | `dependency` | `cards`: blockers not done or cancelled; `reason`: `block_reason` |
 | `blocked` | `wait_reason` `children` (an epic) | `waiting` | `card` | `children` | `cards`: required children not done or cancelled; `reason`: `block_reason` |
+| `blocked` | `wait_reason` `reminder` (a due reminder) | `waiting` | `external` | `reminder` | `reason`: the reminder's state, `due` or `claimed` |
 
 Any other combination, such as `blocked` with `wait_reason` `schedule` on a card that is not `recurring`,
 raises `ValueError` naming the card. Every entry carries the card's user `tag` (null without one). A probe that finds no unit cgroup counts the run as gone; a missing user
@@ -129,10 +131,40 @@ do not count.
 | `blocked`, `process` | `process_wait` |
 | `blocked`, `dependency` | `dependency_wait` |
 | `blocked`, `children` | `children_wait` |
+| `blocked`, `reminder` | `reminder_due` |
 
 `in_progress` is in queue order (priority, then age); `waiting` is longest waiting first (`waiting_since`, then
 `created_at`, then id); `done` and the archive are newest finish first, the archive cut to `archive_limit`. The
 text board prints each waiting entry's time since `waiting_since` (`for 3h`).
+
+## Reminders
+
+A card created with `--reminder TEXT` (`api.create(reminder=...)`) is a reminder (ADR-0100): the text, verbatim, not
+blank and at most 32 KiB, is in `cards.reminder`. It needs `--not-before`, `--hold` or a schedule and runs no head, so
+it takes no script, executor, model, effort, panel, assignee, review, judge acceptance, recheck, dependency, epic or
+parent; its acceptance is optional. Each instance of a recurring reminder copies the text and is a reminder.
+
+At `not_before` the dispatcher writes, in one transaction, the reminder's row in table `reminders` (state `due`), the
+card's move to `blocked` with `wait_reason` `reminder`, the event `reminder_due` and one outbox event of kind
+`reminder_due` (`hive:<card>:reminder_due`) whose payload carries `text`; it starts no head. Then:
+
+- `hive.py reminder claim CARD` makes a `due` reminder `claimed`; `reminder send CARD [--text TEXT]` sends a claimed one
+  through `ulei-tg notify` (the original without `--text`) and prints the receipt; `reminder withdraw CARD --reason
+  TEXT` makes a claimed one `withdrawn` and cancels its card, sending nothing. The actor (`--by`) is `secretary` or
+  `owner_actor`. Each verb holds the dispatcher's lock file; a refusal (not a reminder, not due, wrong state, card no
+  longer waiting) is one stderr line and exit 2, a failed send exit 1.
+- The fallback: every tick, a `due` reminder `[reminders] unclaimed_s` (180) after it fell due, or a `claimed` one
+  `claim_silence_s` (300) after its claim, is sent with its original text, `[tg_binary, "notify", "--config",
+  tg_config]` with the text on stdin; once delivered the secretary gets a `reminder_fallback` event naming the text,
+  why, and the receipt.
+- Delivered means a receipt with a message id: the row keeps who sent what and the receipt, the card is `done` with the
+  text as its result, and no `task_result` is written. A failed send (any non-zero exit, a timeout after
+  `notify_timeout_s`, exit 0 without a receipt) keeps the state, counts an attempt and is retried by the fallback after
+  `retry_s`; the `max_attempts`-th blocks the card as a failure (state `failed`, a `task_blocked` event).
+- A send that reached Telegram but was not recorded (a crash in between) is sent again: a reminder may come twice,
+  never not at all. A cancelled reminder card is never sent.
+
+`hive.py show CARD` prints the reminder's state and text; `api.get` returns its row as `reminder_state`.
 
 ## Disputes
 
