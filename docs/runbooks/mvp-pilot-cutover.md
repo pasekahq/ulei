@@ -294,7 +294,8 @@ As `<ULEI_USER>`:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service
+systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service \
+  ulei-uncertain.timer
 ~/.local/bin/ulei status; echo "exit $?"
 systemctl --user is-active <OLD_UNIT>
 lslocks -o COMMAND,PID,TYPE,PATH | grep -F consumer.lock
@@ -310,7 +311,8 @@ still answers from the old runtime.
 Pass: all hold. Fail: as `engine-live-smoke.md` step 7 reads the `down` and `unknown` lines; a
 lock line of `ulei-inbox` on `<LIVE_ROOT>` (1.4 is wrong: roll back at once).
 
-Roll back: `systemctl --user disable --now ulei-tg.service ulei-inbox.service ulei-engine.service`.
+Roll back: `systemctl --user disable --now ulei-uncertain.timer ulei-tg.service ulei-inbox.service
+ulei-engine.service`.
 
 The garden runs after this step as `ulei-garden.service`, by `docs/runbooks/garden-service.md`.
 
@@ -553,7 +555,8 @@ Expected: `ActiveState=active`. Then, as `<ULEI_USER>`:
 
 ```sh
 touch <LIVE_ROOT>/ENABLED
-systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service
+systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service \
+  ulei-uncertain.timer
 ~/.local/bin/ulei status; echo "exit $?"
 systemctl --user show -p MainPID --value ulei-inbox.service
 lslocks -o COMMAND,PID,TYPE,PATH | grep -F '<LIVE_ROOT>/consumer.lock'
@@ -651,6 +654,10 @@ loads, and whether `ulei-hive-mcp.service` is installed. Then, in order:
 It deletes nothing: the inbox root, the engine journal, the secrets, the binaries, the units and
 the drop-ins stay (in case (a) `live-root.conf` of 2.5; in case (b) there is none). A second run
 changes nothing more.
+
+It leaves `ulei-uncertain.timer` enabled, whose alerter would tell the owner every 24 h that the
+inbox cannot be read. Right after the script, as `<ULEI_USER>`:
+`systemctl --user disable --now ulei-uncertain.timer`.
 
 In case (gate) nothing in the gate changes: the old runtime keeps its own credential and reaches
 the facade again once `ulei-tg` has stopped. The script acts on user units only; in case (b) the
@@ -1140,7 +1147,7 @@ unit of the same name and hand the socket over:
 d=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-engine.service.d
 install -d -m 0755 "$d"
 install -m 0644 deploy/systemd/system/user-engine-off.conf "$d/90-system-unit.conf"
-for u in ulei-inbox ulei-tg ulei-memory ulei-garden ulei-night; do
+for u in ulei-inbox ulei-tg ulei-memory ulei-garden ulei-night ulei-uncertain; do
   install -d -m 0755 "${d%/*}/$u.service.d"
   install -m 0644 deploy/systemd/system/client-no-userns.conf \
     "${d%/*}/$u.service.d/90-system-engine.conf"
@@ -1152,8 +1159,8 @@ systemctl --user stop ulei-engine.service
 and as root `systemctl daemon-reload && systemctl enable --now ulei-engine.service`, then as
 `<ULEI_USER>` `systemctl --user restart ulei-inbox.service ulei-tg.service` (and
 `try-restart ulei-memory.service ulei-garden.service`, which starts nothing while the archive and
-the garden are not enabled; `ulei-night.service` is a oneshot its timer starts and needs no
-restart). Without the
+the garden are not enabled; `ulei-night.service` and `ulei-uncertain.service` are oneshots their
+timers start and need no restart). Without the
 clients' drop-in `ulei status` reads `channel: down` and the kernel log shows `apparmor="DENIED"
 operation="connect" ... disconnected path` for `c6.sock`. The engine's
 log is then `journalctl -u ulei-engine` (as root or a member of `adm`), not `--user`; `ulei
@@ -1162,7 +1169,7 @@ as root after an upgrade.
 
 Roll back: as root `systemctl disable --now ulei-engine.service`, remove the unit and its
 `.d` directory, `systemctl daemon-reload`; as `<ULEI_USER>` remove `90-system-unit.conf` and the
-five `90-system-engine.conf`, `systemctl --user daemon-reload && systemctl --user start
+six `90-system-engine.conf`, `systemctl --user daemon-reload && systemctl --user start
 ulei-engine.service && systemctl --user restart ulei-inbox.service ulei-tg.service`.
 
 ### 6.4 Check from inside the engine's unit

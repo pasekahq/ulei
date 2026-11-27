@@ -62,6 +62,16 @@ pub struct Transport {
     pub owner_ids: Vec<i64>,
 }
 
+/// The keys the uncertain alerter needs (ADR-0097 section 5): those of [`Transport`] and the
+/// owner inbox's C1 socket. `Debug` hides the token.
+#[derive(Debug, Clone)]
+pub struct AlertSettings {
+    /// The Bot API client and the owner ids.
+    pub transport: Transport,
+    /// The owner inbox's C1 socket (`inbox.socket`).
+    pub inbox_socket: PathBuf,
+}
+
 /// Why the settings could not be loaded: one line naming the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsError(String);
@@ -97,10 +107,21 @@ impl Transport {
     /// ids are missing or invalid, or a client key is invalid.
     pub fn load(flag: Option<&Path>) -> Result<Self, SettingsError> {
         let file = File::read(flag).map_err(|e| fail(e.to_string()))?;
+        Reader(&file).transport()
+    }
+}
+
+impl AlertSettings {
+    /// Decodes the config file as [`Transport::load`] does and reads `inbox.socket` besides.
+    ///
+    /// # Errors
+    /// As [`Transport::load`], or `inbox.socket` is missing or empty.
+    pub fn load(flag: Option<&Path>) -> Result<Self, SettingsError> {
+        let file = File::read(flag).map_err(|e| fail(e.to_string()))?;
         let reader = Reader(&file);
         Ok(Self {
-            bot: reader.bot()?,
-            owner_ids: reader.owner_ids()?,
+            transport: reader.transport()?,
+            inbox_socket: PathBuf::from(reader.required("inbox.socket")?),
         })
     }
 }
@@ -190,6 +211,13 @@ impl Reader<'_> {
             zone,
             reactions,
             guest_gate,
+        })
+    }
+
+    fn transport(&self) -> Result<Transport, SettingsError> {
+        Ok(Transport {
+            bot: self.bot()?,
+            owner_ids: self.owner_ids()?,
         })
     }
 

@@ -14,9 +14,10 @@ use ulei_contracts::generated::c6::{
 
 use super::follow::{EMPTY_SENTINEL, Read, read_turn};
 use super::outbound::{Closed, Outbox};
-use crate::c6::{self, Cancel, Event, session_key};
+use crate::c6::{self, Event, session_key};
 use crate::render::is_intentional_silence;
 use crate::render::pytext::strip;
+use crate::uds::Cancel;
 
 /// Wait before a failed connect or a lost hold is tried again: the reference pump's period.
 const RETRY: Duration = Duration::from_secs(2);

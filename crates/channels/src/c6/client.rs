@@ -2,18 +2,12 @@
 //! per connection to the engine's Unix socket, with a connect timeout and a call timeout.
 
 use std::fmt;
-use std::io::{self, Read, Write};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::io;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use rustix::net::sockopt::{self, Timeout};
-use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
 use ulei_contracts::generated::c6::{
     Ack, DeliveryReport, Error as WireError, ErrorCode, InboxTurns, InboxTurnsRequest,
     InterruptRequest, InterruptResponse, RouteSet, SessionStatus, SetRouteRequest, StatusRequest,
@@ -21,11 +15,7 @@ use ulei_contracts::generated::c6::{
     TurnEventsRequest, TurnOutcome, TurnState,
 };
 
-/// Most bytes of the status line, header lines and empty line together.
-const MAX_HEAD: usize = 8 * 1024;
-/// Most bytes of a request or response body.
-const MAX_BODY: usize = 512 * 1024;
-const CHUNK: usize = 8 * 1024;
+use crate::uds::{Cancel, Endpoint, Fault, MAX_BODY, Wait};
 
 /// Why a C6 call failed.
 #[derive(Debug)]
@@ -73,6 +63,19 @@ impl fmt::Display for Error {
                 write!(f, "C6 engine error {}: {message}", code.as_str())
             }
             Self::Cancelled => f.write_str("C6 call cancelled"),
+        }
+    }
+}
+
+impl From<Fault> for Error {
+    fn from(fault: Fault) -> Self {
+        match fault {
+            Fault::Unreachable(e) => Self::Unreachable(e),
+            Fault::Timeout => Self::Timeout,
+            Fault::PeerUid { expected, actual } => Self::PeerUid { expected, actual },
+            Fault::RequestTooLarge(len) => Self::RequestTooLarge(len),
+            Fault::Malformed(what) => Self::Malformed(what),
+            Fault::Cancelled => Self::Cancelled,
         }
     }
 }
@@ -159,72 +162,9 @@ impl Event {
     }
 }
 
-/// Ends the held calls made with it, at once and for good: the call in flight and every
-/// later one fail with [`Error::Cancelled`]. Clones share the state.
-#[derive(Debug, Clone, Default)]
-pub struct Cancel(Arc<Mutex<Held>>);
-
-#[derive(Debug, Default)]
-struct Held {
-    cancelled: bool,
-    stream: Option<UnixStream>,
-}
-
-impl Cancel {
-    /// A cancel not fired yet.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Fires: a call blocked in its read returns at once.
-    pub fn cancel(&self) {
-        let mut held = self.lock();
-        held.cancelled = true;
-        if let Some(stream) = held.stream.take() {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.lock().cancelled
-    }
-
-    /// Registers the stream of the call in flight.
-    fn hold(&self, stream: &UnixStream) -> Result<(), Error> {
-        let mut held = self.lock();
-        if held.cancelled {
-            return Err(Error::Cancelled);
-        }
-        held.stream = Some(stream.try_clone().map_err(Error::Unreachable)?);
-        Ok(())
-    }
-
-    fn release(&self) {
-        self.lock().stream = None;
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// How long a call waits for its answer.
-#[derive(Debug, Clone, Copy)]
-enum Wait {
-    /// Until the call timeout.
-    CallTimeout,
-    /// Without a read timeout; the connect and the write keep their timeouts.
-    Unbounded,
-}
-
 /// A C6 client of one engine socket; every call opens its own connection.
 #[derive(Debug, Clone)]
-pub struct Client {
-    socket: PathBuf,
-    connect_timeout: Duration,
-    call_timeout: Duration,
-    uid: u32,
-}
+pub struct Client(Endpoint);
 
 impl Client {
     /// A client of the engine at `socket`, which must run as this process's effective uid.
@@ -238,14 +178,7 @@ impl Client {
         connect_timeout: Duration,
         call_timeout: Duration,
     ) -> io::Result<Self> {
-        let (ours, _peer) = UnixStream::pair()?;
-        let uid = sockopt::socket_peercred(&ours)?.uid.as_raw();
-        Ok(Self {
-            socket: socket.into(),
-            connect_timeout,
-            call_timeout,
-            uid,
-        })
+        Endpoint::new(socket.into(), connect_timeout, call_timeout).map(Self)
     }
 
     /// C6 `submit_turn`.
@@ -362,46 +295,7 @@ impl Client {
         cancel: Option<&Cancel>,
         wait: Wait,
     ) -> Result<T, Error> {
-        let value = serde_json::to_value(input)
-            .map_err(|_| Error::Malformed("request does not serialize"))?;
-        let body = canonical(&value);
-        if body.len() > MAX_BODY {
-            return Err(Error::RequestTooLarge(body.len()));
-        }
-        let start = Instant::now();
-        let deadline = start + self.call_timeout;
-        let mut stream = connect(
-            &self.socket,
-            start + self.connect_timeout.min(self.call_timeout),
-        )?;
-        let actual = sockopt::socket_peercred(&stream)
-            .map_err(|e| Error::Unreachable(e.into()))?
-            .uid
-            .as_raw();
-        if actual != self.uid {
-            return Err(Error::PeerUid {
-                expected: self.uid,
-                actual,
-            });
-        }
-        let mut request = format!(
-            "POST /v1/{method} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        request.extend_from_slice(&body);
-        if let Some(cancel) = cancel {
-            cancel.hold(&stream)?;
-        }
-        let reading = match wait {
-            Wait::CallTimeout => Some(deadline),
-            Wait::Unbounded => None,
-        };
-        let answer = exchange(&mut stream, &request, deadline, reading);
-        if let Some(cancel) = cancel {
-            cancel.release();
-        }
-        let (status, body) = answer?;
+        let (status, body) = self.0.post(method, input, cancel, wait)?;
         if status == 200 {
             return serde_json::from_slice(&body)
                 .map_err(|_| Error::Malformed("200 body is not valid for the method output"));
@@ -422,176 +316,4 @@ fn cancelled(cancel: &Cancel, error: Error) -> Error {
     } else {
         error
     }
-}
-
-/// Writes `request` before `deadline` and reads its answer before `reading`, if any.
-fn exchange(
-    stream: &mut UnixStream,
-    request: &[u8],
-    deadline: Instant,
-    reading: Option<Instant>,
-) -> Result<(u16, Vec<u8>), Error> {
-    stream
-        .set_write_timeout(Some(left(deadline)?))
-        .map_err(Error::Unreachable)?;
-    stream.write_all(request).map_err(io_error)?;
-    read_response(stream, reading)
-}
-
-/// Connects to `socket` before `deadline`: a listener whose backlog stays full until then is
-/// [`Error::Timeout`].
-fn connect(socket: &Path, deadline: Instant) -> Result<UnixStream, Error> {
-    let errno = |e: rustix::io::Errno| Error::Unreachable(e.into());
-    let fd = rustix::net::socket_with(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::CLOEXEC,
-        None,
-    )
-    .map_err(errno)?;
-    // A Unix `connect` to a full backlog waits up to the send timeout, then fails with EAGAIN.
-    sockopt::set_socket_timeout(&fd, Timeout::Send, Some(left(deadline)?)).map_err(errno)?;
-    let address = SocketAddrUnix::new(socket).map_err(errno)?;
-    rustix::net::connect(&fd, &address).map_err(|e| io_error(e.into()))?;
-    Ok(UnixStream::from(fd))
-}
-
-/// Reads one answer until `deadline`, if any: its status and body.
-fn read_response(
-    stream: &mut UnixStream,
-    deadline: Option<Instant>,
-) -> Result<(u16, Vec<u8>), Error> {
-    let mut buf = Vec::with_capacity(CHUNK);
-    let head_end = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
-        if buf.len() >= MAX_HEAD {
-            return Err(Error::Malformed("head over 8 KiB"));
-        }
-        if read_some(stream, &mut buf, CHUNK, deadline)? == 0 {
-            if buf.is_empty() {
-                return Err(Error::Unreachable(io::ErrorKind::UnexpectedEof.into()));
-            }
-            return Err(Error::Malformed("end of stream before the whole answer"));
-        }
-    };
-    let head =
-        std::str::from_utf8(&buf[..head_end]).map_err(|_| Error::Malformed("head is not UTF-8"))?;
-    let mut lines = head.split("\r\n");
-    let status = status_line(lines.next().unwrap_or_default())?;
-    let length = content_length(lines)?;
-    if length > MAX_BODY {
-        return Err(Error::Malformed("body over 512 KiB"));
-    }
-    let mut body = buf.split_off(head_end + 4);
-    while body.len() < length {
-        let missing = length - body.len();
-        if read_some(stream, &mut body, missing, deadline)? == 0 {
-            return Err(Error::Malformed("end of stream before the whole answer"));
-        }
-    }
-    if body.len() > length || read_some(stream, &mut body, 1, deadline)? != 0 {
-        return Err(Error::Malformed("bytes after the body"));
-    }
-    Ok((status, body))
-}
-
-/// Appends at most `max` bytes that arrive before `deadline`, if any; 0 at the end of the
-/// stream.
-fn read_some(
-    stream: &mut UnixStream,
-    buf: &mut Vec<u8>,
-    max: usize,
-    deadline: Option<Instant>,
-) -> Result<usize, Error> {
-    let timeout = deadline.map(left).transpose()?;
-    stream
-        .set_read_timeout(timeout)
-        .map_err(Error::Unreachable)?;
-    let mut chunk = [0u8; CHUNK];
-    match stream.read(&mut chunk[..max.min(CHUNK)]) {
-        Ok(n) => {
-            buf.extend_from_slice(&chunk[..n]);
-            Ok(n)
-        }
-        // A peer that closes with request bytes unread resets the stream; nothing follows.
-        Err(e) if e.kind() == io::ErrorKind::ConnectionReset && max == 1 => Ok(0),
-        Err(e) => Err(io_error(e)),
-    }
-}
-
-/// Time left until `deadline`; none left is [`Error::Timeout`].
-fn left(deadline: Instant) -> Result<Duration, Error> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        Err(Error::Timeout)
-    } else {
-        Ok(left)
-    }
-}
-
-/// A socket timeout surfaces as `WouldBlock` or `TimedOut`.
-fn io_error(e: io::Error) -> Error {
-    match e.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::Timeout,
-        _ => Error::Unreachable(e),
-    }
-}
-
-/// The status of a status line `HTTP/1.1 <3 digits> <reason>`.
-fn status_line(line: &str) -> Result<u16, Error> {
-    let mut parts = line.splitn(3, ' ');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("HTTP/1.1"), Some(code), Some(_))
-            if code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            code.parse()
-                .map_err(|_| Error::Malformed("malformed status line"))
-        }
-        _ => Err(Error::Malformed("malformed status line")),
-    }
-}
-
-/// The `Content-Length` of the header lines; `Transfer-Encoding` is refused.
-fn content_length<'a>(lines: impl Iterator<Item = &'a str>) -> Result<usize, Error> {
-    let mut length = None;
-    for line in lines {
-        let (name, value) = line
-            .split_once(':')
-            .ok_or(Error::Malformed("malformed header"))?;
-        let value = value.trim_matches([' ', '\t']);
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            return Err(Error::Malformed("Transfer-Encoding is refused"));
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            if length.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(Error::Malformed("malformed Content-Length"));
-            }
-            // All digits, so a parse failure is an overflow: far over the body limit.
-            length = Some(value.parse::<usize>().unwrap_or(usize::MAX));
-        }
-    }
-    length.ok_or(Error::Malformed("Content-Length is required"))
-}
-
-/// Compact JSON with object keys in code point order: a workspace build may unify
-/// `serde_json` with `preserve_order`, and then `Map` keeps insertion order.
-fn canonical(value: &Value) -> Vec<u8> {
-    fn sorted(value: &Value) -> Value {
-        match value {
-            Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
-            Value::Object(fields) => {
-                let mut entries: Vec<_> = fields.iter().collect();
-                entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
-                let mut out = Map::new();
-                for (key, item) in entries {
-                    out.insert(key.clone(), sorted(item));
-                }
-                Value::Object(out)
-            }
-            other => other.clone(),
-        }
-    }
-    sorted(value).to_string().into_bytes()
 }

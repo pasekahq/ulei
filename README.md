@@ -277,7 +277,8 @@ runner's `ulei-connectors serve` (ADR-0056), `ulei-memory.service`, the archive'
 `ulei-memory serve` (ADR-0070), `ulei-hive-mcp.service` (ADR-0071) and `ulei-garden.service`, the
 garden's `ulei-garden serve` with its embedder helper (ADR-0075), and the oneshot
 `ulei-night.service` with its timer `ulei-night.timer`, the night gardener `ulei-engine night`
-(ADR-0078). They run as the account that owns the deployment,
+(ADR-0078), and the oneshot `ulei-uncertain.service` with its timer `ulei-uncertain.timer`, the
+uncertain alerter `ulei-tg uncertain` (ADR-0097). They run as the account that owns the deployment,
 start `ulei-engine` before the inbox and the channel, restart a daemon that exits non-zero, and
 allow writes only to these directories, in the layout of ADR-0042 section 3:
 
@@ -336,6 +337,12 @@ on `night.route`, within `night.max_usd` a run, and exits. It allows `AF_UNIX` o
 the garden and the archive) and has no `[Install]`; `ulei-night.timer` starts it each night. Once
 `ulei.toml` has `[night]`, after a dry run: `systemctl --user enable --now ulei-night.timer`.
 [docs/runbooks/night-gardener.md](docs/runbooks/night-gardener.md).
+
+`ulei-uncertain.service` runs `ulei-tg uncertain` once: it asks the owner inbox over C1 for its
+`uncertain` events and tells the owner through the bot when one is new, every 24 h while any stay,
+and when the inbox cannot be read; it keeps what it told in `<state>/ulei/uncertain`. It has no
+`[Install]`; `ulei-uncertain.timer` starts it every 10 minutes and is enabled with the inbox and
+the channel.
 
 ## Budgets
 

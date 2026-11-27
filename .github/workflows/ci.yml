@@ -520,7 +520,7 @@ jobs:
             name="${unit##*/}"
             case "$name" in
               # Tenths: measured 5.8 on ubuntu-24.04, systemd 255.4.
-              ulei-inbox.service | ulei-engine.service | ulei-tg.service | ulei-connectors.service) threshold=58 ;;
+              ulei-inbox.service | ulei-engine.service | ulei-tg.service | ulei-connectors.service | ulei-uncertain.service) threshold=58 ;;
               # AF_UNIX only.
               ulei-memory.service | ulei-garden.service | ulei-night.service) threshold=55 ;;
               ulei-hive-mcp.service) threshold=58 ;;

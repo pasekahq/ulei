@@ -21,4 +21,4 @@ pub use inbox::Inbox;
 pub use link::{Counts, ENGINE_FAILED, Link, spawn_vital};
 pub use outbound::{Closed, Outbound, Outbox};
 pub use sent::SentTexts;
-pub use settings::{Settings, SettingsError, Transport};
+pub use settings::{AlertSettings, Settings, SettingsError, Transport};

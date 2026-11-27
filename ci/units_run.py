@@ -22,6 +22,8 @@ runs without the embedder, its model or ONNX Runtime and must answer C7 `health`
 `dense: off` and a lexical `search` (ADR-0075).
 ``ulei-night.service``, the night gardener's oneshot, started once by hand on that garden must
 end with ``Result=success`` and a run report without a model call (ADR-0078).
+``ulei-uncertain.service``, the uncertain alerter's oneshot, started once by hand on the running
+inbox with no uncertain event must end with ``Result=success`` and send nothing (ADR-0097).
 
 MODE ``default`` runs on the runner's own user namespace setting: a unit the manager starts
 without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
@@ -65,6 +67,7 @@ MEMORY = "ulei-memory.service"
 HIVE_MCP = "ulei-hive-mcp.service"
 GARDEN = "ulei-garden.service"
 NIGHT = "ulei-night.service"
+UNCERTAIN = "ulei-uncertain.service"
 UNITS = (
     "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", CONNECTORS, MEMORY, HIVE_MCP,
     GARDEN,
@@ -889,6 +892,23 @@ def night_once(values: dict[str, str | int | bool]) -> str:
     )
 
 
+def uncertain_once(api: FakeBotApi) -> str:
+    """`ulei-uncertain.service` started once by hand on the running inbox, which holds no
+    uncertain event: the oneshot ends with `Result=success` and exit 0 and the fake Bot API gets
+    no `sendMessage`, which it would answer 404 and record."""
+    done = systemctl("start", UNCERTAIN)
+    state = show(UNCERTAIN, "Result", "ExecMainStatus", "ActiveState")
+    if done.returncode != 0 or state["Result"] != "success" or state["ExecMainStatus"] != "0":
+        raise Failure(
+            f"systemctl --user start {UNCERTAIN}: exit {done.returncode} "
+            f"{done.stderr.strip()}; {state}; journal: {journal_cause(UNCERTAIN)}"
+        )
+    sends = [e for e in api.errors if "sendMessage" in e]
+    if sends:
+        raise Failure(f"{UNCERTAIN} called the Bot API: {sends}")
+    return f"oneshot Result=success, exit 0, {state['ActiveState']} after the run; no notice"
+
+
 def restart(api: FakeBotApi, ulei: Path, config: Path) -> str:
     restarted = fatal_restart(api)
     status_up(ulei, config)
@@ -964,6 +984,10 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
             passed &= notices.check(
                 starts, f"{mode} {NIGHT} once", lambda: night_once(values),
             )
+        if "ulei-inbox.service" in started:
+            passed &= notices.check(
+                starts, f"{mode} {UNCERTAIN} once", lambda: uncertain_once(api),
+            )
         if CONNECTORS in started:
             passed &= notices.check(
                 runs, f"{mode} {CONNECTORS} runs test", lambda: connector_ok(values),
@@ -992,7 +1016,7 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
         passed &= notices.check(ends, f"{mode} stop", lambda: stop_clean(api))
         return passed
     finally:
-        systemctl("stop", *UNITS, NIGHT)
+        systemctl("stop", *UNITS, NIGHT, UNCERTAIN)
         systemctl("stop", "ulei-connector-*.service")
         api.release.set()
         api.shutdown()

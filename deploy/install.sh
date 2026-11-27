@@ -1,6 +1,7 @@
 #!/bin/sh
 # Installs a ulei release for the current account, without root (ADR-0042 section 10, ADR-0056
-# section 6, ADR-0070, ADR-0071 section 8, ADR-0075, ADR-0078).
+# section 6, ADR-0070, ADR-0071 section 8, ADR-0075, ADR-0078,
+# ADR-0097).
 #   deploy/install.sh RELEASE_DIR
 #   deploy/install.sh --connector NAME --dir DIR RELEASE_DIR
 # Before copying anything, both check every file RELEASE_DIR/SHA256SUMS lists against it, and that
@@ -77,7 +78,8 @@ here=$(dirname "$0")
 set -- ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors ulei-memory ulei-hive-mcp \
   ulei-garden ulei-garden-embed
 units="ulei-engine.service ulei-inbox.service ulei-tg.service ulei-connectors.service ulei-memory.service
-  ulei-hive-mcp.service ulei-garden.service ulei-night.service ulei-night.timer ulei.slice"
+  ulei-hive-mcp.service ulei-garden.service ulei-night.service ulei-night.timer ulei-uncertain.service
+  ulei-uncertain.timer ulei.slice"
 
 [ "$(id -u)" -ne 0 ] || fail account "run as the account that owns the deployment, not root"
 case "${HOME:-}" in
@@ -185,7 +187,7 @@ fi
 cat <<EOF
 next, as this account:
   systemctl --user daemon-reload
-  systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service
+  systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service ulei-uncertain.timer
   systemctl --user restart ulei-engine.service ulei-inbox.service ulei-tg.service  # on an upgrade
   $bindir/ulei status
 the root helper ulei-priv is not installed here: the owner installs it as root to
