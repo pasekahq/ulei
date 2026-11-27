@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -1027,8 +1027,11 @@ fn archive(config: &Config) -> Result<Option<archive::Client>, config::Error> {
 /// Registers the tools of every server of `servers` that connects before `interrupt` fires into
 /// `tools`; each warning goes to stderr as one line.
 fn connect_mcp(servers: &[Server], tools: &mut Registry, interrupt: &Interrupt) -> mcp::Sessions {
+    /// The failed first connects of this process: a server that is down costs one turn its
+    /// connect retries, the next turns a single attempt (`mcp::FAILED_CONNECT_MEMORY`).
+    static FAILED: LazyLock<mcp::FailedConnects> = LazyLock::new(mcp::FailedConnects::new);
     let clock: Arc<dyn mcp::Clock> = Arc::new(mcp::SystemClock);
-    let (sessions, warnings) = mcp::connect(servers, tools, &clock, interrupt);
+    let (sessions, warnings) = mcp::connect_remembering(servers, tools, &clock, interrupt, &FAILED);
     for warning in warnings {
         let _ = writeln!(
             std::io::stderr().lock(),

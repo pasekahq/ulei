@@ -41,6 +41,15 @@ reference's default HTTP path:
   (`_MAX_INITIAL_CONNECT_RETRIES`) after jittered waits of 1, 2 and 4 s; a non-MCP content type
   found by the preflight is not retried. The tools of the servers that connected are registered
   in configuration order after the built-in tools.
+- Failed first connects across runs (amendment 2026-11-27): the reference connects its servers
+  once per process, so a server that is down costs its retries once. The engine connects every
+  server at the start of every run, and a run's first model request waits for all of them: a
+  server that stays down (an expired upstream token behind a bridge) added its three retries,
+  about 7 s, to every owner turn. `ulei-engine serve` therefore keeps the failed first connects
+  of its process (`mcp::FailedConnects`); a server whose first connect failed less than 300 s
+  ago (`mcp::FAILED_CONNECT_MEMORY`, the reference's parked probe interval) gets one attempt
+  without retries, a success forgets the failure, and an interrupted connect records nothing.
+  `mcp::connect` without that memory keeps the full retries.
 - Transport (`StreamableHTTPTransport._prepare_headers`, `_handle_post_request`,
   `_handle_json_response`, `_handle_sse_response`, `_handle_sse_event`, `terminate_session`): the
   `mcp-session-id` of the initialize answer and the negotiated `mcp-protocol-version` go on every

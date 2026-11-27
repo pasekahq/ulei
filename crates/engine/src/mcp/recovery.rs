@@ -15,7 +15,8 @@ use super::client::{self, Failure, Session};
 use crate::tools::{Interrupt, Output};
 
 const MAX_RECONNECT_RETRIES: u32 = 5;
-const MAX_INITIAL_CONNECT_RETRIES: u32 = 3;
+/// Retries of the first connect of a server with no recent failed first connect.
+pub(crate) const MAX_INITIAL_CONNECT_RETRIES: u32 = 3;
 const MAX_BACKOFF_SECONDS: f64 = 60.0;
 const BACKOFF_JITTER: f64 = 0.2;
 const PARKED_RETRY_INTERVAL: Duration = Duration::from_secs(300);
@@ -100,13 +101,14 @@ pub(crate) struct Link {
 }
 
 impl Link {
-    /// Connects `server` and lists its tools, retrying a failed connect up to
-    /// [`MAX_INITIAL_CONNECT_RETRIES`] times with backoff within its connect timeout, until
-    /// `interrupt` fires; the failure text has credentials and secret header values masked.
+    /// Connects `server` and lists its tools, retrying a failed connect up to `retries` times
+    /// with backoff within its connect timeout, until `interrupt` fires; the failure text has
+    /// credentials and secret header values masked.
     pub(crate) fn start(
         server: &Server,
         clock: Arc<dyn Clock>,
         interrupt: &Interrupt,
+        retries: u32,
     ) -> Result<(Self, Vec<Value>), String> {
         let headers = match &server.env_file {
             None => Vec::new(),
@@ -134,13 +136,20 @@ impl Link {
                 opened: None,
             }),
         };
-        let listed = link.connect(now, interrupt).map_err(|e| link.mask(&e))?;
+        let listed = link
+            .connect(now, interrupt, retries)
+            .map_err(|e| link.mask(&e))?;
         Ok((link, listed))
     }
 
-    /// The preflight, then attempts until one connects, the retries run out, the next wait
+    /// The preflight, then attempts until one connects, `max_retries` run out, the next wait
     /// would end past the connect timeout counted from `start` or `interrupt` fires.
-    fn connect(&self, start: Instant, interrupt: &Interrupt) -> Result<Vec<Value>, String> {
+    fn connect(
+        &self,
+        start: Instant,
+        interrupt: &Interrupt,
+        max_retries: u32,
+    ) -> Result<Vec<Value>, String> {
         let left = || {
             self.server
                 .connect_timeout
@@ -160,7 +169,7 @@ impl Link {
                 Err(error) => error,
             };
             retries += 1;
-            if retries > MAX_INITIAL_CONNECT_RETRIES || interrupt.is_interrupted() {
+            if retries > max_retries || interrupt.is_interrupted() {
                 return Err(error);
             }
             let wait = jittered(&*self.clock, backoff);

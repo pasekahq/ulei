@@ -910,6 +910,62 @@ fn the_first_connect_retries_three_times_with_jittered_backoff_within_its_timeou
 }
 
 #[test]
+fn a_server_whose_first_connect_failed_lately_gets_one_attempt_in_the_next_runs() {
+    let dir = Scratch::new();
+    let fake = FakeMcp::start(Spec::new(vec![echo_tool()]));
+    fake.set_down(usize::MAX);
+    let config = servers(&dir, &tools_only(&fake.url(), ""));
+    let clock = FakeClock::new(&[]);
+    let failed = mcp::FailedConnects::new();
+    let run = |failed: &mcp::FailedConnects| {
+        let mut registry = Registry::new();
+        let (_s, warnings) = mcp::connect_remembering(
+            &config,
+            &mut registry,
+            &dynamic(&clock),
+            &Interrupt::new(),
+            failed,
+        );
+        (names(&registry), warnings)
+    };
+
+    // The first run of a down server pays its retries with backoff.
+    let (_, warnings) = run(&failed);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(count(&fake, "initialize"), 4);
+    assert!(
+        close_to(&clock.waits(), &[1.0, 2.0, 4.0]),
+        "{:?}",
+        clock.waits()
+    );
+
+    // The next run within the memory tries once and does not wait.
+    let (_, warnings) = run(&failed);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(count(&fake, "initialize"), 5);
+    assert_eq!(clock.waits().len(), 3, "{:?}", clock.waits());
+
+    // Its single attempt still connects a server that came back, and forgets the failure.
+    fake.set_down(0);
+    let (tools, warnings) = run(&failed);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(tools, ["mcp__fake__echo"]);
+
+    // Down again: the failure was forgotten, so the full retries come back.
+    fake.set_down(usize::MAX);
+    let before = count(&fake, "initialize");
+    let (_, warnings) = run(&failed);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(count(&fake, "initialize"), before + 4);
+
+    // Past the memory a failed server gets its full retries again.
+    clock.advance(mcp::FAILED_CONNECT_MEMORY.as_secs());
+    let before = count(&fake, "initialize");
+    let _ = run(&failed);
+    assert_eq!(count(&fake, "initialize"), before + 4);
+}
+
+#[test]
 fn an_interrupt_during_a_first_connect_backoff_ends_the_connect_at_once() {
     let dir = Scratch::new();
     let fake = FakeMcp::start(Spec::new(vec![echo_tool()]));
