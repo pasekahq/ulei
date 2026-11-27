@@ -138,7 +138,7 @@ fn main() -> ExitCode {
         Ok((config, cache))
     }) {
         Ok((config, cache)) => match interrupt_on_signals(&interrupt) {
-            Ok(()) => turn(&config, cache, &run, &interrupt, None).1,
+            Ok(()) => turn(&config, cache, &run, &interrupt).1,
             Err(e) => Err((EXIT_FAILURE, format!("ulei-engine: signal handler: {e}"))),
         },
         Err(e) => Err((EXIT_FAILURE, format!("ulei-engine: {e}"))),
@@ -422,7 +422,19 @@ impl Runner for Turns {
             message_id: submitted.message_id,
             reactions: Some(Reactions::default()),
         };
-        let (outcome, result) = turn(&self.config, self.cache, &run, interrupt, Some(interim));
+        let (outcome, result, resets_at, tools_ran) =
+            match journaled(&self.config, self.cache, &run, interrupt, Some(interim)) {
+                Ok(ran) => {
+                    let resets_at = match &ran.ended {
+                        Ended::QuotaExhausted { error, .. } => error.resets_at,
+                        _ => None,
+                    };
+                    let tools_ran = ran.tools_ran();
+                    let (outcome, result) = answer(ran);
+                    (outcome, result, resets_at, Some(tools_ran))
+                }
+                Err(failure) => (TurnOutcome::Failed, Err(failure), None, None),
+            };
         let reactions = run
             .reactions
             .as_ref()
@@ -438,6 +450,8 @@ impl Runner for Turns {
             line,
             answer,
             reactions,
+            resets_at,
+            tools_ran,
         }
     }
 
@@ -454,15 +468,9 @@ impl Runner for Turns {
 }
 
 /// Runs and journals one turn under the settings of `config` and the prompt cache mode `cache`
-/// until `interrupt` fires, handing `interim` the turn's interim texts.
-fn turn(
-    config: &Config,
-    cache: Option<CacheMode>,
-    run: &Run,
-    interrupt: &Interrupt,
-    interim: Option<&mut dyn FnMut(&str)>,
-) -> Finish {
-    match journaled(config, cache, run, interrupt, interim) {
+/// until `interrupt` fires.
+fn turn(config: &Config, cache: Option<CacheMode>, run: &Run, interrupt: &Interrupt) -> Finish {
+    match journaled(config, cache, run, interrupt, None) {
         Ok(outcome) => answer(outcome),
         Err(failure) => (TurnOutcome::Failed, Err(failure)),
     }

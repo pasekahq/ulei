@@ -184,6 +184,8 @@ fn report(state: TurnState, outcome: Option<TurnOutcome>, ended: Option<f64>) ->
         outcome,
         ended,
         line: None,
+        resets_at: None,
+        tools_ran: None,
         delivery: None,
     }
 }

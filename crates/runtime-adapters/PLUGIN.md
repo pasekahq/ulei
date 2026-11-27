@@ -249,6 +249,10 @@ Input `StatusRequest` `{"session": <session_id>, "turn": <turn id>}`, output `Se
   `context_exhausted`, `quota_exhausted` and `failed` (ADR-0028 section 1). `line` carries one
   line for `quota_exhausted`, `context_exhausted` and `failed`; it MUST NOT echo the prompt or
   the lease.
+- `resets_at` and `tools_ran` (C6 0.13.0): the Unix time of the nearest quota reset of a
+  `quota_exhausted` turn, and whether an `ended` turn ran any tool call. Both are optional and
+  an adapter MAY omit them; the core then acks a `quota_exhausted` inbox turn `uncertain`
+  instead of offering its event again after the reset (ADR-0036 section 7).
 - `delivery`: on the report of a turn `inject` started, once the turn has `ended` and the
   adapter has sent or withheld its answer, what it did, as ADR-0036 section 6 classifies it:
   `no_answer` when the turn did not consume its event (ADR-0036 section 7), `silent_done` for
@@ -368,6 +372,7 @@ Answers the adapter produces; each has the shape of one of these:
 | `valid/SessionStatus.running_with_turn.json` | `status` of a running session with a named turn |
 | `valid/TurnReport.completed.json` | `turn` or `last_turn` of an ended turn |
 | `valid/TurnReport.delivered.json` | `turn` or `last_turn` of an ended turn `inject` started, with its `delivery` |
+| `valid/TurnReport.quota_exhausted.json` | `turn` or `last_turn` of a turn that ended on quota, with its reset and `tools_ran` |
 | `valid/TurnReport.running.json` | `turn` of a running turn |
 | `valid/TurnReport.unknown.json` | `turn` of a turn the adapter does not hold |
 | `valid/Error.not_found.json` | `404` body |
@@ -386,7 +391,9 @@ Answers the adapter MUST NOT produce; the client refuses each:
 | `invalid/SessionKey.empty.json` | `session` has at least 1 character |
 | `invalid/RouteAlias.uppercase.json` | `route` matches `^[a-z][a-z0-9_-]{0,63}$` |
 | `invalid/TurnReport.missing_state.json` | `state` of a `turn` or `last_turn` is required |
+| `invalid/TurnReport.negative_resets_at.json` | `resets_at` is a Unix time, at least 0 |
 | `invalid/TurnReport.running_with_delivery.json` | `delivery` only on an `ended` turn |
+| `invalid/TurnReport.tools_ran_string.json` | `tools_ran` is a boolean |
 | `invalid/Delivery.delivered.json` | `delivered` is not a `Delivery` |
 | `invalid/TurnId.space.json` | a turn id matches `^[a-zA-Z0-9:._-]{1,128}$` |
 | `invalid/TurnState.finished.json` | `finished` is not a `TurnState` |

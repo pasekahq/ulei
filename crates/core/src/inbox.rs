@@ -442,16 +442,37 @@ impl Inbox {
             .into_iter()
             .find(|o| o.as_str() == outcome)
             .ok_or(Error::InvalidOutcome)?;
+        // Python writes the claimed row's `available`; while this lease is held it equals the
+        // stored column, because only `retry` and `ack` change it and both end the lease.
+        let deferred_until = (outcome == AckOutcome::Deferred).then_some(now + DEFER_SECONDS);
+        self.settle(id, lease, outcome, deferred_until)
+    }
+
+    /// `ack` `deferred` of the `processing` event `id` holding `lease`, available again at
+    /// `until` instead of `now +` [`DEFER_SECONDS`]. True when that row changed.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn defer(&mut self, id: &str, lease: &str, until: f64) -> Result<bool, Error> {
+        self.settle(id, lease, AckOutcome::Deferred, Some(until))
+    }
+
+    /// Settles the `processing` event `id` holding `lease` with `outcome`, and `available` when
+    /// given.
+    fn settle(
+        &mut self,
+        id: &str,
+        lease: &str,
+        outcome: AckOutcome,
+        available: Option<f64>,
+    ) -> Result<bool, Error> {
         let status = match outcome {
             AckOutcome::Success | AckOutcome::Silent => "done",
             AckOutcome::Uncertain | AckOutcome::Deferred => outcome.as_str(),
         };
-        // Python writes the claimed row's `available`; while this lease is held it equals the
-        // stored column, because only `retry` and `ack` change it and both end the lease.
-        let deferred_until = (outcome == AckOutcome::Deferred).then_some(now + DEFER_SECONDS);
         let changed = self.conn.execute(
             "UPDATE events SET status=?1,outcome=?2,available=coalesce(?3,available) WHERE id=?4 AND lease=?5 AND status='processing'",
-            params![status, outcome.as_str(), deferred_until, id, lease],
+            params![status, outcome.as_str(), available, id, lease],
         )?;
         Ok(changed == 1)
     }

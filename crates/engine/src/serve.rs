@@ -96,6 +96,10 @@ pub struct Ending {
     pub answer: Option<String>,
     /// The reactions its `react_to_message` calls recorded, in call order (ADR-0088).
     pub reactions: Vec<Reaction>,
+    /// Unix time of the nearest quota reset the gateway named for a `quota_exhausted` turn.
+    pub resets_at: Option<u64>,
+    /// Whether the turn ran a tool call; none when the runner does not know.
+    pub tools_ran: Option<bool>,
 }
 
 /// Why the socket could not be bound.
@@ -401,6 +405,8 @@ impl Running {
                 outcome: Some(ending.outcome),
                 ended: Some(ended),
                 line: ending.line,
+                resets_at: ending.resets_at,
+                tools_ran: ending.tools_ran,
                 delivery: None,
             },
             events,
@@ -1263,12 +1269,13 @@ fn drive(shared: &Shared, runner: &dyn Runner, mut input: Input, mut interrupt: 
             Err(payload) => panicked(payload.as_ref()),
             Ok(ending) if finished => ending,
             // An interrupted turn still hands over the reactions it recorded, as the reference
-            // set each one at its call.
+            // set each one at its call, and whether its tools ran.
             Ok(ending) => Ending {
                 outcome: TurnOutcome::Interrupted,
                 line: None,
                 answer: None,
-                reactions: ending.reactions,
+                resets_at: None,
+                ..ending
             },
         };
         let ended = now();
@@ -1310,6 +1317,8 @@ fn panicked(payload: &(dyn Any + Send)) -> Ending {
         line: Some(line),
         answer: None,
         reactions: Vec::new(),
+        resets_at: None,
+        tools_ran: None,
     }
 }
 
@@ -1497,6 +1506,8 @@ fn bare_report(turn: TurnId, state: TurnState) -> TurnReport {
         outcome: None,
         ended: None,
         line: None,
+        resets_at: None,
+        tools_ran: None,
         delivery: None,
     }
 }

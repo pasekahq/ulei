@@ -265,6 +265,25 @@ fn status(state: &str, delivery: Option<&str>) -> Reply {
     }))
 }
 
+/// The `status` answer of a `quota_exhausted` turn the channel reported `no_answer`, with
+/// `tools_ran` and `resets_at` when given.
+fn quota(tools_ran: Option<bool>, resets_at: Option<u64>) -> Reply {
+    let mut turn = json!({
+        "turn": TURN, "state": "ended", "outcome": "quota_exhausted", "ended": 2.0,
+        "delivery": "no_answer",
+    });
+    if let Some(tools_ran) = tools_ran {
+        turn["tools_ran"] = json!(tools_ran);
+    }
+    if let Some(resets_at) = resets_at {
+        turn["resets_at"] = json!(resets_at);
+    }
+    Reply::Ok(json!({
+        "session": SESSION, "running": false, "since": 1.0, "queue_depth": 0, "route": "main",
+        "turn": turn,
+    }))
+}
+
 /// A signed packet of `kind` with id `id` and `payload`.
 fn packet(id: &str, kind: &str, payload: &str) -> Value {
     sign(
@@ -419,6 +438,42 @@ fn no_answer_and_a_failed_send_ack_uncertain() {
             state(&row),
             ("uncertain", Some("uncertain"), 1),
             "{delivery}"
+        );
+        assert_eq!(row.available, 0.0);
+    }
+}
+
+#[test]
+fn a_step_free_quota_exhausted_turn_acks_deferred_until_its_reset() {
+    let (row, _) = settle("task_result", quota(Some(false), Some(1_893_474_000)));
+    assert_eq!(state(&row), ("deferred", Some("deferred"), 1));
+    assert_eq!(row.available, 1_893_474_000.0);
+}
+
+#[test]
+fn a_step_free_quota_exhausted_turn_without_a_reset_acks_deferred_for_an_hour() {
+    let (row, at) = settle("task_result", quota(Some(false), None));
+    assert_eq!(state(&row), ("deferred", Some("deferred"), 1));
+    assert!(
+        (at + 3600.0..at + 3600.0 + WAIT.as_secs_f64()).contains(&row.available),
+        "available {} after publish {at}",
+        row.available
+    );
+}
+
+#[test]
+fn a_quota_exhausted_turn_that_ran_a_tool_or_lacks_the_facts_acks_uncertain() {
+    for (tools_ran, resets_at) in [
+        (Some(true), Some(1_893_474_000)),
+        (Some(true), None),
+        (None, Some(1_893_474_000)),
+        (None, None),
+    ] {
+        let (row, _) = settle("task_result", quota(tools_ran, resets_at));
+        assert_eq!(
+            state(&row),
+            ("uncertain", Some("uncertain"), 1),
+            "{tools_ran:?} {resets_at:?}"
         );
         assert_eq!(row.available, 0.0);
     }

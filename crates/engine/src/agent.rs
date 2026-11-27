@@ -172,6 +172,16 @@ pub struct Compacted {
     pub after: usize,
 }
 
+impl Outcome {
+    /// Whether a step of the turn ran tool calls: a kept message carries their results.
+    pub fn tools_ran(&self) -> bool {
+        self.messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| b.r#type == BlockType::ToolResult)
+    }
+}
+
 /// The pieces a loop runs with.
 pub struct Agent<'a> {
     /// The qb gateway.

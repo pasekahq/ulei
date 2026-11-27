@@ -643,6 +643,8 @@ fn turn_ids_never_repeat_across_a_restart_and_last_turn_comes_from_the_journal()
             outcome: None,
             ended: None,
             line: None,
+            resets_at: None,
+            tools_ran: None,
             delivery: None,
         })
     );
@@ -692,6 +694,36 @@ fn a_quota_exhausted_turn_reports_the_line_run_prints() {
         format!("{}\n", report.line.unwrap()).into_bytes(),
         run.stderr
     );
+}
+
+#[test]
+fn a_quota_exhausted_turn_reports_its_reset_and_whether_a_tool_ran() {
+    let mut quota = gateway_error(ErrorClass::QuotaExhausted);
+    quota.resets_at = Some(1_700_000_000);
+    let (_fake, _dir, engine) = setup(vec![
+        Answer::Reject(429, quota.clone()),
+        tool_step(vec![call("c1", "terminal", json!({"command": "true"}))]),
+        Answer::Reject(429, quota),
+        Answer::Reject(429, gateway_error(ErrorClass::QuotaExhausted)),
+    ]);
+    let s = &engine.socket;
+    for (session, resets_at, tools_ran) in [
+        ("step-free", Some(1_700_000_000), false),
+        ("tool", Some(1_700_000_000), true),
+        ("no-reset", None, false),
+    ] {
+        let turn = prompt(s, session, "hi");
+        let report = ended(s, session, &turn);
+        assert_eq!(
+            (report.outcome, report.resets_at, report.tools_ran),
+            (
+                Some(TurnOutcome::QuotaExhausted),
+                resets_at,
+                Some(tools_ran)
+            ),
+            "{session}"
+        );
+    }
 }
 
 #[test]
@@ -796,6 +828,8 @@ impl Runner for Instantly {
             line: None,
             answer: None,
             reactions: Vec::new(),
+            resets_at: None,
+            tools_ran: None,
         }
     }
 }
@@ -1061,6 +1095,8 @@ fn unknown(turn: &str) -> TurnReport {
         outcome: None,
         ended: None,
         line: None,
+        resets_at: None,
+        tools_ran: None,
         delivery: None,
     }
 }
@@ -1697,6 +1733,8 @@ impl Runner for Lingering {
             line: None,
             answer: None,
             reactions: Vec::new(),
+            resets_at: None,
+            tools_ran: None,
         }
     }
 }
@@ -1779,6 +1817,8 @@ impl Runner for Panicking {
             line: None,
             answer: Some("next".to_owned()),
             reactions: Vec::new(),
+            resets_at: None,
+            tools_ran: None,
         }
     }
 }
@@ -1869,6 +1909,8 @@ impl Runner for Deciding {
             line: None,
             answer: None,
             reactions: Vec::new(),
+            resets_at: None,
+            tools_ran: None,
         }
     }
 }
@@ -1940,6 +1982,8 @@ impl Runner for Narrating {
             line: None,
             answer: Some("late".to_owned()),
             reactions: Vec::new(),
+            resets_at: None,
+            tools_ran: None,
         }
     }
 }
@@ -2395,6 +2439,8 @@ impl Runner for Sized {
             line: None,
             answer: Some("a".repeat(input.request.prompt.parse().unwrap())),
             reactions: Vec::new(),
+            resets_at: None,
+            tools_ran: None,
         }
     }
 }
@@ -2468,6 +2514,8 @@ impl Runner for Reacting {
                 message_id,
                 emoji: "👍".to_owned(),
             }],
+            resets_at: None,
+            tools_ran: None,
         }
     }
 }
