@@ -76,8 +76,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - The places bed (ADR-0080) is written only through `places::Bed`, one unit of work per call; a
   refusal is a `places::Refusal` and writes nothing. Its tables are the store's; a type is its
   `attr_policy` rows, and a key without a row of the place's type is refused. A place written by
-  name is the one bed place whose name or alias equals it, two or more are refused; without one,
-  it is the one place entity `Edge::name` finds when it has no bed row, otherwise a new entity.
+  name is found by the dedup rule, stated once in ADR-0080 section 6 and implemented once in
+  `places::Bed::place`: the same `osm_id`, else within `places::SAME_PLACE_M` with a similar
+  name, else, for a write with neither `osm_id` nor `location`, the one equal name or alias (two
+  or more refused). Without a match it is the one place entity `Edge::name` finds when it has no
+  bed row, otherwise a new entity, with a `bed_dup_pair` row for each near place of another name
+  and each similar name where either side has no location; the garden never settles a pair.
   A found place keeps its status on a `candidate` write and takes `active` or `gone`. A
   `bed_attr` row is the current value of its key with its own `checked_at`, `source` and
   `confidence`; `num` is the number of a `number` or `count` and the low end of a `range`, and

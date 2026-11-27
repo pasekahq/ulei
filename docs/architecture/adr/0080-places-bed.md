@@ -41,11 +41,9 @@ facts and to the bed would cross a wire.
 Relation to the rest of the garden:
 
 - Entities. Every bed row is a row of `entities` of the kind its type maps to (type `place`, kind
-  `place`). A bed write by name finds the one place of the bed whose name or alias is equal
-  after the store's normalisation, and refuses the name of two or more as `ambiguous_place`, so
-  a repeated write changes nothing; without one it names the place with `Edge::name`, called
-  read only: one place entity it finds without a bed row is adopted, otherwise a new entity is
-  written in the same unit of work. `entities.attrs` keeps `PlaceAttrs` (`osm_id`, `lat_lon`) in step with the bed. So a visit
+  `place`). A bed write by name finds its place by the dedup rule of section 6; without a match
+  it names the place with `Edge::name`, called read only: one place entity it finds without a
+  bed row is adopted, otherwise a new entity is written in the same unit of work. `entities.attrs` keeps `PlaceAttrs` (`osm_id`, `lat_lon`) in step with the bed. So a visit
   or a preference fact names the same id as the bed, and the id is `PlaceHit.id`.
 - Facts. Bed attributes and verdicts are not facts: they enter no `facts`, `fact_fts`,
   `fact_vectors`, seedbed, pointer, `search` answer, core profile or `garden_miss`;
@@ -404,13 +402,30 @@ key exist (section 8).
   `status_at`, and clears its `bed_recheck` rows. A gone place keeps its attributes and verdicts,
   so it is not suggested again, and is not rechecked. A closing date after now writes nothing.
 - Grooming never writes `bed_verdict` or `bed_profile`.
-- Dedup runs at every write of a new place (import, candidate): an existing place of the type with
-  the same `osm_id`, or within 75 m with a similar name (equal `name_norm`, else equal
-  `translit::key`, else a key one edit away when both have five characters or more, the edge's
-  rule), is the same place, and the write merges into it as observations. A place within 75 m with
-  another name, or of a similar name where either side has no location, is written as a new place
-  with a `bed_dup_pair` row, answered as `possible_duplicate` until settled. The garden settles no
-  pair by a model; settling is the owner's, through a later surface.
+- Dedup is the one rule by which a write that names its place by name (import, `places_write`,
+  `add-candidate`, `verdict --name`) finds it among the bed's places of its type, in the write's
+  unit of work. It reads the write's own `osm_id` and `location`, each the observation with the
+  latest `checked_at`; one that does not fit its form counts as absent. A name is similar to a
+  place's when it equals its name or an alias after the store's normalisation (`name_norm`),
+  else has an equal `translit::key`, else a key one edit away when both have five characters or
+  more, the edge's rule. In order:
+  1. a place whose current `osm_id` is the write's is the place, whatever its name or distance;
+  2. else, for a write with a `location`, the nearest place within 75 m (the haversine of
+     section 5) of a similar name is the place;
+  3. else, for a write with neither `osm_id` nor `location`, the one place whose name or alias
+     is equal is the place, and two or more are refused as `ambiguous_place`; the write names
+     one by id;
+  4. otherwise the write is a new place, adopted or created as section 1 says, with one
+     `bed_dup_pair` row (`a` before `b`) with each place within 75 m of another name, its
+     `distance_m` in whole metres, and with each place of a similar name where either side has
+     no location, without `distance_m`; `places_search` answers them `possible_duplicate` until
+     settled.
+  A place of a similar name more than 75 m away, both located, is another place, so the branches
+  of a chain stay apart and a write with a location finds the branch within 75 m of it. A found
+  place, answered `found`, takes the write's attributes as observations under the history and
+  status rules of section 2, and no place write touches `bed_verdict`. A repeated write finds the
+  place it wrote and writes nothing. The garden never settles a pair, and never by a model;
+  settling is the owner's, through a later surface.
 
 ### 7. Surface for the secretary
 

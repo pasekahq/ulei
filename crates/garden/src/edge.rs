@@ -1022,10 +1022,10 @@ impl<'a> Edge<'a> {
             .filter(|(_, k)| *k == want)
             .map(|(id, _)| id)
             .collect();
-        if ids.is_empty() && want.len() >= MIN_FUZZY_CHARS {
+        if ids.is_empty() {
             ids = keys
                 .iter()
-                .filter(|(_, k)| k.len() >= MIN_FUZZY_CHARS && within_one_edit(&want, k))
+                .filter(|(_, k)| one_edit_alike(&want, k))
                 .map(|(id, _)| id)
                 .collect();
         }
@@ -1532,6 +1532,12 @@ fn refusal(c: &c7::ProposeRequest) -> Option<Rejection> {
         return Some(Rejection::Invalid);
     }
     None
+}
+
+/// Whether transliterated names `a` and `b` both have [`MIN_FUZZY_CHARS`] characters or more and
+/// are at most one edit apart.
+pub(crate) fn one_edit_alike(a: &[char], b: &[char]) -> bool {
+    a.len() >= MIN_FUZZY_CHARS && b.len() >= MIN_FUZZY_CHARS && within_one_edit(a, b)
 }
 
 /// Whether `a` and `b` are at most one insertion, deletion or substitution apart.
