@@ -1,0 +1,8 @@
+{"entity":{"id":"ada","name":"Ada Example"}}
+{"earlier":{"ref":"f1","source":"owner","text":"Ada has a dog called Biscuit.","valid_from":"2025-03-01"}}
+{"earlier":{"ref":"f2","source":"owner","text":"Ада пьёт кофе.","valid_from":"2025-03-01"}}
+{"new":{"hints":["f1","f2"],"ref":"f9","source":"raw","text":"Ada keeps a dog named Biscuit.","valid_from":"2026-11-20"}}
+{"new":{"hints":["f2"],"ref":"f11","source":"raw","text":"Ada plays chess.","valid_from":"2026-11-20"}}
+{"entity":{"id":"bob","name":"Bob Example"}}
+{"earlier":{"ref":"f3","source":"owner","text":"Bob drinks coffee every morning.","valid_from":"2025-03-01"}}
+{"new":{"hints":["f3"],"ref":"f10","source":"raw","text":"Bob drinks only tea.","valid_from":"2026-11-20"}}

@@ -1496,7 +1496,10 @@ fn the_garden_core_profile_ends_every_prompt_as_it_stands_and_an_owner_turn_carr
 
     let tools = tool_names(&fake);
     assert_eq!(tools[5..13], LATER_TOOLS);
-    assert_eq!(tools[13..], ["garden_search", "garden_propose"]);
+    assert_eq!(
+        tools[13..],
+        ["garden_search", "garden_review", "garden_propose"]
+    );
 }
 
 /// A garden answering every `pointers` with one pointer to a fact about Anna.

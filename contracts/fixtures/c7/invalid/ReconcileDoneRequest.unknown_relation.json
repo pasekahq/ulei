@@ -1,0 +1,14 @@
+{
+  "judge": "j",
+  "items": [
+    {
+      "fact_id": "f-9",
+      "verdicts": [
+        {
+          "hint": "f-2",
+          "relation": "compatible"
+        }
+      ]
+    }
+  ]
+}

@@ -172,6 +172,7 @@ fn found() -> Vec<c7::Fact> {
         unprocessed: id.starts_with("seed:").then_some(true),
         disputed: None,
         conflicts_with: None,
+        conflict_note: None,
     };
     vec![
         fact("f:3", "The shed is painted green.", "c8:9"),

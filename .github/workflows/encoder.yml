@@ -164,3 +164,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/m" && ln -sf "$PWD/encoder-e5/model/model.ulei-infer" "$RUNNER_TEMP/m/model.ulei-infer"
           python3 ci/encoder_vectors.py target/release/ulei-garden-embed "$RUNNER_TEMP/m" \
             encoder-e5/ref/texts/synthetic-664.jsonl encoder-e5/ref/texts/synthetic-664.f32
+      # ADR-0096: the garden's related-fact hints on the real model, the frozen synthetic
+      # selection set of tests/fixtures/reconcile-eval: recall at 5 within 0.02 of the 0.886
+      # report E15 measured.
+      - name: Hint recall of the garden on the synthetic selection set
+        if: runner.os == 'Linux'
+        env:
+          ULEI_GARDEN_EVAL_MODEL: ${{ github.workspace }}/encoder-e5/model/model.ulei-infer
+        run: cargo test --locked -p ulei-garden --features native --test reconcile_eval -- --ignored --nocapture

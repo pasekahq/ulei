@@ -183,7 +183,7 @@ ALTER TABLE miss_outbox ADD COLUMN query TEXT;
 ALTER TABLE edge_proposal ADD COLUMN entity_candidates TEXT;
 ",
     // Facts the edge accepted without an attribute, with their candidate as C7 JSON, until the
-    // worker reconciles them with the facts most similar to them.
+    // night's judge weighs them against their hints (ADR-0096).
     r"
 CREATE TABLE reconcile_queue (
     fact TEXT PRIMARY KEY REFERENCES facts(id),
@@ -379,6 +379,66 @@ CREATE TABLE model_checks (
     CHECK ((passed_at IS NULL) = (digest IS NULL)),
     CHECK ((failed_at IS NULL) = (failure IS NULL))
 ) STRICT;
+",
+    // The night's judge (ADR-0096): a queued fact gets its hints, the earlier facts of its
+    // entity nearest to it, before the judge sees it; every verdict is a row of
+    // `reconcile_judgement` (the audit an undo reverses), a judged fact a row of
+    // `reconcile_judged`, a pair an undo keeps a row of `reconcile_kept`, and the anonymous
+    // counters of `health` rows of `reconcile_stats`. The open contradiction items the cosine
+    // rule wrote are withdrawn; their facts are not judged again.
+    r"
+ALTER TABLE reconcile_queue ADD COLUMN state TEXT NOT NULL DEFAULT 'waiting'
+    CHECK (state IN ('waiting', 'hinted'));
+CREATE TABLE reconcile_hint (
+    fact TEXT NOT NULL REFERENCES facts(id),
+    rank INTEGER NOT NULL CHECK (rank >= 1),
+    hint TEXT NOT NULL REFERENCES facts(id),
+    basis TEXT NOT NULL CHECK (basis IN ('dense', 'lexical')),
+    model TEXT,
+    computed_at INTEGER NOT NULL,
+    PRIMARY KEY (fact, rank),
+    CHECK ((basis = 'dense') = (model IS NOT NULL))
+) STRICT;
+CREATE TABLE reconcile_judged (
+    fact TEXT PRIMARY KEY REFERENCES facts(id),
+    judged_at INTEGER NOT NULL,
+    judge TEXT NOT NULL
+) STRICT;
+CREATE TABLE reconcile_judgement (
+    id INTEGER PRIMARY KEY,
+    fact TEXT NOT NULL REFERENCES facts(id),
+    hint TEXT NOT NULL REFERENCES facts(id),
+    entity TEXT NOT NULL REFERENCES entities(id),
+    relation TEXT NOT NULL CHECK (relation IN ('duplicate', 'supersedes', 'contradiction')),
+    applied TEXT NOT NULL
+        CHECK (applied IN ('merged', 'superseded', 'contradiction', 'not_applied', 'stale')),
+    note TEXT,
+    judge TEXT NOT NULL,
+    basis TEXT NOT NULL CHECK (basis IN ('dense', 'lexical')),
+    embedder TEXT,
+    at INTEGER NOT NULL,
+    proposal INTEGER REFERENCES edge_proposal(id),
+    restored TEXT REFERENCES facts(id),
+    undone_at INTEGER,
+    CHECK ((undone_at IS NULL) OR applied IN ('merged', 'superseded', 'contradiction'))
+) STRICT;
+CREATE INDEX reconcile_judgement_fact ON reconcile_judgement(fact);
+CREATE INDEX reconcile_judgement_changes ON reconcile_judgement(entity, id)
+    WHERE applied IN ('merged', 'superseded', 'contradiction');
+CREATE TABLE reconcile_kept (
+    a TEXT NOT NULL,
+    b TEXT NOT NULL,
+    kept_at INTEGER NOT NULL,
+    PRIMARY KEY (a, b),
+    CHECK (a < b)
+) STRICT;
+CREATE TABLE reconcile_stats (
+    name TEXT PRIMARY KEY,
+    n INTEGER NOT NULL CHECK (n >= 0)
+) STRICT;
+UPDATE edge_proposal SET status = 'withdrawn', candidate = NULL, entity_candidates = NULL,
+    resolved_at = CAST(strftime('%s', 'now') AS INTEGER)
+WHERE status = 'queued' AND reason = 'contradiction' AND fact_id IS NOT NULL;
 ",
 ];
 
@@ -1248,6 +1308,30 @@ impl Store {
         Ok(copies)
     }
 
+    /// Writes the closed version `id` back as a current copy recorded at `at`, with its valid
+    /// interval, vectors and pin (an undo of the night's judge, ADR-0096 section 4); returns the
+    /// copy's id. The closed version stays as it was, so `as_of` before `at` answers as before.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Invalid`] for a current one.
+    pub fn restore(&mut self, id: &FactId, at: UnixTime) -> Result<FactId, StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        let f =
+            load_fact(&tx, id)?.ok_or_else(|| StoreError::NotFound(format!("fact {}", id.0)))?;
+        if f.superseded_at.is_none() {
+            return invalid(format!("fact {}: still current", id.0));
+        }
+        let mut c = f.clone();
+        c.id = copy_id(&tx, &f.id, at)?;
+        c.recorded_at = at;
+        c.superseded_at = None;
+        c.superseded_by = None;
+        let copy = write_copy(&tx, &f.id, c)?;
+        tx.commit()?;
+        Ok(copy)
+    }
+
     /// The fact version with `id`, if any.
     ///
     /// # Errors
@@ -1274,6 +1358,25 @@ impl Store {
              ORDER BY f.valid_from, f.seq"
         );
         query_facts(&self.conn, &sql, params![valid_at, known_at, e.0])
+    }
+
+    /// How many facts about `e` hold at (`valid_at`, `known_at`), secrets and private ones
+    /// included.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn count_of(
+        &self,
+        e: &EntityId,
+        valid_at: UnixTime,
+        known_at: UnixTime,
+    ) -> Result<usize, StoreError> {
+        let sql = format!("SELECT count(*) FROM facts f WHERE f.entity = ?3 AND {HOLDS}");
+        let n: i64 = self
+            .conn
+            .query_row(&sql, params![valid_at, known_at, e.0], |r| r.get(0))?;
+        Ok(usize::try_from(n).unwrap_or(0))
     }
 
     /// Every version of every fact about `e`, oldest recorded first.
@@ -2343,10 +2446,9 @@ impl Store {
     /// 0) when none passed. Their facts are without a vector again and are embedded again once
     /// a sound model is back; the vectors computed before stay. Returns how many went.
     ///
-    /// The reconciliation decided from those vectors goes with them ([`withdraw_reconciled`]):
-    /// the open `contradiction` items it wrote since that start whose fact or rival loses its
-    /// vector are withdrawn, and their facts and the reconciled facts that lose their vector
-    /// wait in `reconcile_queue` again (ADR-0087 section 8).
+    /// The hints computed from those vectors go with them ([`withdraw_reconciled`]): the facts
+    /// that wait for the judge with dense hints computed since that start wait for their hints
+    /// again (ADR-0087 section 8 as ADR-0096 section 6 amends it).
     ///
     /// # Errors
     ///
@@ -2360,7 +2462,7 @@ impl Store {
             .optional()?
             .flatten();
         let since = since.unwrap_or(1).max(1);
-        withdraw_reconciled(&tx, since, at)?;
+        withdraw_reconciled(&tx, since)?;
         let n = tx.execute("DELETE FROM fact_vectors WHERE computed_at >= ?1", [since])?;
         tx.execute(
             "INSERT INTO model_checks (id, failed_at, failure) VALUES (1, ?1, ?2)
@@ -3216,108 +3318,23 @@ fn query_facts(
     rows.map(|r| decode_fact(r?)).collect()
 }
 
-/// The reconciliation decided from the vectors computed at or after `since`, which a failed
-/// check of the model file is about to drop, undone at `at` (review E13r, finding 2):
-///
-/// - an open `contradiction` item that `Edge::reconcile_similar` wrote (it names the reconciled
-///   fact in `fact_id`; the edge's own contradictions do not) at or after `since`, whose fact
-///   or rival has such a vector, is withdrawn: status `withdrawn`, no longer in the digest, and
-///   `resolve` answers it `not_open`; its fact, while current, waits in `reconcile_queue`
-///   again with the item's candidate;
-/// - every current fact that such a vector belongs to and that the edge queued for
-///   reconciliation when it accepted it (accepted by the edge itself, without an attribute and
-///   not secret) waits in `reconcile_queue` again, with a candidate made from the fact, since the
-///   candidate it was queued with is gone.
-///
-/// A fact already waiting keeps its row.
-fn withdraw_reconciled(c: &Connection, since: UnixTime, at: UnixTime) -> Result<(), StoreError> {
-    let dropped: std::collections::HashSet<String> = c
-        .prepare(
-            "SELECT DISTINCT f.id FROM fact_vectors v JOIN facts f ON f.seq = v.fact
-             WHERE v.computed_at >= ?1",
-        )?
-        .query_map([since], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
-    if dropped.is_empty() {
-        return Ok(());
-    }
-    let mut requeue = c.prepare(
-        "INSERT OR IGNORE INTO reconcile_queue (fact, candidate)
-         SELECT id, ?2 FROM facts WHERE id = ?1 AND superseded_at IS NULL",
+/// The hints computed from the vectors at or after `since`, which a failed check of the model
+/// file is about to drop, undone (review E13r, finding 2; ADR-0096 section 6): every fact
+/// waiting for the judge with dense hints computed since goes back to waiting for its hints,
+/// which are computed again from sound vectors. Judged facts stay judged: the judge read texts.
+fn withdraw_reconciled(c: &Connection, since: UnixTime) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE reconcile_queue SET state = 'waiting'
+         WHERE state = 'hinted' AND fact IN (SELECT fact FROM reconcile_hint
+             WHERE basis = 'dense' AND computed_at >= ?1)",
+        [since],
     )?;
-    let items: Vec<(i64, String, Option<String>, Option<String>)> = c
-        .prepare(
-            "SELECT id, fact_id, conflicts_with, candidate FROM edge_proposal
-             WHERE status = 'queued' AND reason = 'contradiction' AND fact_id IS NOT NULL
-               AND created_at >= ?1
-             ORDER BY id",
-        )?
-        .query_map([since], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
-        .collect::<Result<_, _>>()?;
-    for (id, fact, rival, candidate) in items {
-        if !dropped.contains(&fact) && rival.as_ref().is_none_or(|r| !dropped.contains(r)) {
-            continue;
-        }
-        c.execute(
-            "UPDATE edge_proposal SET status = 'withdrawn', candidate = NULL,
-             entity_candidates = NULL, resolved_at = ?2
-             WHERE id = ?1",
-            params![id, at],
-        )?;
-        let candidate = match candidate {
-            Some(candidate) => candidate,
-            None => match load_fact(c, &FactId(fact.clone()))? {
-                Some(f) => candidate_of(&f)?,
-                None => continue,
-            },
-        };
-        requeue.execute(params![fact, candidate])?;
-    }
-    let reconciled: Vec<String> = c
-        .prepare(
-            "SELECT DISTINCT f.id, f.seq FROM edge_proposal p JOIN facts f ON f.id = p.fact_id
-             WHERE p.status = 'accepted' AND p.reason IS NULL AND f.superseded_at IS NULL
-               AND f.attribute IS NULL AND f.sensitivity != 'secret'
-             ORDER BY f.seq",
-        )?
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
-    for id in reconciled {
-        if !dropped.contains(&id) {
-            continue;
-        }
-        if let Some(f) = load_fact(c, &FactId(id))? {
-            requeue.execute(params![f.id.0, candidate_of(&f)?])?;
-        }
-    }
+    c.execute(
+        "DELETE FROM reconcile_hint
+         WHERE fact IN (SELECT fact FROM reconcile_queue WHERE state = 'waiting')",
+        [],
+    )?;
     Ok(())
-}
-
-/// A candidate, as C7 JSON, that the edge would write as the fact `f`: its text, its entity by
-/// id, its source, times, lifetime type, confidence, domain and privacy.
-fn candidate_of(f: &Fact) -> Result<String, StoreError> {
-    #[allow(clippy::cast_precision_loss)]
-    let time = |t: UnixTime| t as f64;
-    let candidate = c7::ProposeRequest {
-        fact: f.text.clone(),
-        entity: Some(f.entity.0.clone()),
-        source_ref: f.provenance.source_ref.clone(),
-        valid_from: Some(time(f.valid_from)),
-        kind: None,
-        domain: f.domain.clone(),
-        attribute: None,
-        valid_to: f.valid_to.map(time),
-        source_kind: serde_json::from_value(Value::from(source_kind_str(f.provenance.kind))).ok(),
-        observed_at: Some(time(f.provenance.observed_at)),
-        confidence: Some(f64::from(f.confidence)),
-        ttl_kind: serde_json::from_value(Value::from(f.ttl.as_str())).ok(),
-        secret_ref: None,
-        private: matches!(f.sensitivity, Sensitivity::Private).then_some(true),
-        pin: None,
-    };
-    serde_json::to_string(&candidate).map_err(|e| StoreError::Corrupt(format!("{}: {e}", f.id.0)))
 }
 
 fn load_fact(c: &Connection, id: &FactId) -> Result<Option<Fact>, StoreError> {

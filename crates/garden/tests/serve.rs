@@ -341,7 +341,11 @@ fn every_method_round_trips_over_the_socket_and_the_store_outlives_a_restart() {
     .unwrap();
     assert_eq!(resolved.status, c7::ProposalStatus::Accepted);
 
-    let health: c7::Health = serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
+    let mut health: c7::Health =
+        serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
+    let counters = health.reconcile.take().expect("the judge's counters");
+    assert_eq!(counters.judged, 0);
+    assert_eq!(counters.latency.len(), 6);
     assert_eq!(
         health,
         c7::Health {
@@ -354,6 +358,7 @@ fn every_method_round_trips_over_the_socket_and_the_store_outlives_a_restart() {
             passages_skipped: None,
             passages_deferred: None,
             model_check: None,
+            reconcile: None,
         }
     );
 
@@ -940,17 +945,11 @@ fn the_recheck_schedule_is_read_from_the_config() {
 }
 
 #[test]
-fn the_reconcile_threshold_is_read_from_the_config() {
+fn the_old_reconcile_threshold_is_read_and_ignored() {
     let scratch = Scratch::new();
     let config = scratch.config_with("[garden.edge]\nreconcile_min_cosine = \"0.5\"\n");
     let edge = Settings::read(Some(&config)).unwrap().api.edge;
-    assert_eq!(
-        edge,
-        EdgeConfig {
-            reconcile_min_cosine: 0.5,
-            ..EdgeConfig::default()
-        }
-    );
+    assert_eq!(edge, EdgeConfig::default());
 }
 
 #[test]
@@ -1235,16 +1234,27 @@ fn bad_pointer_threshold_stops_the_start_with_one_line_naming_the_key() {
     }
 }
 
+/// The key of the cosine rule is accepted for one release whatever its value, with one stderr
+/// line, and the daemon starts (ADR-0096 section 7).
 #[test]
-fn bad_reconcile_threshold_stops_the_start_with_one_line_naming_the_key() {
+fn the_old_reconcile_threshold_starts_the_daemon_with_one_stderr_line() {
     let scratch = Scratch::new();
-    for value in ["\"1.5\"", "\"0.85x\"", "-1", "2"] {
-        refuses_start(
-            &scratch,
-            &format!("[garden.edge]\nreconcile_min_cosine = {value}\n"),
-            "garden.edge.reconcile_min_cosine",
-        );
-    }
+    let config = scratch.config_with("[garden.edge]\nreconcile_min_cosine = \"1.5\"\n");
+    let Started::Ready(mut daemon) = launch(&config) else {
+        panic!("daemon did not start");
+    };
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let line = "garden: garden.edge.reconcile_min_cosine is no longer read (ADR-0096); remove it";
+    assert_eq!(stderr.lines().filter(|l| *l == line).count(), 1, "{stderr}");
 }
 
 #[test]
@@ -2280,8 +2290,14 @@ fn forget_queues_current_facts_of_the_ref_and_of_the_records_proposals_and_undo_
         &json!({"items": [{"ref": clinic_record, "candidates": [placed]}]}),
     );
     let clinic = answer.items[0].outcomes[0].fact_id.clone().unwrap();
+    // The worker hints these facts (or lets them leave, alone in their entity) on its own
+    // thread; a forget adds nothing to the queue.
     let reconciling = reconcile_queue(&scratch);
-    assert_ne!(reconciling.len(), 0);
+    let unqueued = |scratch: &Scratch| {
+        reconcile_queue(scratch)
+            .iter()
+            .all(|row| reconciling.contains(row))
+    };
 
     let before = now();
     let request = json!({
@@ -2328,7 +2344,7 @@ fn forget_queues_current_facts_of_the_ref_and_of_the_records_proposals_and_undo_
         0,
         "a waiting row is not queued twice"
     );
-    assert_eq!(reconcile_queue(&scratch), reconciling);
+    assert!(unqueued(&scratch));
 
     night_takes(&scratch, &choir_record);
     let undo = json!({
@@ -2349,7 +2365,7 @@ fn forget_queues_current_facts_of_the_ref_and_of_the_records_proposals_and_undo_
         .map(|q| (q.fact.0, q.r#ref))
         .collect();
     assert_eq!(left, [(choir, choir_record)], "the night took it");
-    assert_eq!(reconcile_queue(&scratch), reconciling);
+    assert!(unqueued(&scratch));
 }
 
 #[test]
@@ -3451,4 +3467,97 @@ fn a_corrupted_refusal_without_the_engines_weight_file_stops_the_start() {
     };
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("model file corrupted"), "{stderr}");
+}
+
+/// The night judge's methods over the socket (ADR-0096): the daemon without an embedder hints
+/// new facts lexically on its worker; `reconcile_take` lists them, `reconcile_done` refuses an
+/// unknown fact (`not_found`) or a hint of another fact (`invalid_request`) before any item and
+/// merges a duplicate silently, `reconcile_review` lists the merge, `reconcile_undo` reverses
+/// it, and `health` counts it.
+#[test]
+fn the_judge_takes_hinted_facts_and_its_merge_is_reviewed_and_undone_over_the_socket() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let earlier = decided(
+        &socket,
+        &owner_fact("Ada Example", "Ada has a dog called Biscuit."),
+    )
+    .fact_id
+    .unwrap();
+    let new = decided(
+        &socket,
+        &owner_fact("Ada Example", "Ada keeps a dog named Biscuit."),
+    )
+    .fact_id
+    .unwrap();
+    let mut items = Vec::new();
+    for _ in 0..200 {
+        let take: c7::ReconcileTakeResponse =
+            serde_json::from_slice(&ok(&socket, "reconcile_take", &json!({}))).unwrap();
+        if !take.items.is_empty() {
+            items = take.items;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(items.len(), 1, "the worker hinted the new fact");
+    assert_eq!(items[0].fact.fact_id.as_deref(), Some(new.as_str()));
+    assert_eq!(items[0].hints[0].fact_id.as_deref(), Some(earlier.as_str()));
+
+    let verdict = |fact: &str, hint: &str| {
+        json!({"judge": "scripted judge-v1", "items": [{"fact_id": fact, "verdicts": [
+            {"hint": hint, "relation": "duplicate", "note": "same dog"}]}],
+            "stats": {"calls": 1, "tokens_in": 300, "tokens_out": 20}})
+    };
+    assert_eq!(
+        refused(post(
+            &socket,
+            "reconcile_done",
+            &verdict("f-none", &earlier)
+        )),
+        (404, c7::ErrorCode::NotFound)
+    );
+    assert_eq!(
+        refused(post(&socket, "reconcile_done", &verdict(&new, "f-none"))),
+        (400, c7::ErrorCode::InvalidRequest)
+    );
+    let answer: c7::ReconcileDoneResponse =
+        serde_json::from_slice(&ok(&socket, "reconcile_done", &verdict(&new, &earlier))).unwrap();
+    let outcome = &answer.items[0].outcomes[0];
+    assert_eq!(outcome.applied, c7::ReconcileApplied::Merged);
+    let digest: c7::DigestResponse =
+        serde_json::from_slice(&ok(&socket, "digest", &json!({}))).unwrap();
+    assert_eq!(digest.items.len(), 0, "a merge is silent");
+
+    let review: c7::ReconcileReviewResponse = serde_json::from_slice(&ok(
+        &socket,
+        "reconcile_review",
+        &json!({"entity": "ada-example", "relation": "duplicate"}),
+    ))
+    .unwrap();
+    assert_eq!(review.changes.len(), 1);
+    assert_eq!(review.changes[0].change_id, outcome.change_id.unwrap());
+    let undone: c7::ReconcileUndoResponse = serde_json::from_slice(&ok(
+        &socket,
+        "reconcile_undo",
+        &json!({"change_id": outcome.change_id.unwrap()}),
+    ))
+    .unwrap();
+    assert_eq!(undone.change.state, c7::ChangeState::Undone);
+    assert_eq!(
+        refused(post(&socket, "reconcile_undo", &json!({"change_id": 999}))),
+        (404, c7::ErrorCode::NotFound)
+    );
+    let health: c7::Health = serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
+    let counters = health.reconcile.unwrap();
+    assert_eq!(
+        (
+            counters.judged,
+            counters.applied.duplicate,
+            counters.undone.duplicate
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!((counters.judge_calls, counters.judge_tokens_in), (1, 300));
 }

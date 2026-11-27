@@ -5,8 +5,9 @@
 //! queue cleared, three sessions into candidates and forest records with a rerun sending nothing
 //! and a rerun of a session replacing its record, a failed session not stopping the walk and
 //! retried on later runs until given up, the
-//! spend limit stopping a run that the next run resumes, and a dry run sending and writing
-//! nothing.
+//! spend limit stopping a run that the next run resumes, a dry run sending and writing
+//! nothing, and the judge of stage d (ADR-0096): hinted facts in calls of whole entities into
+//! `reconcile_done` with its counts, a malformed answer leaving its facts, and its own budget.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -45,6 +46,10 @@ struct GardenState {
     closed: Vec<String>,
     /// Every `propose` request.
     proposed: Vec<c7::ProposeRequest>,
+    /// The facts waiting with their hints for the judge.
+    hinted: Vec<c7::ReconcileItem>,
+    /// Every `reconcile_done` request.
+    judged: Vec<c7::ReconcileDoneRequest>,
 }
 
 fn candidate(fact: &str, source_ref: &str) -> c7::ProposeRequest {
@@ -138,6 +143,51 @@ fn fake_garden(state: &Arc<Mutex<GardenState>>) -> FakeGateway {
             });
             let answer = json!({"proposal_id": format!("seed:{seq}"), "status": "seeded"});
             json_bytes(200, &serde_json::to_vec(&answer).unwrap())
+        }),
+    );
+    let s = Arc::clone(state);
+    fake.respond(
+        "POST /v1/reconcile_take",
+        Box::new(move |request| {
+            let take: c7::ReconcileTakeRequest = serde_json::from_slice(&request.body).unwrap();
+            let state = s.lock().unwrap();
+            let items: Vec<&c7::ReconcileItem> = state
+                .hinted
+                .iter()
+                .filter(|i| i.seq > take.after.unwrap_or(0))
+                .take(usize::try_from(take.limit.unwrap_or(50)).unwrap())
+                .collect();
+            json_bytes(200, &serde_json::to_vec(&json!({"items": items})).unwrap())
+        }),
+    );
+    let s = Arc::clone(state);
+    fake.respond(
+        "POST /v1/reconcile_done",
+        Box::new(move |request| {
+            let done: c7::ReconcileDoneRequest = serde_json::from_slice(&request.body).unwrap();
+            let mut state = s.lock().unwrap();
+            let mut items = Vec::new();
+            for item in &done.items {
+                state
+                    .hinted
+                    .retain(|h| h.fact.fact_id.as_deref() != Some(item.fact_id.as_str()));
+                let outcomes: Vec<Value> = item
+                    .verdicts
+                    .iter()
+                    .map(|v| {
+                        let applied = match v.relation {
+                            c7::ReconcileRelation::Duplicate => "merged",
+                            c7::ReconcileRelation::Supersedes => "superseded",
+                            c7::ReconcileRelation::Contradiction => "contradiction",
+                        };
+                        json!({"hint": v.hint, "relation": v.relation, "applied": applied,
+                            "change_id": 1})
+                    })
+                    .collect();
+                items.push(json!({"fact_id": item.fact_id, "outcomes": outcomes}));
+            }
+            state.judged.push(done);
+            json_bytes(200, &serde_json::to_vec(&json!({"items": items})).unwrap())
         }),
     );
     let s = Arc::clone(state);
@@ -309,6 +359,8 @@ impl Rig {
             max_tokens: 8_192,
             timeout: Duration::from_secs(10),
             seed_batch: 50,
+            judge_max_usd: 1.0,
+            judge_batch: 25,
             sources: vec!["old-runtime".to_owned()],
             separator: "/".to_owned(),
             roles: vec!["user".to_owned(), "assistant".to_owned()],
@@ -967,4 +1019,260 @@ fn a_failed_session_does_not_stop_the_walk_and_is_retried_until_given_up() {
         (0, 0, 0)
     );
     assert_eq!(forest_puts(&rig.archive).len(), 4);
+}
+
+/// A garden fact as `reconcile_take` gives it.
+fn garden_fact(id: &str, text: &str) -> c7::Fact {
+    serde_json::from_value(json!({"fact": text, "entity": "ada-example",
+        "valid_from": 1_764_115_200, "source_ref": "msg:1", "score": 0, "fact_id": id,
+        "source_kind": "owner"}))
+    .unwrap()
+}
+
+/// Queues `new` with its `hints` (id and text each) for the judge.
+fn hinted(
+    state: &Arc<Mutex<GardenState>>,
+    entity: &str,
+    new: (&str, &str),
+    hints: &[(&str, &str)],
+) {
+    let mut state = state.lock().unwrap();
+    let seq = state.hinted.len() as u64 + 1;
+    state.hinted.push(c7::ReconcileItem {
+        seq,
+        entity: entity.to_owned(),
+        entity_name: format!("{entity} name"),
+        fact: garden_fact(new.0, new.1),
+        hints: hints.iter().map(|(i, t)| garden_fact(i, t)).collect(),
+        basis: c7::HintBasis::Dense,
+        embedder: Some("e5".to_owned()),
+    });
+}
+
+fn three_hinted(rig: &Rig) {
+    hinted(
+        &rig.state,
+        "ada",
+        ("f9", "Ada keeps a dog named Biscuit."),
+        &[
+            ("f1", "Ada has a dog called Biscuit."),
+            ("f2", "Ada drinks coffee."),
+        ],
+    );
+    hinted(
+        &rig.state,
+        "bob",
+        ("f10", "Bob drinks only tea."),
+        &[("f3", "Bob drinks coffee every morning.")],
+    );
+    hinted(
+        &rig.state,
+        "ada",
+        ("f11", "Ada plays chess."),
+        &[("f2", "Ada drinks coffee.")],
+    );
+}
+
+fn judge_answer() -> String {
+    json!({"items": [
+        {"ref": "f9", "verdicts": [{"hint": "f1", "relation": "duplicate"}]},
+        {"ref": "f11", "verdicts": [{"hint": "f2", "relation": "compatible"}]},
+        {"ref": "f10", "verdicts": [{"hint": "f3", "relation": "contradiction",
+            "note": "tea only vs coffee every morning"}]}]})
+    .to_string()
+}
+
+#[test]
+fn the_judge_sends_hinted_facts_by_entity_and_hands_the_verdicts_and_its_counts_back() {
+    let rig = Rig::new(vec![turn(&judge_answer(), 1_200, 90)], Vec::new());
+    three_hinted(&rig);
+    let (stop, totals, path) = rig.run(&rig.settings(), &[Stage::Judge], None);
+    assert_eq!(stop, Stop::Done);
+    assert_eq!(rig.turns(), 1, "one call for the three facts");
+    let turn: Value = serde_json::from_slice(&rig.gateway.requests()[0].body).unwrap();
+    assert!(
+        turn["system"]
+            .as_str()
+            .unwrap()
+            .starts_with("You check new facts")
+    );
+    let prompt = turn["messages"][0]["content"][0]["text"].as_str().unwrap();
+    let firsts: Vec<String> = prompt
+        .lines()
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            v.as_object().unwrap().keys().next().unwrap().clone()
+        })
+        .collect();
+    assert_eq!(
+        firsts,
+        [
+            "entity", "earlier", "earlier", "new", "new", "entity", "earlier", "new"
+        ],
+        "ada's facts together, each earlier fact once"
+    );
+    let state = rig.state.lock().unwrap();
+    assert_eq!(state.judged.len(), 1);
+    let done = &state.judged[0];
+    assert_eq!(done.judge, "model-a judge-v1");
+    let verdicts: Vec<(&str, usize)> = done
+        .items
+        .iter()
+        .map(|i| (i.fact_id.as_str(), i.verdicts.len()))
+        .collect();
+    assert_eq!(verdicts, [("f9", 1), ("f11", 0), ("f10", 1)], "by entity");
+    assert_eq!(
+        done.items[2].verdicts[0].note.as_deref(),
+        Some("tea only vs coffee every morning")
+    );
+    let counts = done.stats.as_ref().unwrap();
+    assert_eq!(
+        (counts.calls, counts.tokens_in, counts.tokens_out),
+        (Some(1), Some(1_200), Some(90))
+    );
+    assert_eq!(state.hinted.len(), 0);
+    assert_eq!(
+        (totals.judged, totals.merged, totals.contradictions),
+        (3, 1, 1)
+    );
+    assert!(totals.judge_usd > 0.0);
+    assert!((totals.judge_usd - totals.usd).abs() < 1e-12);
+    let lines = report(path.as_ref().unwrap());
+    let judge = lines.iter().find(|l| l["type"] == "judge").unwrap();
+    assert_eq!(judge["outcome"], "done");
+    assert_eq!(judge["facts"], 3);
+    assert!(
+        !lines.iter().any(|l| l.to_string().contains("Biscuit")),
+        "the report holds counts, no fact text"
+    );
+}
+
+#[test]
+fn a_malformed_judge_answer_leaves_its_facts_and_counts_the_failure() {
+    let rig = Rig::new(
+        vec![turn("no json", 100, 10), turn("{\"items\": []}", 100, 10)],
+        Vec::new(),
+    );
+    three_hinted(&rig);
+    let (stop, totals, _) = rig.run(&rig.settings(), &[Stage::Judge], None);
+    assert_eq!(stop, Stop::Done);
+    assert_eq!(rig.turns(), 2);
+    assert_eq!((totals.judged, totals.judge_failures), (0, 1));
+    let state = rig.state.lock().unwrap();
+    assert_eq!(state.hinted.len(), 3, "the facts wait for the next night");
+    assert_eq!(state.judged.len(), 1, "only the counts were sent");
+    assert_eq!(state.judged[0].items, []);
+    let counts = state.judged[0].stats.as_ref().unwrap();
+    assert_eq!((counts.calls, counts.failures), (Some(2), Some(1)));
+}
+
+/// The judge spends from its own budget: an extraction budget of 0 does not stop it, and a
+/// judge budget of 0 leaves every hinted fact for the next night without a call.
+#[test]
+fn the_judge_has_a_budget_of_its_own() {
+    let rig = Rig::new(vec![turn(&judge_answer(), 1_200, 90)], Vec::new());
+    three_hinted(&rig);
+    seed(&rig.state, "Ada likes tea.", "c8:1");
+    let starved = Settings {
+        max_usd: 0.0,
+        ..rig.settings()
+    };
+    let (stop, totals, _) = rig.run(&starved, &[Stage::Seedbed, Stage::Judge], None);
+    assert_eq!(stop, Stop::SpendLimit, "stage a met its limit");
+    assert_eq!(totals.taken, 0);
+    assert_eq!(totals.judged, 3, "the judge ran on its own budget");
+
+    let rig = Rig::new(vec![], Vec::new());
+    three_hinted(&rig);
+    let none = Settings {
+        judge_max_usd: 0.0,
+        ..rig.settings()
+    };
+    let (stop, totals, _) = rig.run(&none, &[Stage::Judge], None);
+    assert_eq!(stop, Stop::SpendLimit);
+    assert_eq!((rig.turns(), totals.judged), (0, 0));
+    assert_eq!(rig.state.lock().unwrap().hinted.len(), 3);
+}
+
+#[test]
+fn a_dry_run_estimates_the_judge_and_sends_nothing() {
+    let rig = Rig::new(vec![], Vec::new());
+    three_hinted(&rig);
+    let options = Options {
+        dry_run: true,
+        stages: vec![Stage::Judge],
+        limit_sessions: None,
+    };
+    let mut out = Vec::new();
+    let (stop, _, path) = night::run(&rig.settings(), &options, None, &mut out);
+    assert_eq!(stop, Stop::Done);
+    assert_eq!(path, None);
+    let line: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(line["stage"], "d");
+    assert_eq!(
+        (line["items"].as_u64(), line["calls"].as_u64()),
+        (Some(3), Some(1))
+    );
+    assert_eq!(rig.turns(), 0);
+    assert_eq!(rig.state.lock().unwrap().judged.len(), 0);
+}
+
+/// The judge's prompt lines are the ones `ci/judge_eval.py` renders for the judge eval: both
+/// sides are checked against the same golden file, so the eval scores the prompt the night
+/// sends (ADR-0096).
+#[test]
+fn the_judge_prompt_matches_the_eval_runners_golden_file() {
+    let at = |date: &str| match date {
+        "earlier" => 1_740_787_200.0,
+        _ => 1_795_132_800.0,
+    };
+    let fact = |id: &str, text: &str, side: &str| -> c7::Fact {
+        serde_json::from_value(json!({"fact": text, "entity": "x", "valid_from": at(side),
+            "source_ref": "msg:1", "score": 0, "fact_id": id,
+            "source_kind": if side == "earlier" { "owner" } else { "raw" }}))
+        .unwrap()
+    };
+    let item = |seq: u64, entity: &str, name: &str, new: (&str, &str), hints: &[(&str, &str)]| {
+        c7::ReconcileItem {
+            seq,
+            entity: entity.to_owned(),
+            entity_name: name.to_owned(),
+            fact: fact(new.0, new.1, "new"),
+            hints: hints.iter().map(|(i, t)| fact(i, t, "earlier")).collect(),
+            basis: c7::HintBasis::Dense,
+            embedder: None,
+        }
+    };
+    let items = [
+        item(
+            1,
+            "ada",
+            "Ada Example",
+            ("f9", "Ada keeps a dog named Biscuit."),
+            &[
+                ("f1", "Ada has a dog called Biscuit."),
+                ("f2", "Ада пьёт кофе."),
+            ],
+        ),
+        item(
+            2,
+            "bob",
+            "Bob Example",
+            ("f10", "Bob drinks only tea."),
+            &[("f3", "Bob drinks coffee every morning.")],
+        ),
+        item(
+            3,
+            "ada",
+            "Ada Example",
+            ("f11", "Ada plays chess."),
+            &[("f2", "Ада пьёт кофе.")],
+        ),
+    ];
+    let golden = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/judge-prompt.txt"),
+    )
+    .unwrap();
+    let batch: Vec<&c7::ReconcileItem> = items.iter().collect();
+    assert_eq!(night::judge::render(&batch), golden);
 }

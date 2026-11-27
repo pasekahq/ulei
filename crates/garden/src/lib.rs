@@ -18,6 +18,7 @@ pub mod client;
 pub mod edge;
 pub mod embed;
 pub mod eval;
+pub mod judge;
 pub mod matrix;
 pub mod miss;
 pub mod model;

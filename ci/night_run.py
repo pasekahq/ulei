@@ -16,7 +16,11 @@ there, and ``ulei-engine night`` of RELEASE_DIR against them, and checks:
   that ``forest_search`` finds with their span and links, tool output is left out, a rerun sends
   nothing, and a forest record forgotten through ``forest_forget`` leaves the search;
 - the spend limit stops a run after the call that reaches it, and the next run sends only the
-  rest.
+  rest;
+- stage d (ADR-0096): facts without an attribute get lexical hints from the garden's worker, the
+  judge's verdicts merge a duplicate into the earlier fact silently and record a contradiction
+  with its reason for the digest, `reconcile_review` lists both, `reconcile_undo` brings the
+  merged fact back, and `health` counts it all.
 
 Its passed checks fold into one notice; a failed check is an error annotation of its own.
 Synthetic data only.
@@ -31,6 +35,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from annotations import Notices, annotate
@@ -46,7 +51,8 @@ SESSION_AT = 1_700_000_000
 
 class FakeGateway:
     """A C4G gateway that answers every turn from the prompt: in stage a one candidate per
-    record of a known text, in stage c one candidate from message 1 and a summary. In
+    record of a known text, in stage c one candidate from message 1 and a summary, in stage d
+    a duplicate of a dog fact and a contradiction of coffee with tea. In
     ``malformed`` mode it answers text that is no JSON. Each turn reports ``input`` tokens."""
 
     def __init__(self, path: Path) -> None:
@@ -96,6 +102,8 @@ class FakeGateway:
             text = "I could not decide."
         elif request["system"].startswith("You sort notes"):
             text = json.dumps(seed_answer(prompt))
+        elif request["system"].startswith("You check new facts"):
+            text = json.dumps(judge_answer(prompt))
         else:
             text = json.dumps(history_answer(prompt))
         events = [
@@ -125,6 +133,10 @@ KNOWN = {
     "Ada Example lives at 9 Sample Road.": ("Ada Example", "person", "address", 0.9),
     "Cafe Moss might close at 18:00.": ("Cafe Moss", "place", "opening_hours", 0.3),
     "Tobin Marsh works at Heron Labs.": ("Tobin Marsh", "person", "employer", 0.9),
+    "Wren Hollis has a dog called Biscuit.": ("Wren Hollis", "person", None, 0.9),
+    "Wren Hollis keeps a dog named Biscuit.": ("Wren Hollis", "person", None, 0.9),
+    "Wren Hollis drinks only tea.": ("Wren Hollis", "person", None, 0.9),
+    "Wren Hollis drinks coffee every morning.": ("Wren Hollis", "person", None, 0.9),
 }
 
 
@@ -136,10 +148,33 @@ def seed_answer(prompt: str) -> dict:
         candidates = []
         if known:
             entity, kind, attribute, confidence = known
-            candidates.append({"entity": entity, "kind": kind, "fact": record["text"],
-                               "attribute": attribute, "confidence": confidence})
+            candidate = {"entity": entity, "kind": kind, "fact": record["text"],
+                         "confidence": confidence}
+            if attribute:
+                candidate["attribute"] = attribute
+            candidates.append(candidate)
         records.append({"ref": record["ref"], "candidates": candidates})
     return {"records": records}
+
+
+def judge_answer(prompt: str) -> dict:
+    """Stage d: a new dog fact duplicates the earlier one, coffee contradicts tea."""
+    earlier, items = {}, []
+    for line in prompt.splitlines():
+        row = json.loads(line)
+        if "earlier" in row:
+            earlier[row["earlier"]["ref"]] = row["earlier"]["text"]
+        elif "new" in row:
+            new, verdicts = row["new"], []
+            for hint in new["hints"]:
+                text = earlier[hint]
+                if "keeps a dog" in new["text"] and "dog called" in text:
+                    verdicts.append({"hint": hint, "relation": "duplicate"})
+                elif "coffee" in new["text"] and "tea" in text:
+                    verdicts.append({"hint": hint, "relation": "contradiction",
+                                     "note": "coffee every morning vs only tea"})
+            items.append({"ref": new["ref"], "verdicts": verdicts})
+    return {"items": items}
 
 
 def history_answer(prompt: str) -> dict:
@@ -376,6 +411,55 @@ def spend(bed: Bed) -> str:
             f"run sent the third only")
 
 
+def judge(bed: Bed) -> str:
+    for n, text in enumerate(("Wren Hollis has a dog called Biscuit.",
+                              "Wren Hollis keeps a dog named Biscuit.",
+                              "Wren Hollis drinks only tea.",
+                              "Wren Hollis drinks coffee every morning."), start=201):
+        bed.propose(text, f"c8:{n}")
+    _, total = bed.night("--stage", "a")
+    if total["accepted"] != 4:
+        raise Failure(f"stage a before the judge: {total}")
+    # The garden's worker hints the three later facts lexically on its own thread.
+    deadline = time.monotonic() + 30
+    while len(bed.garden("reconcile_take", {})["items"]) < 3:
+        if time.monotonic() > deadline:
+            raise Failure(f"hinted facts: {bed.garden('reconcile_take', {})}")
+        time.sleep(0.1)
+    before = bed.gateway.count()
+    _, total = bed.night("--stage", "d")
+    if bed.gateway.count() - before != 1:
+        raise Failure(f"stage d made {bed.gateway.count() - before} calls")
+    if (total["judged"], total["merged"], total["contradictions"]) != (3, 1, 1):
+        raise Failure(f"stage d totals: {total}")
+    dogs = [f for f in bed.facts("Wren Hollis dog Biscuit") if "dog" in f["fact"]]
+    if [f["fact"] for f in dogs] != ["Wren Hollis has a dog called Biscuit."] \
+            or dogs[0].get("proof_count") != 2:
+        raise Failure(f"the merge kept the earlier wording with a proof: {dogs}")
+    digest = [i for i in bed.garden("digest", {})["items"] if "Wren" in json.dumps(i)]
+    if len(digest) != 1 or digest[0].get("note") != "coffee every morning vs only tea":
+        raise Failure(f"the contradiction in the digest: {digest}")
+    coffee = [f for f in bed.facts("Wren Hollis coffee") if "coffee" in f["fact"]]
+    if not coffee or not coffee[0].get("disputed") or not coffee[0].get("conflict_note"):
+        raise Failure(f"search does not mark the contradiction: {coffee}")
+    changes = bed.garden("reconcile_review", {})["changes"]
+    kinds = sorted(c["applied"] for c in changes)
+    if kinds != ["contradiction", "merged"] or not all(c["judge"].endswith("judge-v1")
+                                                       for c in changes):
+        raise Failure(f"review: {changes}")
+    merge = next(c for c in changes if c["applied"] == "merged")
+    undone = bed.garden("reconcile_undo", {"change_id": merge["change_id"]})["change"]
+    dogs = [f for f in bed.facts("Wren Hollis dog Biscuit") if "dog" in f["fact"]]
+    if undone["state"] != "undone" or len(dogs) != 2:
+        raise Failure(f"undo: {undone}")
+    counters = bed.garden("health", {})["reconcile"]
+    if (counters["judged"], counters["undone"]["duplicate"], counters["judge_calls"]) != (3, 1, 1):
+        raise Failure(f"health counters: {counters}")
+    return (f"stage d: 3 hinted facts in 1 call, a duplicate merged silently and undone, a "
+            f"contradiction in the digest with its reason; tokens {total['tokens_in']}/"
+            f"{total['tokens_out']}")
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: night_run.py RELEASE_DIR WORKDIR", file=sys.stderr)
@@ -391,6 +475,7 @@ def main(argv: list[str]) -> int:
         for title, probe in (
             ("dry run", dry_run), ("stage a", seedbed), ("malformed answer", malformed),
             ("stage b", forget), ("stage c", history), ("spend limit", spend),
+            ("stage d", judge),
         ):
             ok = notices.check(FOLD, f"night {title}", lambda probe=probe: probe(bed))
             passed &= ok

@@ -1,10 +1,12 @@
 //! The night gardener, `ulei-engine night` (ADR-0078): once per run it clears the facts the
 //! garden's forget queue reaches (stage b), sorts the seedbed through the extraction model into
-//! the garden's edge (stage a), and sorts the history of the configured archive sources session
-//! by session (stage c). It is an owner-designed addition, not a port.
+//! the garden's edge (stage a), sorts the history of the configured archive sources session
+//! by session (stage c), and judges the new facts the garden hinted against their earlier ones
+//! (stage d, ADR-0096). It is an owner-designed addition, not a port.
 
 pub mod client;
 pub mod extract;
+pub mod judge;
 pub mod render;
 pub mod spend;
 pub mod stages;
@@ -73,6 +75,16 @@ pub const SEED_BATCH: Setting = Setting {
     key: "night.seed_batch",
     env: "ULEI_NIGHT_SEED_BATCH",
 };
+/// Most USD the judge of stage d spends in one run, a budget of its own.
+pub const JUDGE_MAX_USD: Setting = Setting {
+    key: "night.judge_max_usd",
+    env: "ULEI_NIGHT_JUDGE_MAX_USD",
+};
+/// New facts per judge call.
+pub const JUDGE_BATCH: Setting = Setting {
+    key: "night.judge_batch",
+    env: "ULEI_NIGHT_JUDGE_BATCH",
+};
 /// The archive sources of stage c.
 pub const SOURCES: Setting = Setting {
     key: "night.sources",
@@ -110,6 +122,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 pub const DEFAULT_SEED_BATCH: usize = 20;
 /// Most records of one seedbed page and so of one batch.
 pub const MAX_SEED_BATCH: usize = 100;
+/// Default [`JUDGE_MAX_USD`] (ADR-0096 section 3).
+pub const DEFAULT_JUDGE_MAX_USD: f64 = 0.5;
+/// Default [`JUDGE_BATCH`].
+pub const DEFAULT_JUDGE_BATCH: usize = 25;
+/// Most new facts of one judge call, and of one `reconcile_take` page.
+pub const MAX_JUDGE_BATCH: usize = 100;
 /// Default [`SEPARATOR`].
 pub const DEFAULT_SEPARATOR: &str = "/";
 /// Default [`ROLES`].
@@ -144,6 +162,10 @@ pub struct Settings {
     pub timeout: Duration,
     /// Seedbed records per call.
     pub seed_batch: usize,
+    /// The judge's own spend limit of a run in USD.
+    pub judge_max_usd: f64,
+    /// New facts per judge call.
+    pub judge_batch: usize,
     /// The archive sources of stage c, in order.
     pub sources: Vec<String>,
     /// The separator of an entry's `external_id`.
@@ -213,6 +235,12 @@ impl Settings {
         if seed_batch > MAX_SEED_BATCH {
             return Err(invalid(SEED_BATCH, "must be 1 to 100"));
         }
+        let judge_max_usd = usd(JUDGE_MAX_USD, DEFAULT_JUDGE_MAX_USD)?;
+        let judge_batch =
+            config.positive(JUDGE_BATCH, env(JUDGE_BATCH.env), DEFAULT_JUDGE_BATCH)?;
+        if judge_batch > MAX_JUDGE_BATCH {
+            return Err(invalid(JUDGE_BATCH, "must be 1 to 100"));
+        }
         let sources = config.names(SOURCES, env(SOURCES.env));
         if sources.iter().any(|s| !is_source(s)) {
             return Err(invalid(SOURCES, "must list archive source names"));
@@ -242,6 +270,8 @@ impl Settings {
             max_tokens,
             timeout,
             seed_batch,
+            judge_max_usd,
+            judge_batch,
             sources,
             separator,
             roles,

@@ -637,54 +637,72 @@ pub fn fuse<T: Clone + Eq + Hash + Ord>(
     )
 }
 
-/// The `k` facts about the entity of `fact`, other than it, that hold at (`valid_at`,
-/// `known_at`) and are most like it, private ones included: RRF of the lexical ranking for its
-/// text and the dense ranking by cosine to its own vector of `model` (none while it has no such
-/// vector), each with that cosine when it is a dense candidate.
+/// How the hints of a fact were ranked (ADR-0096 section 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Basis {
+    /// By cosine of the stored vectors of the embedder's model.
+    Dense,
+    /// By the entity-filtered lexical ranking of the fact's text.
+    Lexical,
+}
+
+impl Basis {
+    /// The stored and wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dense => "dense",
+            Self::Lexical => "lexical",
+        }
+    }
+}
+
+/// The `k` facts about the entity of `fact` nearest to it that hold at (`valid_at`,
+/// `known_at`), other than it and other than those `skip` names, private ones included, best
+/// first (ADR-0096 section 1). With a vector of `model` for `fact` they are ranked by cosine
+/// of the stored vectors of `model`, ties by id, with no threshold and no lexical ranking
+/// (a fact without such a vector is not ranked); otherwise, and always without `model`, by
+/// the entity-filtered lexical ranking of its text.
 ///
 /// # Errors
 ///
 /// [`SearchError`] when the store fails.
-pub fn similar(
+pub fn nearest(
     store: &Store,
     fact: &Fact,
-    model: &str,
+    model: Option<&str>,
     k: usize,
     valid_at: UnixTime,
     known_at: UnixTime,
-) -> Result<Vec<(FactId, Option<f32>)>, SearchError> {
-    let p = SearchParams {
-        k,
-        known_at,
-        include_private: true,
-        ..SearchParams::at(valid_at)
-    };
+    skip: &dyn Fn(&FactId) -> bool,
+) -> Result<(Vec<FactId>, Basis), SearchError> {
+    if let Some(model) = model {
+        let vectors = store.vectors_of(&fact.entity, model, valid_at, known_at)?;
+        if let Some((_, own)) = vectors.iter().find(|(id, _)| *id == fact.id) {
+            let mut dense: Vec<(&FactId, f32)> = vectors
+                .iter()
+                .filter(|(id, _)| *id != fact.id && !skip(id))
+                .map(|(id, v)| (id, dot(own, v)))
+                .collect();
+            dense.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            let ids = dense
+                .into_iter()
+                .take(k)
+                .map(|(id, _)| id.clone())
+                .collect();
+            return Ok((ids, Basis::Dense));
+        }
+    }
+    let held = store.count_of(&fact.entity, valid_at, known_at)?;
     let query = clean_query(&bounded_query(&fact.text));
-    let mut lexical =
-        store.lexical_of(&fact.entity, &query, p.candidates + 1, valid_at, known_at)?;
-    lexical.retain(|(id, _)| *id != fact.id);
-    lexical.truncate(p.candidates);
-    let vectors = store.vectors_of(&fact.entity, model, valid_at, known_at)?;
-    let mut dense: Vec<(FactId, f32)> = match vectors.iter().find(|(id, _)| *id == fact.id) {
-        Some((_, own)) => vectors
-            .iter()
-            .filter(|(id, _)| *id != fact.id)
-            .map(|(id, v)| (id.clone(), dot(own, v)))
-            .collect(),
-        None => Vec::new(),
-    };
-    dense.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    dense.truncate(p.candidates);
-    let cosine: HashMap<&FactId, f32> = dense.iter().map(|(id, s)| (id, *s)).collect();
-    let mut hits = fuse(&dense, &lexical, &p)?;
-    hits.truncate(k);
-    Ok(hits
+    let ids = store
+        .lexical_of(&fact.entity, &query, held + 1, valid_at, known_at)?
         .into_iter()
-        .map(|(id, _)| {
-            let cos = cosine.get(&id).copied();
-            (id, cos)
-        })
-        .collect())
+        .map(|(id, _)| id)
+        .filter(|id| *id != fact.id && !skip(id))
+        .take(k)
+        .collect();
+    Ok((ids, Basis::Lexical))
 }
 
 /// Embeds every fact of [`Store::missing_vectors`] for `embedder`'s model, `batch` texts at a

@@ -946,6 +946,7 @@ fn a_record_is_found_as_an_unprocessed_fact_until_its_expiry_and_then_the_questi
             unprocessed: Some(true),
             disputed: None,
             conflicts_with: None,
+            conflict_note: None,
         }
     );
 

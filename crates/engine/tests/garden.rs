@@ -19,7 +19,9 @@ use serde_json::{Value, json};
 use ulei_engine::garden::{self, POINTERS_DEADLINE};
 use ulei_engine::policy::Origin;
 use ulei_engine::prompt::garden::{CoreProfile, pointers, with_core_block};
-use ulei_engine::tools::{Context, GardenPropose, GardenSearch, Interrupt, Output, Registry};
+use ulei_engine::tools::{
+    Context, GardenPropose, GardenReview, GardenSearch, Interrupt, Output, Registry,
+};
 use ulei_engine::wire::c7;
 
 fn fact(text: &str) -> c7::Fact {
@@ -41,6 +43,7 @@ fn fact(text: &str) -> c7::Fact {
         unprocessed: None,
         disputed: None,
         conflicts_with: None,
+        conflict_note: None,
     }
 }
 
@@ -76,6 +79,9 @@ fn call(fake: &FakeGateway, origin: Origin, name: &str, input: Value) -> Output 
     let mut registry = Registry::new();
     registry
         .register(Box::new(GardenSearch::new(client.clone())))
+        .unwrap();
+    registry
+        .register(Box::new(GardenReview::new(client.clone())))
         .unwrap();
     registry
         .register(Box::new(GardenPropose::new(client, origin)))
@@ -639,4 +645,42 @@ fn a_proposed_fact_is_an_unprocessed_record_garden_search_and_pointers_find_in_t
         "{context}"
     );
     assert!(!context.contains("lantern"), "{context}");
+}
+
+/// `garden_review` reads C7 `reconcile_review` with its filters and shows each change with
+/// both facts, the reviewer's reason and its state, and the page's continuation (ADR-0096).
+#[test]
+fn garden_review_lists_the_judges_changes_with_both_facts_and_its_reason() {
+    let body = json!({"changes": [{"change_id": 4, "at": 1_700_000_000, "entity": "shed",
+        "entity_name": "Shed", "relation": "contradiction", "applied": "contradiction",
+        "state": "open", "new": {"fact_id": "f:9", "fact": "The shed is blue."},
+        "earlier": {"fact_id": "f:3", "fact": "The shed is red."}, "note": "blue vs red",
+        "judge": "model-a judge-v1", "basis": "dense", "proposal_id": "p31"}], "next": 4});
+    let fake = garden_answering("POST /v1/reconcile_review", 200, &body);
+    let out = call(
+        &fake,
+        Origin::TopLevelOwner,
+        "garden_review",
+        json!({"relation": "contradiction", "open": true, "limit": 500}),
+    );
+    let answer = ok(&out);
+    let change = &answer["changes"][0];
+    assert_eq!(change["change"], 4);
+    assert_eq!(change["entity"], "Shed");
+    assert_eq!(change["state"], "open");
+    assert_eq!(change["new"], "The shed is blue.");
+    assert_eq!(change["earlier_ref"], "f:3");
+    assert_eq!(change["why"], "blue vs red");
+    assert_eq!(answer["next_before"], 4);
+    assert_eq!(
+        bodies(&fake),
+        [json!({"relation": "contradiction", "open": true, "limit": 50})]
+    );
+    let refused = call(
+        &fake,
+        Origin::TopLevelOwner,
+        "garden_review",
+        json!({"relation": "same"}),
+    );
+    assert!(error(&refused).contains("relation must be"), "{refused:?}");
 }

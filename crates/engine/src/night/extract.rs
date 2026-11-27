@@ -155,7 +155,7 @@ pub fn seed_line(record: &SeedRecord) -> String {
 }
 
 /// The JSON object of a model answer: the text itself, or the body of one code fence around it.
-fn object(text: &str) -> Result<Map<String, Value>, Malformed> {
+pub(crate) fn object(text: &str) -> Result<Map<String, Value>, Malformed> {
     let mut text = text.trim();
     if let Some(rest) = text.strip_prefix("```") {
         let body = rest.split_once('\n').map_or("", |(_, body)| body);
@@ -173,7 +173,11 @@ fn object(text: &str) -> Result<Map<String, Value>, Malformed> {
 }
 
 /// `map` has only keys of `allowed`.
-fn only(map: &Map<String, Value>, allowed: &[&str], what: Malformed) -> Result<(), Malformed> {
+pub(crate) fn only(
+    map: &Map<String, Value>,
+    allowed: &[&str],
+    what: Malformed,
+) -> Result<(), Malformed> {
     if map.keys().all(|k| allowed.contains(&k.as_str())) {
         Ok(())
     } else {
@@ -349,6 +353,8 @@ pub struct Reply {
     pub stop: StopReason,
     /// The last usage event, when the gateway sent one.
     pub usage: Option<Usage>,
+    /// The vendor model that answered, from the route event, when the gateway sent one.
+    pub model: Option<String>,
 }
 
 /// Why a call gave no answer.
@@ -358,12 +364,14 @@ pub enum CallError {
     Gateway(String),
     /// The input does not fit the model; this batch or session fails, the run goes on.
     TooLong(String),
+    /// The call timed out; the run stops as for [`CallError::Gateway`], counted apart.
+    Timeout(String),
 }
 
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Gateway(e) | Self::TooLong(e) => f.write_str(e),
+            Self::Gateway(e) | Self::TooLong(e) | Self::Timeout(e) => f.write_str(e),
         }
     }
 }
@@ -438,25 +446,28 @@ impl Model for Gateway {
             request_id: format!("night-{}-{}", self.run, self.calls),
         };
         let deadline = Instant::now() + self.timeout;
-        let mut turn = self
-            .client
-            .turn(&request)
-            .map_err(|e| CallError::Gateway(format!("gateway: {e}")))?;
+        let mut turn = self.client.turn(&request).map_err(|e| match e {
+            gateway::Error::Timeout => CallError::Timeout(format!("gateway: {e}")),
+            e => CallError::Gateway(format!("gateway: {e}")),
+        })?;
         turn.set_deadline(deadline);
-        let (mut text, mut usage) = (String::new(), None);
+        let (mut text, mut usage, mut model) = (String::new(), None, None);
         for event in turn {
             let event = event.map_err(|e| match e {
                 gateway::Error::Rejected { error, .. } => gateway_error(&error),
+                gateway::Error::Timeout => CallError::Timeout(format!("gateway: {e}")),
                 e => CallError::Gateway(format!("gateway: {e}")),
             })?;
             match event.r#type {
                 EventType::TextDelta => text.push_str(event.text.as_deref().unwrap_or_default()),
                 EventType::Usage => usage = event.usage,
+                EventType::Route => model = event.route.map(|r| r.model),
                 EventType::Stop => {
                     return Ok(Reply {
                         text,
                         stop: event.reason.unwrap_or(StopReason::End),
                         usage,
+                        model,
                     });
                 }
                 EventType::Error => {
@@ -465,7 +476,7 @@ impl Model for Gateway {
                         gateway_error,
                     ));
                 }
-                EventType::Route | EventType::Thinking | EventType::ToolCall => {}
+                EventType::Thinking | EventType::ToolCall => {}
             }
         }
         Err(CallError::Gateway(

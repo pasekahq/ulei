@@ -331,8 +331,8 @@ def index_query(ctx: Ctx) -> C.Result:
     res.metrics["memory_samples"] = len(sampler.rows)
     (ctx.out / "index_query.samples.json").write_text(json.dumps(sampler.rows))
     res.metrics["reference"] = reference_check(res, ctx, d.root, E5)
-    # Observation, not a check: digest items the worker's reconciliation made with e5 at the
-    # default reconcile_min_cosine 0.85 (ADR-0047 says an enabled model needs its own value).
+    # Observation, not a check: the edge's digest items by status and reason; the worker
+    # writes none since ADR-0096 (it only gives hints to the night's judge).
     db = d.root / "final.sqlite3"
     res.metrics["edge_proposal_by_reason"] = C.q(
         db, "SELECT status, reason, count(*) FROM edge_proposal GROUP BY status, reason")
@@ -891,7 +891,7 @@ def start_states(ctx: Ctx) -> C.Result:
 
 def upgrade(ctx: Ctx) -> C.Result:
     """A store of the previous release (schema 15) with ONNX-backend vectors, opened by the new
-    daemon with the native helper: migration 16, identity change, re-embedding completes,
+    daemon with the native helper: migrations 16 and 17, identity change, re-embedding completes,
     search answers throughout, every final vector exact."""
     res = C.Result("upgrade")
     for fx in ("upgrade-onnx",):
@@ -916,8 +916,8 @@ def upgrade(ctx: Ctx) -> C.Result:
         finally:
             d.stop()
         after = C.integrity(d.root / "store" / "garden.sqlite3")
-        res.check(f"{fx}: schema 15 -> 16", before["user_version"] == 15 and after["user_version"] == 16,
-                  [before["user_version"], after["user_version"]], "15 -> 16")
+        res.check(f"{fx}: schema 15 -> 17", before["user_version"] == 15 and after["user_version"] == 17,
+                  [before["user_version"], after["user_version"]], "15 -> 17")
         res.metrics[fx] = {"old_models": old_models,
                            "reference": reference_check(res, ctx, d.root, E5, label=f"{fx}: ")}
     return res

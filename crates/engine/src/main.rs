@@ -42,8 +42,8 @@ use ulei_engine::tools::web::{
     DEFAULT_EXTRACT_CHAR_LIMIT, EXA_CALL_TIMEOUT, Web, clamp_char_limit,
 };
 use ulei_engine::tools::{
-    ArchiveRead, ArchiveSearch, DuplicateTool, Forget, GardenPropose, GardenSearch, Interrupt,
-    Memory, ReactToMessage, Reactions, Registry, ServiceUnit, SessionSearch, SetModel,
+    ArchiveRead, ArchiveSearch, DuplicateTool, Forget, GardenPropose, GardenReview, GardenSearch,
+    Interrupt, Memory, ReactToMessage, Reactions, Registry, ServiceUnit, SessionSearch, SetModel,
 };
 use ulei_engine::trace::{self, Trace};
 use ulei_engine::wire::c6::TurnOutcome;
@@ -51,7 +51,7 @@ use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
 use ulei_engine::{archive, garden, night};
 
-const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH] | ulei-engine serve [--config PATH] | ulei-engine night [--config PATH] [--dry-run] [--stage a|b|c[,...]] [--limit-sessions N]\n";
+const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH] | ulei-engine serve [--config PATH] | ulei-engine night [--config PATH] [--dry-run] [--stage a|b|c|d[,...]] [--limit-sessions N]\n";
 
 /// Upper bound of output tokens per model step of a route that sets none, and of side turns.
 const MAX_TOKENS: u64 = 16_384;
@@ -246,7 +246,7 @@ fn parse(args: Vec<OsString>) -> Option<Command> {
     Some(Command::Run(run, config.map(PathBuf::from)))
 }
 
-/// `night [--config PATH] [--dry-run] [--stage a|b|c[,...]] [--limit-sessions N]`, each flag at
+/// `night [--config PATH] [--dry-run] [--stage a|b|c|d[,...]] [--limit-sessions N]`, each flag at
 /// most once; `None` is a usage error.
 fn parse_night(args: &[OsString]) -> Option<Command> {
     let (mut config, mut dry_run, mut stages, mut limit) = (None, false, None, None);
@@ -276,6 +276,7 @@ fn parse_night(args: &[OsString]) -> Option<Command> {
             night::Stage::Forget,
             night::Stage::Seedbed,
             night::Stage::History,
+            night::Stage::Judge,
         ]
     });
     Some(Command::Night(
@@ -301,7 +302,7 @@ fn night(options: &night::Options, path: Option<&Path>) -> (u8, String) {
         && options
             .stages
             .iter()
-            .any(|s| matches!(s, night::Stage::Seedbed | night::Stage::History));
+            .any(|s| !matches!(s, night::Stage::Forget));
     let mut model = match (needs_model, &settings.gateway) {
         (false, _) => None,
         (true, Some(socket)) => Some(night::extract::Gateway::new(
@@ -871,6 +872,7 @@ fn journal_tools(
     }
     if let Some(garden) = stores.garden {
         tools.register(Box::new(GardenSearch::new(garden.clone())))?;
+        tools.register(Box::new(GardenReview::new(garden.clone())))?;
         tools.register(Box::new(GardenPropose::new(garden, origin)))?;
     }
     Ok(())

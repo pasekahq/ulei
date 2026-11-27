@@ -6,6 +6,7 @@
 //! it. The queues live in tables the store's migrations create; a seedbed write, a propose, a
 //! resolve or the processing of a seedbed record is one unit of work of the store.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use rusqlite::{OptionalExtension, params};
@@ -16,7 +17,7 @@ use crate::model::{
 };
 use crate::search::{self, SearchError};
 use crate::secret::looks_secret;
-use crate::store::{Store, StoreError, sqlite_class};
+use crate::store::{PASSAGE_TRIES, Store, StoreError, sqlite_class};
 use crate::translit;
 use crate::wire::c7;
 
@@ -35,26 +36,45 @@ WITH RECURSIVE lineage(id, entity) AS (
 SELECT 1 + count(*) FROM edge_proposal
 WHERE status = 'duplicate' AND fact_id IN (SELECT id FROM lineage)";
 
-/// Facts most like a new fact that its reconciliation weighs ([`Edge::reconcile_similar`]).
-pub const RECONCILE_K: usize = 5;
+/// Hints a waiting fact gets: the earlier facts of its entity nearest to it, which the night's
+/// judge compares it with (ADR-0096 section 1). A budget of the judge's prompt, not a
+/// calibration of any model.
+pub const HINTS: usize = 5;
+
+/// Seconds after its recording a waiting fact without a vector of the helper's model gets
+/// lexical hints instead when the night takes it, so a helper that is down delays the judge by
+/// this much and no more.
+pub const HINT_WAIT: UnixTime = 3_600;
+
+/// SQL over alias `f`, with `?3` the ready helper's model or null and `?4` = `PASSAGE_TRIES`:
+/// the dense side cannot hint the fact, since no helper is ready or its passage is skipped.
+const BLIND: &str = "(?3 IS NULL OR EXISTS (SELECT 1 FROM passage_failures p
+    WHERE p.model = ?3 AND p.fact = f.seq AND p.failures >= ?4))";
 
 /// Tunables of the edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EdgeConfig {
     /// Candidates with a `confidence` below this go to the digest as `low_confidence`.
     pub min_confidence: f64,
-    /// Least cosine at which a new fact without an attribute contradicts a current fact of its
-    /// entity with another normalised text.
-    pub reconcile_min_cosine: f32,
 }
 
 impl Default for EdgeConfig {
     fn default() -> Self {
         Self {
             min_confidence: 0.6,
-            reconcile_min_cosine: 0.85,
         }
     }
+}
+
+/// What [`Edge::hint`] did with a waiting fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Hinted {
+    /// The fact waits for the judge with these hints, nearest first.
+    Hints(Vec<FactId>, search::Basis),
+    /// No other fact of its entity: it left the queue without hints.
+    Alone,
+    /// It is no longer current, or no longer waiting: it left the queue, or nothing changed.
+    Gone,
 }
 
 /// Why a candidate was refused. Refused candidates are never stored or logged.
@@ -574,20 +594,20 @@ impl<'a> Edge<'a> {
         }
     }
 
-    /// The oldest fact waiting for [`Edge::reconcile_similar`] that is ready for it under the
-    /// embedding model `model`: it has a vector of `model`, or it is no longer current.
+    /// The oldest fact waiting for its hints ([`Edge::hint`]) that is ready for dense ones under
+    /// the embedding model `model`: it has a vector of `model`, or it is no longer current.
     ///
     /// # Errors
     ///
     /// Failures of the edge's tables.
-    pub fn unreconciled(&self, model: &str) -> Result<Option<FactId>, EdgeError> {
+    pub fn dense_waiting(&self, model: &str) -> Result<Option<FactId>, EdgeError> {
         Ok(self
             .store
             .conn()
             .query_row(
                 "SELECT q.fact FROM reconcile_queue q JOIN facts f ON f.id = q.fact
-                 WHERE f.superseded_at IS NOT NULL
-                    OR EXISTS (SELECT 1 FROM fact_vectors v WHERE v.model = ?1 AND v.fact = f.seq)
+                 WHERE q.state = 'waiting' AND (f.superseded_at IS NOT NULL
+                    OR EXISTS (SELECT 1 FROM fact_vectors v WHERE v.model = ?1 AND v.fact = f.seq))
                  ORDER BY q.rowid LIMIT 1",
                 [model],
                 |r| r.get(0),
@@ -596,83 +616,119 @@ impl<'a> Edge<'a> {
             .map(FactId))
     }
 
-    /// Reconciles the waiting fact `id` once, at `now`, with the [`RECONCILE_K`] current facts
-    /// of its entity most like it ([`search::similar`] under `model`) that do not wait
-    /// themselves (each pair is weighed when its later fact is): the first of them with a cosine
-    /// of at least `reconcile_min_cosine` and another normalised text makes a `contradiction`
-    /// digest item for the written fact. A fact no longer current only leaves the queue.
+    /// The oldest fact waiting for its hints that gets lexical ones at `now`: with `all` (the
+    /// daemon runs without an embedder) every waiting fact; else one no longer current, or one
+    /// recorded [`HINT_WAIT`] seconds or more before `now` that the dense side cannot hint: any
+    /// while the helper is not ready (`ready` is `None`), one whose passage is skipped under the
+    /// ready helper's model.
     ///
     /// # Errors
     ///
-    /// Failures of the store, the retrieval or the edge's tables; the fact then stays queued.
-    pub fn reconcile_similar(
+    /// Failures of the edge's tables.
+    pub fn lexical_waiting(
+        &self,
+        all: bool,
+        ready: Option<&str>,
+        now: UnixTime,
+    ) -> Result<Option<FactId>, EdgeError> {
+        let sql = format!(
+            "SELECT q.fact FROM reconcile_queue q JOIN facts f ON f.id = q.fact
+             WHERE q.state = 'waiting' AND (?1 OR f.superseded_at IS NOT NULL
+                OR (f.recorded_at <= ?2 AND {BLIND}))
+             ORDER BY q.rowid LIMIT 1"
+        );
+        Ok(self
+            .store
+            .conn()
+            .query_row(
+                &sql,
+                params![all, now.saturating_sub(HINT_WAIT), ready, PASSAGE_TRIES],
+                |r| r.get(0),
+            )
+            .optional()?
+            .map(FactId))
+    }
+
+    /// Gives the waiting fact `id` its hints at `now` in one unit of work (ADR-0096 section 1):
+    /// the [`HINTS`] current facts of its entity nearest to it ([`search::nearest`], dense under
+    /// `model` when the fact has a vector of it, else lexical), other than facts queued after
+    /// it, which are weighed when they are judged themselves, and other than the facts an undo
+    /// kept apart from it. They are stored in `reconcile_hint` and the row waits `hinted` for
+    /// the judge; a fact with no such fact leaves the queue, as does one no longer current.
+    /// Nothing is decided here and no digest item is written.
+    ///
+    /// # Errors
+    ///
+    /// Failures of the store, the retrieval or the edge's tables; the fact then stays waiting.
+    pub fn hint(
         &mut self,
         id: &FactId,
-        model: &str,
+        model: Option<&str>,
         now: UnixTime,
-    ) -> Result<(), EdgeError> {
-        let config = self.config;
+    ) -> Result<Hinted, EdgeError> {
         self.store.atomically(|store| {
-            let mut edge = Edge::new(store, config);
-            let candidate: String = edge.store.conn().query_row(
-                "SELECT candidate FROM reconcile_queue WHERE fact = ?1",
-                [&id.0],
-                |r| r.get(0),
-            )?;
-            edge.store
-                .conn()
-                .execute("DELETE FROM reconcile_queue WHERE fact = ?1", [&id.0])?;
-            let fact = edge
-                .store
+            let conn = store.conn();
+            let Some(place) = conn
+                .query_row(
+                    "SELECT rowid FROM reconcile_queue WHERE fact = ?1 AND state = 'waiting'",
+                    [&id.0],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+            else {
+                return Ok(Hinted::Gone);
+            };
+            let fact = store
                 .fact(id)?
                 .ok_or_else(|| EdgeError::Corrupt(id.0.clone()))?;
             if fact.superseded_at.is_some() {
-                return Ok(());
+                conn.execute("DELETE FROM reconcile_queue WHERE fact = ?1", [&id.0])?;
+                return Ok(Hinted::Gone);
             }
             let at = match fact.valid_to {
                 Some(end) if end <= now => end - 1,
                 _ => now,
             }
             .max(fact.valid_from);
-            let mut waiting = edge
-                .store
-                .conn()
-                .prepare("SELECT 1 FROM reconcile_queue WHERE fact = ?1")?;
-            let mut rivals = Vec::with_capacity(RECONCILE_K);
-            for (rival, cosine) in search::similar(edge.store, &fact, model, usize::MAX, at, now)? {
-                if rivals.len() == RECONCILE_K {
-                    break;
-                }
-                if !waiting.exists([&rival.0])? {
-                    rivals.push((rival, cosine));
-                }
+            let mut skipped: HashSet<String> = conn
+                .prepare(
+                    "SELECT q.fact FROM reconcile_queue q JOIN facts f ON f.id = q.fact
+                     WHERE q.rowid > ?1 AND f.entity = ?2",
+                )?
+                .query_map(params![place, fact.entity.0], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            let mut kept = conn.prepare(
+                "SELECT b FROM reconcile_kept WHERE a = ?1 UNION SELECT a FROM reconcile_kept WHERE b = ?1",
+            )?;
+            for other in kept.query_map([&id.0], |r| r.get::<_, String>(0))? {
+                skipped.insert(other?);
             }
-            drop(waiting);
-            let norm = normalise(&fact.text);
-            for (rival, cosine) in rivals {
-                if cosine.is_none_or(|c| c < config.reconcile_min_cosine) {
-                    continue;
-                }
-                let differs = edge
-                    .store
-                    .fact(&rival)?
-                    .is_some_and(|r| normalise(&r.text) != norm);
-                if differs {
-                    let item = edge.record(
-                        "queued",
-                        Some(c7::DigestReason::Contradiction.as_str()),
-                        Some(&candidate),
-                        Some(&rival.0),
-                        now,
-                    )?;
-                    edge.store.conn().execute(
-                        "UPDATE edge_proposal SET fact_id = ?2 WHERE id = ?1",
-                        params![row_id(&item), id.0],
-                    )?;
-                    break;
-                }
+            drop(kept);
+            let skip = |other: &FactId| skipped.contains(&other.0);
+            let (hints, basis) = search::nearest(store, &fact, model, HINTS, at, now, &skip)?;
+            if hints.is_empty() {
+                conn.execute("DELETE FROM reconcile_queue WHERE fact = ?1", [&id.0])?;
+                bump(conn, "without_hints", 1)?;
+                return Ok(Hinted::Alone);
             }
-            Ok(())
+            let model = match basis {
+                search::Basis::Dense => model,
+                search::Basis::Lexical => None,
+            };
+            for (rank, hint) in (1..).zip(&hints) {
+                conn.execute(
+                    "INSERT INTO reconcile_hint (fact, rank, hint, basis, model, computed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![id.0, rank, hint.0, basis.as_str(), model, now],
+                )?;
+            }
+            conn.execute(
+                "UPDATE reconcile_queue SET state = 'hinted' WHERE fact = ?1",
+                [&id.0],
+            )?;
+            bump(conn, &format!("hinted_{}", basis.as_str()), 1)?;
+            bump(conn, "hints_offered", hints.len())?;
+            Ok(Hinted::Hints(hints, basis))
         })
     }
 
@@ -750,6 +806,16 @@ impl<'a> Edge<'a> {
                 Some(f) => self.store.fact(&FactId(f.clone()))?.map(|f| f.text),
                 None => None,
             };
+            let note: Option<String> = self
+                .store
+                .conn()
+                .query_row(
+                    "SELECT note FROM reconcile_judgement WHERE proposal = ?1 AND note IS NOT NULL
+                     ORDER BY id LIMIT 1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
             items.push(c7::DigestItem {
                 proposal_id: pid,
                 reason,
@@ -758,6 +824,7 @@ impl<'a> Edge<'a> {
                 conflicting_fact,
                 entity_candidates,
                 queued_at: as_f64(created_at),
+                note,
             });
         }
         Ok(items)
@@ -766,7 +833,7 @@ impl<'a> Edge<'a> {
     /// Applies the owner's decision on an open digest item: `accept` writes the candidate
     /// (the store closes the conflicting version), to `entity` for an `ambiguous_entity` item,
     /// `reject` drops it, `replace` writes `replacement` instead. On an item of a fact already
-    /// written ([`Edge::reconcile_similar`]) `reject` retracts that fact in favour of its rival,
+    /// written and judged a contradiction (ADR-0096) `reject` retracts that fact in favour of its rival,
     /// `accept` the rival in favour of it outside its interval, and `replace` retracts it in
     /// favour of the replacement. A replacement passes the same refusal checks as a proposal; a
     /// refused one leaves the item open. Like a propose, it commits whole or not at all.
@@ -925,7 +992,7 @@ impl<'a> Edge<'a> {
 
     /// Retracts `old`, while it is current, at `now` in favour of `by`; with `keep_outside` it
     /// stays believed outside the valid interval of `by`.
-    fn retract(
+    pub(crate) fn retract(
         &mut self,
         old: &FactId,
         by: &FactId,
@@ -1252,7 +1319,7 @@ impl<'a> Edge<'a> {
 
     /// Inserts a proposal row, naming the seedbed record being processed, and returns its name;
     /// `link` is the conflicting fact of a queued row.
-    fn record(
+    pub(crate) fn record(
         &mut self,
         status: &str,
         reason: Option<&str>,
@@ -1293,6 +1360,27 @@ impl<'a> Edge<'a> {
         )?;
         Ok(())
     }
+}
+
+/// Adds `by` to the anonymous counter `name` of `reconcile_stats` (ADR-0096 section 5).
+///
+/// # Errors
+///
+/// SQLite errors.
+pub(crate) fn bump(
+    conn: &rusqlite::Connection,
+    name: &str,
+    by: usize,
+) -> Result<(), rusqlite::Error> {
+    if by == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO reconcile_stats (name, n) VALUES (?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET n = n + excluded.n",
+        params![name, i64::try_from(by).unwrap_or(i64::MAX)],
+    )?;
+    Ok(())
 }
 
 /// The C7 proof count of fact `id`: 1 plus the `duplicate` proposals that named it or a

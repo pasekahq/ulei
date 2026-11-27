@@ -76,6 +76,7 @@ fn fact(text: &str) -> c7::Fact {
         unprocessed: None,
         disputed: None,
         conflicts_with: None,
+        conflict_note: None,
     }
 }
 

@@ -273,6 +273,28 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.14.0
+- The night's judge of new facts (additive, ADR-0096). `x-methods` gains `reconcile_take`
+  (`ReconcileTakeRequest` with `after`, `limit` 1 to 100, default 50, and `hint`, which gives
+  the due lexical hints first unless false, answered by
+  `ReconcileTakeResponse` of `ReconcileItem`s: `seq`, `entity`, `entity_name`, the new `fact`,
+  1 to 10 `hints` as `Fact`s, `basis` `HintBasis` `dense` or `lexical`, `embedder`),
+  `reconcile_done` (`ReconcileDoneRequest` with `judge`, up to 100 `ReconcileJudged` items of
+  `fact_id` and `ReconcileVerdict`s, each `hint`, `relation` `ReconcileRelation` `duplicate`,
+  `supersedes` or `contradiction` and `note`, and optional `JudgeStats`; answered by
+  `ReconcileDoneResponse` with one `ReconcileDoneItem` per fact of `ReconcileOutcome`s, each
+  `applied` `ReconcileApplied` `merged`, `superseded`, `contradiction`, `not_applied` or `stale`
+  with `change_id`), `reconcile_review` (`ReconcileReviewRequest` with `limit` 1 to 200,
+  `before`, `entity`, `relation` and `open`, answered by `ReconcileReviewResponse` of
+  `ReconcileChange`s with `state` `ChangeState` `applied`, `open`, `resolved` or `undone`, both
+  `ChangeFact`s, the judge's `note`, `judge`, `embedder`, `basis`, `proposal_id`, `restored`
+  and `undone_at`, and `next`) and `reconcile_undo` (`ReconcileUndoRequest` with `change_id`,
+  answered by `ReconcileUndoResponse`). `Fact` gains `conflict_note`, and `disputed` with
+  `conflicts_with` also marks a fact in an open judged contradiction. `DigestItem` gains `note`.
+  `Health` gains `reconcile` (`ReconcileStats`, anonymous counters with `RelationCounts` and
+  `LatencyBucket`s). `ErrorCode` `not_found` and `invalid_request` cover the new methods. No
+  existing field changes meaning.
+
 ## C7 0.13.0
 - `PlaceMarkKind` gains `open_unconfirmed` (additive, ADR-0080 section 5 items 5 and 6): in a
   `places_search` with `open_now`, a place whose `open` is `probably_open` or `unknown` ranks as
@@ -474,6 +496,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft records of the engine's session journal (ADR-0014): `Session` (id and session key),
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
+
+## C9 0.13.0
+- Keys `night.judge_max_usd` (an `integer` or `string`, a decimal, default `"0.5"`) and
+  `night.judge_batch` (an `integer`, 1 to 100, default 25) of the night's stage d (additive,
+  ADR-0096). Description of `garden.edge.reconcile_min_cosine`: no longer read; the daemon accepts
+  it with one stderr line and the next release removes it.
 
 ## C9 0.12.0
 - Key `engine.trace_file` (additive, a `string`): the debug trace of the engine's turns, one

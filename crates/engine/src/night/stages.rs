@@ -1,6 +1,7 @@
 //! One night run (ADR-0078 sections 2 to 6): stage b clears the forget queue, stage a sorts the
 //! seedbed, stage c sorts the history of the configured archive sources into the garden and its
-//! session summaries into the forest (ADR-0079), all within the spend limit; or, with
+//! session summaries into the forest (ADR-0079), all within the spend limit, and stage d judges
+//! the new facts the garden hinted within a spend limit of its own (ADR-0096); or, with
 //! `--dry-run`, the same walk read only with estimates.
 
 use std::io::Write;
@@ -14,14 +15,17 @@ use crate::night::client::{self, Archive, Garden};
 use crate::night::extract::{
     self, CallError, Candidate, HISTORY_SYSTEM, History, MAX_FACT_CHARS, Model, Reply, SEED_SYSTEM,
 };
+use crate::night::judge::{self, JUDGE_SYSTEM, PROMPT_VERSION};
 use crate::night::render::{self, Part};
 use crate::night::spend::{Budget, estimate_output, estimate_tokens};
 use crate::night::state::{self, Cursor, Report, Source};
-use crate::night::{MAX_SEED_BATCH, STATE, Settings};
+use crate::night::{MAX_JUDGE_BATCH, MAX_SEED_BATCH, STATE, Settings};
 use crate::wire::c4g::StopReason;
 use crate::wire::c7::{
-    ForgetDoneRequest, ForgetTakeRequest, ProposalStatus, ProposeRequest, ProposeResponse,
-    SeedRecord, SeedbedDoneItem, SeedbedDoneRequest, SeedbedTakeRequest, SourceKind,
+    ForgetDoneRequest, ForgetTakeRequest, JudgeStats, ProposalStatus, ProposeRequest,
+    ProposeResponse, ReconcileApplied, ReconcileDoneRequest, ReconcileItem, ReconcileJudged,
+    ReconcileTakeRequest, SeedRecord, SeedbedDoneItem, SeedbedDoneRequest, SeedbedTakeRequest,
+    SourceKind,
 };
 use crate::wire::c10::{ForestLink, ForestPutRequest, ListRequest, Listed, Producer};
 use crate::zone;
@@ -46,6 +50,8 @@ pub enum Stage {
     Forget,
     /// `c`: the archive history.
     History,
+    /// `d`: the judge of the new facts the garden hinted (ADR-0096).
+    Judge,
 }
 
 impl Stage {
@@ -56,6 +62,7 @@ impl Stage {
             "a" => Some(Self::Seedbed),
             "b" => Some(Self::Forget),
             "c" => Some(Self::History),
+            "d" => Some(Self::Judge),
             _ => None,
         }
     }
@@ -67,6 +74,7 @@ impl Stage {
             Self::Seedbed => "a",
             Self::Forget => "b",
             Self::History => "c",
+            Self::Judge => "d",
         }
     }
 }
@@ -76,7 +84,7 @@ impl Stage {
 pub struct Options {
     /// Call no model and write nothing; print the estimates.
     pub dry_run: bool,
-    /// The stages to run; they run in the order b, a, c whatever the order given.
+    /// The stages to run; they run in the order b, a, c, d whatever the order given.
     pub stages: Vec<Stage>,
     /// Most sessions or parts stage c sends.
     pub limit_sessions: Option<u64>,
@@ -153,6 +161,22 @@ pub struct Totals {
     pub tokens_out: u64,
     /// USD spent.
     pub usd: f64,
+    /// New facts the judge's verdicts were applied to.
+    pub judged: u64,
+    /// Of them, merged into an earlier fact.
+    pub merged: u64,
+    /// Earlier facts a new one superseded.
+    pub superseded: u64,
+    /// Contradictions recorded for the digest.
+    pub contradictions: u64,
+    /// Verdicts on facts no longer current.
+    pub stale: u64,
+    /// Judge calls whose answer was malformed twice, refused or too long; their facts wait.
+    pub judge_failures: u64,
+    /// Judge calls that timed out.
+    pub judge_timeouts: u64,
+    /// Of `usd`, what the judge spent.
+    pub judge_usd: f64,
 }
 
 impl Totals {
@@ -170,7 +194,7 @@ impl Totals {
     #[must_use]
     pub fn line(&self, stop: &Stop, seconds: f64) -> String {
         let mut line = format!(
-            "ulei-engine night: {} taken {} proposed {} accepted {} digest {} refused {} malformed {} cleared {} sessions {} waiting {} tokens {}/{} usd {:.4} in {seconds:.0} s",
+            "ulei-engine night: {} taken {} proposed {} accepted {} digest {} refused {} malformed {} cleared {} sessions {} waiting {} judged {} tokens {}/{} usd {:.4} in {seconds:.0} s",
             stop.word(),
             self.taken,
             self.proposed,
@@ -181,6 +205,7 @@ impl Totals {
             self.cleared,
             self.sessions,
             self.waiting,
+            self.judged,
             self.tokens_in,
             self.tokens_out,
             self.usd,
@@ -216,6 +241,14 @@ impl Totals {
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
             "usd": self.usd,
+            "judged": self.judged,
+            "merged": self.merged,
+            "superseded": self.superseded,
+            "contradictions": self.contradictions,
+            "stale": self.stale,
+            "judge_failures": self.judge_failures,
+            "judge_timeouts": self.judge_timeouts,
+            "judge_usd": self.judge_usd,
             "seconds": seconds,
         })
     }
@@ -245,6 +278,30 @@ pub struct Estimate {
 /// A failure that ends the run.
 type Fail = String;
 
+/// The judge's own counts since the last `reconcile_done`, for the garden's local counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct JudgeCounts {
+    calls: u64,
+    failures: u64,
+    timeouts: u64,
+    tokens_in: u64,
+    tokens_out: u64,
+}
+
+impl JudgeCounts {
+    /// The counts as C7 sends them; `None` when there is nothing to send.
+    fn wire(self) -> Option<JudgeStats> {
+        let some = |n: u64| (n > 0).then_some(n);
+        (self != Self::default()).then(|| JudgeStats {
+            calls: some(self.calls),
+            failures: some(self.failures),
+            timeouts: some(self.timeouts),
+            tokens_in: some(self.tokens_in),
+            tokens_out: some(self.tokens_out),
+        })
+    }
+}
+
 /// Tokens in, tokens out and USD of the attempts of one extraction.
 type Usage = (u64, u64, f64);
 
@@ -263,6 +320,14 @@ struct Night<'a> {
     options: &'a Options,
     model: Option<&'a mut dyn Model>,
     budget: Budget,
+    /// The judge's own spend limit (ADR-0096 section 3).
+    judge_budget: Budget,
+    /// Stage d runs: calls spend from `judge_budget` and count into `judge_stats`.
+    judging: bool,
+    /// The judge's counts not yet handed to the garden.
+    judge_stats: JudgeCounts,
+    /// The vendor model that last answered the judge, from the gateway's route event.
+    judge_model: Option<String>,
     totals: Totals,
     report: Option<Report>,
     state: Option<PathBuf>,
@@ -296,6 +361,10 @@ pub fn run<'a>(
         options,
         model,
         budget: Budget::new(settings.max_usd),
+        judge_budget: Budget::new(settings.judge_max_usd),
+        judging: false,
+        judge_stats: JudgeCounts::default(),
+        judge_model: None,
         totals: Totals::default(),
         report: None,
         state: settings.state.clone(),
@@ -327,8 +396,12 @@ impl Night<'_> {
             }
         }
         let mut failures = false;
-        for stage in [Stage::Forget, Stage::Seedbed, Stage::History] {
-            if !self.options.stages.contains(&stage) {
+        // A limit of stage a or c ends the extraction, not the judge, which spends from a
+        // budget of its own: a history import cannot starve it (ADR-0096 section 3).
+        let mut limited = None;
+        for stage in [Stage::Forget, Stage::Seedbed, Stage::History, Stage::Judge] {
+            if !self.options.stages.contains(&stage) || (limited.is_some() && stage != Stage::Judge)
+            {
                 continue;
             }
             let result = match (stage, self.options.dry_run) {
@@ -338,15 +411,23 @@ impl Night<'_> {
                 (Stage::Seedbed, true) => self.dry_seedbed(),
                 (Stage::History, false) => self.history(),
                 (Stage::History, true) => self.dry_history(),
+                (Stage::Judge, false) => self.judge(),
+                (Stage::Judge, true) => self.dry_judge(),
             };
             match result {
                 Ok(Stop::Done) => {}
                 Ok(Stop::DoneWithFailures) => failures = true,
-                Ok(stop) => return stop,
+                Ok(stop) => {
+                    if limited.is_none() {
+                        limited = Some(stop);
+                    }
+                }
                 Err(e) => return Stop::Failed(e),
             }
         }
-        if failures {
+        if let Some(stop) = limited {
+            stop
+        } else if failures {
             Stop::DoneWithFailures
         } else {
             Stop::Done
@@ -655,10 +736,13 @@ impl Night<'_> {
         let mut usage = (0, 0, 0.0);
         let mut why = "";
         for attempt in 1..=2 {
-            if !self
-                .budget
-                .allows(self.settings.prices.input_cost(estimate))
-            {
+            let cost = self.settings.prices.input_cost(estimate);
+            let allowed = if self.judging {
+                self.judge_budget.allows(cost)
+            } else {
+                self.budget.allows(cost)
+            };
+            if !allowed {
                 if attempt == 1 {
                     return Ok((Extracted::OverBudget, 0, usage));
                 }
@@ -672,9 +756,19 @@ impl Night<'_> {
                 Err(CallError::TooLong(_)) => {
                     return Ok((Extracted::Failed("too long for the model"), attempt, usage));
                 }
+                Err(CallError::Timeout(e)) => {
+                    if self.judging {
+                        self.totals.judge_timeouts += 1;
+                        self.judge_stats.timeouts += 1;
+                    }
+                    return Err(e);
+                }
                 Err(CallError::Gateway(e)) => return Err(e),
             };
             let (tokens_in, tokens_out, usd) = self.charge(&reply, estimate);
+            if self.judging && reply.model.is_some() {
+                self.judge_model.clone_from(&reply.model);
+            }
             usage = (usage.0 + tokens_in, usage.1 + tokens_out, usage.2 + usd);
             if reply.stop == StopReason::MaxTokens {
                 why = MAX_TOKENS;
@@ -714,12 +808,188 @@ impl Night<'_> {
             };
             (estimate, output, prices.cost(&usage))
         };
-        self.budget.charge(usd);
+        if self.judging {
+            self.judge_budget.charge(usd);
+            self.totals.judge_usd += usd;
+            let s = &mut self.judge_stats;
+            s.calls += 1;
+            s.tokens_in += tokens_in;
+            s.tokens_out += tokens_out;
+        } else {
+            self.budget.charge(usd);
+        }
         self.totals.calls += 1;
         self.totals.tokens_in += tokens_in;
         self.totals.tokens_out += tokens_out;
         self.totals.usd += usd;
         (tokens_in, tokens_out, usd)
+    }
+
+    // Stage d.
+
+    /// The judge: takes the facts the garden hinted page by page, sends them in calls of whole
+    /// entities, and hands the verdicts to `reconcile_done`, from a budget of its own. A batch
+    /// whose answer is malformed twice is left for the next night; facts left when the budget
+    /// is spent wait too. The judge's counts reach the garden with each `reconcile_done`, and a
+    /// last one carries what is left when the stage ends.
+    fn judge(&mut self) -> Result<Stop, Fail> {
+        let garden = self.garden()?;
+        self.judging = true;
+        let stop = self.judge_walk(&garden);
+        self.judging = false;
+        let flushed = self.judge_done(&garden, Vec::new()).map(drop);
+        let stop = stop?;
+        flushed?;
+        Ok(stop)
+    }
+
+    fn judge_walk(&mut self, garden: &Garden) -> Result<Stop, Fail> {
+        let mut after = None;
+        loop {
+            if self.judge_budget.exhausted() {
+                return Ok(Stop::SpendLimit);
+            }
+            let page = garden
+                .reconcile_take(&ReconcileTakeRequest {
+                    limit: Some(MAX_JUDGE_BATCH as u64),
+                    after,
+                    hint: None,
+                })
+                .map_err(|e| daemon(&e))?
+                .items;
+            let Some(last) = page.last() else {
+                return Ok(Stop::Done);
+            };
+            after = Some(last.seq);
+            let budget = self
+                .settings
+                .max_prompt_tokens
+                .saturating_sub(estimate_tokens(JUDGE_SYSTEM));
+            for batch in judge::batches(&page, self.settings.judge_batch, budget) {
+                if let Some(stop) = self.judge_batch(garden, &batch)? {
+                    return Ok(stop);
+                }
+            }
+        }
+    }
+
+    /// Sends one judge call; `Some` stops the stage. An answer that hits `max_tokens` is split
+    /// in halves down to one fact, as in stage a.
+    fn judge_batch(
+        &mut self,
+        garden: &Garden,
+        batch: &[&ReconcileItem],
+    ) -> Result<Option<Stop>, Fail> {
+        let prompt = judge::render(batch);
+        let (answer, attempts, usage) = self.extract(JUDGE_SYSTEM, &prompt, true, |text| {
+            judge::parse(text, batch)
+        })?;
+        let first = batch.first().map_or(0, |i| i.seq);
+        let last = batch.last().map_or(0, |i| i.seq);
+        let mut line = json!({"type": "judge", "facts": batch.len(), "first": first, "last": last,
+            "attempts": attempts, "tokens_in": usage.0, "tokens_out": usage.1, "usd": usage.2});
+        let judged = match answer {
+            Extracted::Failed(MAX_TOKENS) if batch.len() > 1 => {
+                line["outcome"] = "split".into();
+                self.line(&line)?;
+                let (head, tail) = batch.split_at(batch.len() / 2);
+                for half in [head, tail] {
+                    if let Some(stop) = self.judge_batch(garden, half)? {
+                        return Ok(Some(stop));
+                    }
+                }
+                return Ok(None);
+            }
+            Extracted::OverBudget => return Ok(Some(Stop::SpendLimit)),
+            Extracted::Failed(why) => {
+                self.totals.judge_failures += 1;
+                self.judge_stats.failures += 1;
+                line["outcome"] = "left".into();
+                line["why"] = why.into();
+                self.line(&line)?;
+                return Ok(None);
+            }
+            Extracted::Answer(judged) => judged,
+        };
+        let done = self.judge_done(garden, judged)?;
+        let count = |what: ReconcileApplied| {
+            done.iter()
+                .flat_map(|i| &i.outcomes)
+                .filter(|o| o.applied == what)
+                .count() as u64
+        };
+        let (merged, superseded, contradictions, stale) = (
+            count(ReconcileApplied::Merged),
+            count(ReconcileApplied::Superseded),
+            count(ReconcileApplied::Contradiction),
+            count(ReconcileApplied::Stale),
+        );
+        self.totals.judged += done.len() as u64;
+        self.totals.merged += merged;
+        self.totals.superseded += superseded;
+        self.totals.contradictions += contradictions;
+        self.totals.stale += stale;
+        line["outcome"] = "done".into();
+        line["merged"] = merged.into();
+        line["superseded"] = superseded.into();
+        line["contradictions"] = contradictions.into();
+        line["stale"] = stale.into();
+        self.line(&line)?;
+        Ok(None)
+    }
+
+    /// `reconcile_done` of `items` with the judge's counts not yet sent; nothing when both are
+    /// empty. The outcomes.
+    fn judge_done(
+        &mut self,
+        garden: &Garden,
+        items: Vec<ReconcileJudged>,
+    ) -> Result<Vec<crate::wire::c7::ReconcileDoneItem>, Fail> {
+        let stats = self.judge_stats.wire();
+        if items.is_empty() && stats.is_none() {
+            return Ok(Vec::new());
+        }
+        let label = format!(
+            "{} {PROMPT_VERSION}",
+            self.judge_model.as_deref().unwrap_or(&self.settings.route)
+        );
+        let answer = garden
+            .reconcile_done(&ReconcileDoneRequest {
+                judge: label,
+                items,
+                stats,
+            })
+            .map_err(|e| daemon(&e))?;
+        self.judge_stats = JudgeCounts::default();
+        Ok(answer.items)
+    }
+
+    fn dry_judge(&mut self) -> Result<Stop, Fail> {
+        let garden = self.garden()?;
+        let mut estimate = Estimate::default();
+        let mut after = None;
+        let budget = self
+            .settings
+            .max_prompt_tokens
+            .saturating_sub(estimate_tokens(JUDGE_SYSTEM));
+        loop {
+            let page = garden
+                .reconcile_take(&ReconcileTakeRequest {
+                    limit: Some(MAX_JUDGE_BATCH as u64),
+                    after,
+                    hint: Some(false),
+                })
+                .map_err(|e| daemon(&e))?
+                .items;
+            let Some(last) = page.last() else { break };
+            after = Some(last.seq);
+            estimate.items += page.len() as u64;
+            for batch in judge::batches(&page, self.settings.judge_batch, budget) {
+                self.estimate_call(&mut estimate, JUDGE_SYSTEM, &judge::render(&batch));
+            }
+        }
+        self.print(Stage::Judge, &estimate)?;
+        Ok(Stop::Done)
     }
 
     // Stage c.

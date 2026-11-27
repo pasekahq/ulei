@@ -184,6 +184,32 @@ impl Garden {
     }
 }
 
+impl Garden {
+    /// C7 `reconcile_take`: the facts waiting with their hints for the judge.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn reconcile_take(
+        &self,
+        request: &c7::ReconcileTakeRequest,
+    ) -> Result<c7::ReconcileTakeResponse, Error> {
+        let answer = self.0.call("reconcile_take", serde_json::to_vec(request))?;
+        serde_json::from_slice(&answer).map_err(|_| self.0.malformed("not a ReconcileTakeResponse"))
+    }
+
+    /// C7 `reconcile_done`: the judge's verdicts and counts.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn reconcile_done(
+        &self,
+        request: &c7::ReconcileDoneRequest,
+    ) -> Result<c7::ReconcileDoneResponse, Error> {
+        let answer = self.0.call("reconcile_done", serde_json::to_vec(request))?;
+        serde_json::from_slice(&answer).map_err(|_| self.0.malformed("not a ReconcileDoneResponse"))
+    }
+}
+
 /// The archive's C10 `list` and the forest's `forest_put`.
 #[derive(Debug, Clone)]
 pub struct Archive(Http);

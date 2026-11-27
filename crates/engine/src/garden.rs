@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use ulei_contracts::generated::c7::{
     Error as GardenError, ForgetRequest, ForgetResponse, PointersRequest, PointersResponse,
-    ProposeRequest, ProposeResponse, SearchRequest, SearchResponse,
+    ProposeRequest, ProposeResponse, ReconcileReviewRequest, ReconcileReviewResponse,
+    SearchRequest, SearchResponse,
 };
 
 use crate::gateway::{self, Malformed};
@@ -143,6 +144,20 @@ impl Client {
             .map_err(|e| Error::Unreachable(gateway::Error::Io(e.into())))?;
         let answer = self.call("POST /v1/search", &body)?;
         serde_json::from_slice(&answer).map_err(|_| malformed("not a SearchResponse"))
+    }
+
+    /// C7 `reconcile_review`.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn reconcile_review(
+        &self,
+        request: &ReconcileReviewRequest,
+    ) -> Result<ReconcileReviewResponse, Error> {
+        let body = serde_json::to_vec(request)
+            .map_err(|e| Error::Unreachable(gateway::Error::Io(e.into())))?;
+        let answer = self.call("POST /v1/reconcile_review", &body)?;
+        serde_json::from_slice(&answer).map_err(|_| malformed("not a ReconcileReviewResponse"))
     }
 
     /// The body of the `200` answer to `line` with `body`.

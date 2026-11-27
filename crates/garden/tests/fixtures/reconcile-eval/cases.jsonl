@@ -1,0 +1,419 @@
+{"id": "c000", "entity": "e00", "label": "duplicate", "lang": "en", "gold": "e00.f1", "text": "Alice Thornbury has one son, Tim."}
+{"id": "c001", "entity": "e00", "label": "contradiction", "lang": "en", "gold": "e00.f8", "text": "Her blood type is A positive."}
+{"id": "c002", "entity": "e00", "label": "supersedes", "lang": "en", "gold": "e00.f17", "text": "Email is the best way to reach Alice now, not as before."}
+{"id": "c003", "entity": "e00", "label": "contradiction", "lang": "en", "gold": "e00.f26", "text": "Note: she shares a flat with two friends."}
+{"id": "c004", "entity": "e00", "label": "duplicate", "lang": "en", "gold": "e00.f4", "text": "Alice went to a concert of Nautilus in October 2024."}
+{"id": "c005", "entity": "e00", "label": "none", "lang": "en", "gold": "", "text": "Alice plays drums in an amateur rock band."}
+{"id": "c006", "entity": "e00", "label": "none", "lang": "en", "gold": "", "text": "In November 2025 Alice Thornbury finished reading Roadside Picnic."}
+{"id": "c014", "entity": "e02", "label": "duplicate", "lang": "en", "gold": "e02.f4", "text": "Her shoe size is 45 EU."}
+{"id": "c015", "entity": "e02", "label": "contradiction", "lang": "en", "gold": "e02.f11", "text": "FYI: Priya was born on 17 July."}
+{"id": "c016", "entity": "e02", "label": "supersedes", "lang": "en", "gold": "e02.f0", "text": "Most weekends Priya stays in and plays video games since May 2026."}
+{"id": "c017", "entity": "e02", "label": "duplicate", "lang": "en", "gold": "e02.f3", "text": "FYI: Priya Holloway has blood group A+."}
+{"id": "c018", "entity": "e02", "label": "duplicate", "lang": "en", "gold": "e02.f5", "text": "In February 2025 Priya Holloway had an appointment with the dentist."}
+{"id": "c019", "entity": "e02", "label": "none", "lang": "en", "gold": "", "text": "Priya's only child is a son named Tim."}
+{"id": "c020", "entity": "e02", "label": "none", "lang": "en", "gold": "", "text": "Priya saw a dermatologist in September 2025."}
+{"id": "c021", "entity": "e03", "label": "duplicate", "lang": "en", "gold": "e03.f9", "text": "Owen Castellan's car is a red Kia Rio."}
+{"id": "c022", "entity": "e03", "label": "contradiction", "lang": "en", "gold": "e03.f3", "text": "Owen is a night owl and rarely sleeps before 2 a.m."}
+{"id": "c023", "entity": "e03", "label": "supersedes", "lang": "en", "gold": "e03.f1", "text": "Since last winter, Owen Castellan prefers to be reached on Telegram."}
+{"id": "c024", "entity": "e03", "label": "supersedes", "lang": "en", "gold": "e03.f14", "text": "These days Owen walks to work."}
+{"id": "c025", "entity": "e03", "label": "duplicate", "lang": "en", "gold": "e03.f11", "text": "He went to a concert of a local jazz trio in July 2025."}
+{"id": "c026", "entity": "e03", "label": "none", "lang": "en", "gold": "", "text": "He is learning Turkish."}
+{"id": "c027", "entity": "e03", "label": "none", "lang": "en", "gold": "", "text": "Owen Castellan bought an e-bike in July 2024."}
+{"id": "c028", "entity": "e04", "label": "duplicate", "lang": "en", "gold": "e04.f11", "text": "FYI: Greta Lindqvist has blood group B+."}
+{"id": "c029", "entity": "e04", "label": "contradiction", "lang": "en", "gold": "e04.f4", "text": "She works from home all week."}
+{"id": "c030", "entity": "e04", "label": "supersedes", "lang": "en", "gold": "e04.f15", "text": "Since last spring, Greta Lindqvist usually goes to bed after two at night."}
+{"id": "c031", "entity": "e04", "label": "supersedes", "lang": "en", "gold": "e04.f12", "text": "Most weekends she goes hiking (that changed in February)."}
+{"id": "c032", "entity": "e04", "label": "duplicate", "lang": "en", "gold": "e04.f20", "text": "In June 2024 Greta Lindqvist had an appointment with a physiotherapist."}
+{"id": "c033", "entity": "e04", "label": "none", "lang": "en", "gold": "", "text": "FYI: Greta Lindqvist studied law."}
+{"id": "c034", "entity": "e04", "label": "none", "lang": "en", "gold": "", "text": "Greta spent a week in Lisbon in July 2023."}
+{"id": "c035", "entity": "e05", "label": "duplicate", "lang": "en", "gold": "e05.f18", "text": "Tobias Wren supports Benfica."}
+{"id": "c036", "entity": "e05", "label": "contradiction", "lang": "en", "gold": "e05.f16", "text": "Tobias Wren's birthday is on 17 July."}
+{"id": "c037", "entity": "e05", "label": "supersedes", "lang": "en", "gold": "e05.f7", "text": "Tobias Wren uses daily contact lenses now, not as before."}
+{"id": "c038", "entity": "e05", "label": "contradiction", "lang": "en", "gold": "e05.f24", "text": "Tobias Wren studied architecture."}
+{"id": "c039", "entity": "e05", "label": "duplicate", "lang": "en", "gold": "e05.f5", "text": "In August 2024 Tobias Wren had an appointment with a physiotherapist."}
+{"id": "c040", "entity": "e05", "label": "none", "lang": "en", "gold": "", "text": "Tobias prefers city breaks with museums."}
+{"id": "c041", "entity": "e05", "label": "none", "lang": "en", "gold": "", "text": "Tobias saw an eye doctor in July 2025."}
+{"id": "c042", "entity": "e06", "label": "duplicate", "lang": "en", "gold": "e06.f21", "text": "Note: Nadia needs glasses to see properly."}
+{"id": "c043", "entity": "e06", "label": "contradiction", "lang": "en", "gold": "e06.f34", "text": "Nadia Fairweather lives in Lisbon."}
+{"id": "c044", "entity": "e06", "label": "supersedes", "lang": "en", "gold": "e06.f39", "text": "Update: Nadia Fairweather is a night owl and rarely sleeps before 2 a.m."}
+{"id": "c045", "entity": "e06", "label": "contradiction", "lang": "en", "gold": "e06.f10", "text": "Nadia is a Red Star Belgrade fan."}
+{"id": "c046", "entity": "e06", "label": "duplicate", "lang": "en", "gold": "e06.f13", "text": "Nadia Fairweather saw an eye doctor in May 2025."}
+{"id": "c047", "entity": "e06", "label": "none", "lang": "en", "gold": "", "text": "In amateur football Nadia Fairweather plays at the back."}
+{"id": "c048", "entity": "e06", "label": "none", "lang": "en", "gold": "", "text": "Nadia Fairweather and Bogdan caught up over food at Café Lumen in January."}
+{"id": "c049", "entity": "e07", "label": "duplicate", "lang": "en", "gold": "e07.f0", "text": "He was born on 3 March."}
+{"id": "c050", "entity": "e07", "label": "contradiction", "lang": "en", "gold": "e07.f20", "text": "FYI: Elliot is an early riser and gets up at 5:30."}
+{"id": "c051", "entity": "e07", "label": "supersedes", "lang": "en", "gold": "e07.f6", "text": "Since last autumn, Elliot is a non-smoker."}
+{"id": "c052", "entity": "e07", "label": "duplicate", "lang": "en", "gold": "e07.f13", "text": "FYI: Elliot Marsh is an accountant."}
+{"id": "c053", "entity": "e07", "label": "duplicate", "lang": "en", "gold": "e07.f15", "text": "Elliot Marsh went to a concert of a local jazz trio in July 2025."}
+{"id": "c054", "entity": "e07", "label": "none", "lang": "en", "gold": "", "text": "Elliot Marsh usually spends weekends at the dacha."}
+{"id": "c055", "entity": "e07", "label": "none", "lang": "en", "gold": "", "text": "Elliot Marsh finished an online course in personal finance in February 2025."}
+{"id": "c056", "entity": "e08", "label": "duplicate", "lang": "en", "gold": "e08.f2", "text": "FYI: she doesn't eat meat at all."}
+{"id": "c057", "entity": "e08", "label": "contradiction", "lang": "en", "gold": "e08.f11", "text": "Hazel Okafor is a non-smoker."}
+{"id": "c058", "entity": "e08", "label": "supersedes", "lang": "en", "gold": "e08.f5", "text": "She has two daughters (that changed in June)."}
+{"id": "c059", "entity": "e08", "label": "supersedes", "lang": "en", "gold": "e08.f17", "text": "As of August 2025, she commutes by underground."}
+{"id": "c060", "entity": "e08", "label": "duplicate", "lang": "en", "gold": "e08.f19", "text": "In May 2025 she saw Kino tribute band live."}
+{"id": "c061", "entity": "e08", "label": "none", "lang": "en", "gold": "", "text": "Hazel Okafor shares a flat with two friends."}
+{"id": "c062", "entity": "e08", "label": "none", "lang": "en", "gold": "", "text": "She had dinner with Mira at Café Lumen in July."}
+{"id": "c063", "entity": "e09", "label": "duplicate", "lang": "en", "gold": "e09.f13", "text": "FYI: Rupert Vance is on the staff of the city hospital."}
+{"id": "c064", "entity": "e09", "label": "contradiction", "lang": "en", "gold": "e09.f6", "text": "Rupert Vance works fully remotely."}
+{"id": "c065", "entity": "e09", "label": "supersedes", "lang": "en", "gold": "e09.f17", "text": "Rupert drives a red Kia Rio (that changed in July)."}
+{"id": "c066", "entity": "e09", "label": "duplicate", "lang": "en", "gold": "e09.f10", "text": "He would eat pad thai every day if he could."}
+{"id": "c067", "entity": "e09", "label": "duplicate", "lang": "en", "gold": "e09.f5", "text": "In July 2025 Rupert Vance saw Nautilus live."}
+{"id": "c068", "entity": "e09", "label": "none", "lang": "en", "gold": "", "text": "FYI: Rupert Vance drinks only decaf."}
+{"id": "c069", "entity": "e09", "label": "none", "lang": "en", "gold": "", "text": "In June 2025 Rupert Vance saw Radiohead tribute band live."}
+{"id": "c070", "entity": "e10", "label": "duplicate", "lang": "en", "gold": "e10.f34", "text": "Ingrid has one son, Tim."}
+{"id": "c071", "entity": "e10", "label": "contradiction", "lang": "en", "gold": "e10.f31", "text": "She always orders an oat-milk latte."}
+{"id": "c072", "entity": "e10", "label": "supersedes", "lang": "en", "gold": "e10.f16", "text": "Ingrid Halvorsen has a dachshund called Biscuit now, not as before."}
+{"id": "c073", "entity": "e10", "label": "duplicate", "lang": "en", "gold": "e10.f21", "text": "FYI: Ingrid Halvorsen wears size 45 shoes."}
+{"id": "c074", "entity": "e10", "label": "duplicate", "lang": "en", "gold": "e10.f18", "text": "She saw an eye doctor in June 2025."}
+{"id": "c075", "entity": "e10", "label": "none", "lang": "en", "gold": "", "text": "Note: Ingrid usually goes to bed after two at night."}
+{"id": "c076", "entity": "e10", "label": "none", "lang": "en", "gold": "", "text": "She saw an eye doctor in June 2024."}
+{"id": "c077", "entity": "e11", "label": "duplicate", "lang": "en", "gold": "e11.f4", "text": "FYI: he is a fan of Rubin Kazan."}
+{"id": "c078", "entity": "e11", "label": "contradiction", "lang": "en", "gold": "e11.f2", "text": "Note: Dominic Ashby likes red wine and has some most evenings."}
+{"id": "c079", "entity": "e11", "label": "supersedes", "lang": "en", "gold": "e11.f22", "text": "Update: Dominic eats meat every day."}
+{"id": "c080", "entity": "e11", "label": "supersedes", "lang": "en", "gold": "e11.f15", "text": "Dominic is a parent of three kids (that changed in July)."}
+{"id": "c081", "entity": "e11", "label": "duplicate", "lang": "en", "gold": "e11.f27", "text": "Dominic Ashby treated himself to a grey corner sofa in August 2025."}
+{"id": "c082", "entity": "e11", "label": "none", "lang": "en", "gold": "", "text": "Dominic Ashby was born on 17 July."}
+{"id": "c083", "entity": "e11", "label": "none", "lang": "en", "gold": "", "text": "He treated himself to a new laptop in August 2025."}
+{"id": "c084", "entity": "e12", "label": "duplicate", "lang": "en", "gold": "e12.f8", "text": "Leona wears glasses."}
+{"id": "c085", "entity": "e12", "label": "contradiction", "lang": "en", "gold": "e12.f18", "text": "Leona has two daughters."}
+{"id": "c086", "entity": "e12", "label": "supersedes", "lang": "en", "gold": "e12.f7", "text": "Update: Leona Pritchard enjoys a glass of red wine with dinner."}
+{"id": "c087", "entity": "e12", "label": "supersedes", "lang": "en", "gold": "e12.f35", "text": "Leona's spouse is Sasha (that changed in June)."}
+{"id": "c088", "entity": "e12", "label": "duplicate", "lang": "en", "gold": "e12.f22", "text": "In June 2025 Leona finished reading Dune."}
+{"id": "c089", "entity": "e12", "label": "none", "lang": "en", "gold": "", "text": "Note: Leona has a beagle called Biscuit."}
+{"id": "c090", "entity": "e12", "label": "none", "lang": "en", "gold": "", "text": "She finished an online course in public speaking in October 2023."}
+{"id": "c091", "entity": "e13", "label": "duplicate", "lang": "en", "gold": "e13.f11", "text": "FYI: Felix works at Northwind Logistics."}
+{"id": "c092", "entity": "e13", "label": "contradiction", "lang": "en", "gold": "e13.f7", "text": "Felix Ambrose prefers beach holidays."}
+{"id": "c093", "entity": "e13", "label": "supersedes", "lang": "en", "gold": "e13.f22", "text": "Since last autumn, Felix Ambrose wakes up at half past five every morning."}
+{"id": "c094", "entity": "e13", "label": "supersedes", "lang": "en", "gold": "e13.f29", "text": "As of February 2025, Felix Ambrose is vegetarian."}
+{"id": "c095", "entity": "e13", "label": "duplicate", "lang": "en", "gold": "e13.f10", "text": "In March 2025 he got a film camera."}
+{"id": "c096", "entity": "e13", "label": "none", "lang": "en", "gold": "", "text": "He works night shifts."}
+{"id": "c097", "entity": "e13", "label": "none", "lang": "en", "gold": "", "text": "In December 2023 Felix Ambrose travelled to Riga."}
+{"id": "c112", "entity": "e16", "label": "duplicate", "lang": "en", "gold": "e16.f21", "text": "Maeve likes navy blue best."}
+{"id": "c113", "entity": "e16", "label": "contradiction", "lang": "en", "gold": "e16.f2", "text": "FYI: Maeve designs buildings as an architect."}
+{"id": "c114", "entity": "e16", "label": "supersedes", "lang": "en", "gold": "e16.f9", "text": "Since last winter, she usually goes to bed after two at night."}
+{"id": "c115", "entity": "e16", "label": "contradiction", "lang": "en", "gold": "e16.f1", "text": "Maeve Donnelly prefers to be reached by email."}
+{"id": "c116", "entity": "e16", "label": "duplicate", "lang": "en", "gold": "e16.f16", "text": "In June Maeve Donnelly met Kostya at Café Lumen."}
+{"id": "c117", "entity": "e16", "label": "none", "lang": "en", "gold": "", "text": "FYI: Maeve Donnelly wears size 38 shoes."}
+{"id": "c118", "entity": "e16", "label": "none", "lang": "en", "gold": "", "text": "Maeve finished an online course in first aid in August 2023."}
+{"id": "c119", "entity": "e17", "label": "duplicate", "lang": "en", "gold": "e17.f8", "text": "FYI: Silas Harrow works as an accountant."}
+{"id": "c120", "entity": "e17", "label": "contradiction", "lang": "en", "gold": "e17.f13", "text": "Silas wakes up at half past five every morning."}
+{"id": "c121", "entity": "e17", "label": "supersedes", "lang": "en", "gold": "e17.f15", "text": "Silas works in the office five days a week (that changed in February)."}
+{"id": "c122", "entity": "e17", "label": "contradiction", "lang": "en", "gold": "e17.f10", "text": "Most weekends Silas Harrow stays in and plays video games."}
+{"id": "c123", "entity": "e17", "label": "duplicate", "lang": "en", "gold": "e17.f18", "text": "In December 2024 he finished reading The Hobbit."}
+{"id": "c124", "entity": "e17", "label": "none", "lang": "en", "gold": "", "text": "Silas Harrow's shoe size is 41 EU."}
+{"id": "c125", "entity": "e17", "label": "none", "lang": "en", "gold": "", "text": "Silas Harrow went to Yerevan in January 2024."}
+{"id": "c126", "entity": "e18", "label": "duplicate", "lang": "en", "gold": "e18.f26", "text": "Her car is a red Kia Rio."}
+{"id": "c127", "entity": "e18", "label": "contradiction", "lang": "en", "gold": "e18.f3", "text": "Rosa Kettering takes the metro to work."}
+{"id": "c128", "entity": "e18", "label": "supersedes", "lang": "en", "gold": "e18.f0", "text": "As of January 2024, Rosa Kettering doesn't have kids."}
+{"id": "c129", "entity": "e18", "label": "supersedes", "lang": "en", "gold": "e18.f7", "text": "She likes green best of all colours now, not as before."}
+{"id": "c130", "entity": "e18", "label": "duplicate", "lang": "en", "gold": "e18.f24", "text": "In November Rosa Kettering met Bogdan at the Georgian place on the corner."}
+{"id": "c131", "entity": "e18", "label": "none", "lang": "en", "gold": "", "text": "Rosa Kettering and Nika are a couple, unmarried."}
+{"id": "c132", "entity": "e18", "label": "none", "lang": "en", "gold": "", "text": "Rosa Kettering had dinner with Gosha at a rooftop bar in July."}
+{"id": "c140", "entity": "e20", "label": "duplicate", "lang": "en", "gold": "e20.f1", "text": "FYI: Beatrix has blood group A+."}
+{"id": "c141", "entity": "e20", "label": "contradiction", "lang": "en", "gold": "e20.f5", "text": "Beatrix's mum and dad are in Yerevan."}
+{"id": "c142", "entity": "e20", "label": "supersedes", "lang": "en", "gold": "e20.f8", "text": "Update: Beatrix Colvin takes Japanese lessons twice a week."}
+{"id": "c143", "entity": "e20", "label": "duplicate", "lang": "en", "gold": "e20.f11", "text": "Note: Beatrix works at the city hospital."}
+{"id": "c144", "entity": "e20", "label": "duplicate", "lang": "en", "gold": "e20.f6", "text": "Beatrix Colvin treated herself to a small drone in November 2024."}
+{"id": "c145", "entity": "e20", "label": "none", "lang": "en", "gold": "", "text": "Beatrix Colvin is an accountant."}
+{"id": "c146", "entity": "e20", "label": "none", "lang": "en", "gold": "", "text": "Beatrix Colvin bought a new laptop in May 2024."}
+{"id": "c147", "entity": "e21", "label": "duplicate", "lang": "en", "gold": "e21.f14", "text": "Hugo Brannigan gets to the office by bike."}
+{"id": "c148", "entity": "e21", "label": "contradiction", "lang": "en", "gold": "e21.f25", "text": "Hugo Brannigan doesn't own a car."}
+{"id": "c149", "entity": "e21", "label": "supersedes", "lang": "en", "gold": "e21.f23", "text": "Recently Hugo Brannigan plays bass in an amateur rock band."}
+{"id": "c150", "entity": "e21", "label": "contradiction", "lang": "en", "gold": "e21.f16", "text": "Hugo Brannigan supports Red Star Belgrade."}
+{"id": "c151", "entity": "e21", "label": "duplicate", "lang": "en", "gold": "e21.f18", "text": "Hugo Brannigan read Roadside Picnic in April 2025 and liked it."}
+{"id": "c152", "entity": "e21", "label": "none", "lang": "en", "gold": "", "text": "Hugo needs glasses to see properly."}
+{"id": "c153", "entity": "e21", "label": "none", "lang": "en", "gold": "", "text": "Hugo read The Master and Margarita in January 2024 and liked it."}
+{"id": "c154", "entity": "e22", "label": "duplicate", "lang": "en", "gold": "e22.f3", "text": "Her shoe size is 41 EU."}
+{"id": "c155", "entity": "e22", "label": "contradiction", "lang": "en", "gold": "e22.f0", "text": "Note: Iris Mallory is on the staff of the city hospital."}
+{"id": "c156", "entity": "e22", "label": "supersedes", "lang": "en", "gold": "e22.f1", "text": "Iris Mallory's home is in Kazan (that changed in June)."}
+{"id": "c157", "entity": "e22", "label": "supersedes", "lang": "en", "gold": "e22.f4", "text": "Iris mostly listens to classical music now, not as before."}
+{"id": "c158", "entity": "e22", "label": "duplicate", "lang": "en", "gold": "e22.f2", "text": "Iris went to a concert of Kino tribute band in September 2024."}
+{"id": "c159", "entity": "e22", "label": "none", "lang": "en", "gold": "", "text": "Iris Mallory grew up speaking Georgian."}
+{"id": "c160", "entity": "e22", "label": "none", "lang": "en", "gold": "", "text": "Iris Mallory finished an online course in personal finance in March 2024."}
+{"id": "c161", "entity": "e23", "label": "duplicate", "lang": "en", "gold": "e23.f15", "text": "Note: Callum Strand doesn't have kids."}
+{"id": "c162", "entity": "e23", "label": "contradiction", "lang": "en", "gold": "e23.f19", "text": "Callum Strand still lives with his parents."}
+{"id": "c163", "entity": "e23", "label": "supersedes", "lang": "en", "gold": "e23.f21", "text": "Since November, Callum Strand is employed by Northwind Logistics."}
+{"id": "c164", "entity": "e23", "label": "supersedes", "lang": "en", "gold": "e23.f20", "text": "These days Callum Strand sees perfectly without glasses."}
+{"id": "c165", "entity": "e23", "label": "duplicate", "lang": "en", "gold": "e23.f17", "text": "Callum finished an online course in bread baking in January 2024."}
+{"id": "c166", "entity": "e23", "label": "none", "lang": "en", "gold": "", "text": "Callum Strand is a night owl and rarely sleeps before 2 a.m."}
+{"id": "c167", "entity": "e23", "label": "none", "lang": "en", "gold": "", "text": "Callum Strand had dinner with Mira at Café Lumen in June."}
+{"id": "c168", "entity": "e24", "label": "duplicate", "lang": "ru", "gold": "e24.f2", "text": "Она любит отдыхать в городах, с музеями."}
+{"id": "c169", "entity": "e24", "label": "contradiction", "lang": "ru", "gold": "e24.f6", "text": "Анна прекрасно видит без очков."}
+{"id": "c170", "entity": "e24", "label": "supersedes", "lang": "ru", "gold": "e24.f1", "text": "С прошлой весны Анна ходит на вечерние курсы турецкого."}
+{"id": "c171", "entity": "e24", "label": "contradiction", "lang": "ru", "gold": "e24.f20", "text": "Кстати, Анна — жаворонок, встаёт в 5:30."}
+{"id": "c172", "entity": "e24", "label": "duplicate", "lang": "ru", "gold": "e24.f5", "text": "Она ходила на концерт городского симфонического оркестра в январе 2024 года."}
+{"id": "c173", "entity": "e24", "label": "none", "lang": "ru", "gold": "", "text": "Анна пользуется вейпом вместо сигарет."}
+{"id": "c174", "entity": "e24", "label": "none", "lang": "ru", "gold": "", "text": "В сентябре 2023 года Анна Ветрова провела неделю в Казани."}
+{"id": "c175", "entity": "e25", "label": "duplicate", "lang": "ru", "gold": "e25.f5", "text": "Кстати, Олег играет в защите в любительской футбольной команде."}
+{"id": "c176", "entity": "e25", "label": "contradiction", "lang": "ru", "gold": "e25.f9", "text": "Кстати, Олег Сомов предпочитает отдыхать в горах."}
+{"id": "c177", "entity": "e25", "label": "supersedes", "lang": "ru", "gold": "e25.f7", "text": "Олег Сомов ест рыбу, но не ест мясо — с мая 2024 года."}
+{"id": "c178", "entity": "e25", "label": "duplicate", "lang": "ru", "gold": "e25.f0", "text": "Он закончил онлайн-курс по первой помощи в июне 2024 года."}
+{"id": "c179", "entity": "e25", "label": "none", "lang": "ru", "gold": "", "text": "Олег Сомов носит очки."}
+{"id": "c180", "entity": "e25", "label": "none", "lang": "ru", "gold": "", "text": "Олег Сомов прочитал «Дюна» в октябре 2024 года, понравилось."}
+{"id": "c188", "entity": "e27", "label": "duplicate", "lang": "ru", "gold": "e27.f7", "text": "В отпуске Игорь выбирает города и музеи, а не природу."}
+{"id": "c189", "entity": "e27", "label": "contradiction", "lang": "ru", "gold": "e27.f0", "text": "Игорь играет на барабанах в любительской рок-группе."}
+{"id": "c190", "entity": "e27", "label": "supersedes", "lang": "ru", "gold": "e27.f4", "text": "С февраля он обычно засыпает после двух часов ночи."}
+{"id": "c191", "entity": "e27", "label": "duplicate", "lang": "ru", "gold": "e27.f6", "text": "Любимый цвет Игоря Белова — зелёный."}
+{"id": "c192", "entity": "e27", "label": "duplicate", "lang": "ru", "gold": "e27.f3", "text": "В ноябре 2025 года Игорь Белов провёл неделю в Ереване."}
+{"id": "c193", "entity": "e27", "label": "none", "lang": "ru", "gold": "", "text": "Игорь всю неделю работает из дома."}
+{"id": "c194", "entity": "e27", "label": "none", "lang": "ru", "gold": "", "text": "В декабре 2024 года Игорь Белов дочитал «Солярис»."}
+{"id": "c195", "entity": "e28", "label": "duplicate", "lang": "ru", "gold": "e28.f9", "text": "У Светланы трое детей."}
+{"id": "c196", "entity": "e28", "label": "contradiction", "lang": "ru", "gold": "e28.f14", "text": "На заметку: Светлана ездит к родителям в Казань, они там живут."}
+{"id": "c197", "entity": "e28", "label": "supersedes", "lang": "ru", "gold": "e28.f11", "text": "С мая Светлана — жаворонок, встаёт в 5:30."}
+{"id": "c198", "entity": "e28", "label": "duplicate", "lang": "ru", "gold": "e28.f10", "text": "Светлана Озерова живёт в Лиссабоне."}
+{"id": "c199", "entity": "e28", "label": "duplicate", "lang": "ru", "gold": "e28.f5", "text": "В августе 2024 года Светлана Озерова провела неделю в Хельсинки."}
+{"id": "c200", "entity": "e28", "label": "none", "lang": "ru", "gold": "", "text": "Кстати, Светлана Озерова ест рыбу, но не ест мясо."}
+{"id": "c201", "entity": "e28", "label": "none", "lang": "ru", "gold": "", "text": "Светлана Озерова была у стоматолога в мае 2025 года."}
+{"id": "c202", "entity": "e29", "label": "duplicate", "lang": "ru", "gold": "e29.f7", "text": "Любимый жанр кино у Дмитрия — документалки."}
+{"id": "c203", "entity": "e29", "label": "contradiction", "lang": "ru", "gold": "e29.f12", "text": "Дмитрий Ласточкин живёт в Валенсии."}
+{"id": "c204", "entity": "e29", "label": "supersedes", "lang": "ru", "gold": "e29.f21", "text": "С прошлой зимы Дмитрий совсем не ест мясо."}
+{"id": "c205", "entity": "e29", "label": "supersedes", "lang": "ru", "gold": "e29.f15", "text": "Машина у Дмитрия Ласточкина — потрёпанный универсал Volvo, раньше было иначе."}
+{"id": "c206", "entity": "e29", "label": "duplicate", "lang": "ru", "gold": "e29.f5", "text": "Дмитрий Ласточкин ужинал с Зоей в баре на крыше в марте."}
+{"id": "c207", "entity": "e29", "label": "none", "lang": "ru", "gold": "", "text": "Любимый цвет Дмитрия Ласточкина — жёлтый."}
+{"id": "c208", "entity": "e29", "label": "none", "lang": "ru", "gold": "", "text": "Дмитрий Ласточкин съездил в Хельсинки — это было в июле 2024 года."}
+{"id": "c209", "entity": "e30", "label": "duplicate", "lang": "ru", "gold": "e30.f8", "text": "У Юлии Соболевой группа крови 0(I), резус минус."}
+{"id": "c210", "entity": "e30", "label": "contradiction", "lang": "ru", "gold": "e30.f9", "text": "В любительской группе Юлия — барабанщик."}
+{"id": "c211", "entity": "e30", "label": "supersedes", "lang": "ru", "gold": "e30.f4", "text": "С прошлой осени Юлия Соболева — жаворонок, встаёт в 5:30."}
+{"id": "c212", "entity": "e30", "label": "duplicate", "lang": "ru", "gold": "e30.f5", "text": "Она добирается до офиса пешком."}
+{"id": "c213", "entity": "e30", "label": "duplicate", "lang": "ru", "gold": "e30.f16", "text": "Она съездила в Хельсинки — это было в ноябре 2025 года."}
+{"id": "c214", "entity": "e30", "label": "none", "lang": "ru", "gold": "", "text": "Дом у неё в Белграде."}
+{"id": "c215", "entity": "e30", "label": "none", "lang": "ru", "gold": "", "text": "В мае 2024 года она ходила к окулисту."}
+{"id": "c216", "entity": "e31", "label": "duplicate", "lang": "ru", "gold": "e31.f33", "text": "Он живёт в своём доме, при доме есть сад."}
+{"id": "c217", "entity": "e31", "label": "contradiction", "lang": "ru", "gold": "e31.f0", "text": "Павел Гречкин обычно проводит выходные дома за видеоиграми."}
+{"id": "c218", "entity": "e31", "label": "supersedes", "lang": "ru", "gold": "e31.f7", "text": "Любимый цвет Павла — тёмно-синий, раньше было иначе."}
+{"id": "c219", "entity": "e31", "label": "duplicate", "lang": "ru", "gold": "e31.f25", "text": "Кстати, Павел Гречкин носит обувь 45-го размера."}
+{"id": "c220", "entity": "e31", "label": "duplicate", "lang": "ru", "gold": "e31.f27", "text": "Он был у дерматолога в сентябре 2025 года."}
+{"id": "c221", "entity": "e31", "label": "none", "lang": "ru", "gold": "", "text": "Старшего брата Павла зовут Илья."}
+{"id": "c222", "entity": "e31", "label": "none", "lang": "ru", "gold": "", "text": "Павел ездил в Тбилиси в октябре 2024 года."}
+{"id": "c223", "entity": "e32", "label": "duplicate", "lang": "ru", "gold": "e32.f11", "text": "Она выросла, говоря по-грузински."}
+{"id": "c224", "entity": "e32", "label": "contradiction", "lang": "ru", "gold": "e32.f30", "text": "Кстати, Вера — жаворонок, встаёт в 5:30."}
+{"id": "c225", "entity": "e32", "label": "supersedes", "lang": "ru", "gold": "e32.f28", "text": "Недавно поменялось: Вера Миронова не держит дома никаких животных."}
+{"id": "c226", "entity": "e32", "label": "supersedes", "lang": "ru", "gold": "e32.f14", "text": "В любительской группе Вера Миронова поёт основной вокал, раньше было иначе."}
+{"id": "c227", "entity": "e32", "label": "duplicate", "lang": "ru", "gold": "e32.f8", "text": "Вера Миронова была у дерматолога в сентябре 2025 года."}
+{"id": "c228", "entity": "e32", "label": "none", "lang": "ru", "gold": "", "text": "На заметку: Вера ездит к родителям в Порту, они там живут."}
+{"id": "c229", "entity": "e32", "label": "none", "lang": "ru", "gold": "", "text": "Вера Миронова прочитала «Война и мир» в феврале 2024 года, понравилось."}
+{"id": "c244", "entity": "e35", "label": "duplicate", "lang": "ru", "gold": "e35.f13", "text": "Егор Румянцев предпочитает крафтовое пиво."}
+{"id": "c245", "entity": "e35", "label": "contradiction", "lang": "ru", "gold": "e35.f21", "text": "День рождения у Егора 11 декабря."}
+{"id": "c246", "entity": "e35", "label": "supersedes", "lang": "ru", "gold": "e35.f0", "text": "Он работает в стартапе Kestrel Robotics — с июля 2026 года."}
+{"id": "c247", "entity": "e35", "label": "duplicate", "lang": "ru", "gold": "e35.f11", "text": "Егор живёт у родителей."}
+{"id": "c248", "entity": "e35", "label": "duplicate", "lang": "ru", "gold": "e35.f20", "text": "Он ужинал с Зоей в баре на крыше в феврале."}
+{"id": "c249", "entity": "e35", "label": "none", "lang": "ru", "gold": "", "text": "Больше всего Егор Румянцев любит классическую музыку."}
+{"id": "c250", "entity": "e35", "label": "none", "lang": "ru", "gold": "", "text": "В апреле 2024 года он дочитал «Солярис»."}
+{"id": "c251", "entity": "e36", "label": "duplicate", "lang": "ru", "gold": "e36.f44", "text": "Полина Чайкина — жаворонок, встаёт в 5:30."}
+{"id": "c252", "entity": "e36", "label": "contradiction", "lang": "ru", "gold": "e36.f29", "text": "Родной язык Полины Чайкиной — русский."}
+{"id": "c253", "entity": "e36", "label": "supersedes", "lang": "ru", "gold": "e36.f37", "text": "Теперь она — пескетарианка."}
+{"id": "c254", "entity": "e36", "label": "supersedes", "lang": "ru", "gold": "e36.f8", "text": "Полина Чайкина обычно проводит выходные в походах — с августа 2024 года."}
+{"id": "c255", "entity": "e36", "label": "duplicate", "lang": "ru", "gold": "e36.f15", "text": "Полина была у окулиста в апреле 2025 года."}
+{"id": "c256", "entity": "e36", "label": "none", "lang": "ru", "gold": "", "text": "Кстати, она стоит на воротах в любительской футбольной команде."}
+{"id": "c257", "entity": "e36", "label": "none", "lang": "ru", "gold": "", "text": "В апреле 2025 года она слушала вживую трибьют-группы «Кино»."}
+{"id": "c258", "entity": "e37", "label": "duplicate", "lang": "ru", "gold": "e37.f11", "text": "На заметку: он — солист любительской рок-группы."}
+{"id": "c259", "entity": "e37", "label": "contradiction", "lang": "ru", "gold": "e37.f18", "text": "У Никиты Воронцова красная Kia Rio."}
+{"id": "c260", "entity": "e37", "label": "supersedes", "lang": "ru", "gold": "e37.f4", "text": "Любимый цвет Никиты — зелёный — с февраля 2024 года."}
+{"id": "c261", "entity": "e37", "label": "supersedes", "lang": "ru", "gold": "e37.f25", "text": "Супруга Никиты Воронцова — Саша (так с ноября)."}
+{"id": "c262", "entity": "e37", "label": "duplicate", "lang": "ru", "gold": "e37.f14", "text": "Он прочитал «Норвежский лес» в апреле 2024 года, понравилось."}
+{"id": "c263", "entity": "e37", "label": "none", "lang": "ru", "gold": "", "text": "Он пользуется вейпом вместо сигарет."}
+{"id": "c264", "entity": "e37", "label": "none", "lang": "ru", "gold": "", "text": "В декабре 2025 года Никита Воронцов провёл неделю в Хельсинки."}
+{"id": "c265", "entity": "e38", "label": "duplicate", "lang": "ru", "gold": "e38.f9", "text": "Дарья слушает в основном джаз."}
+{"id": "c266", "entity": "e38", "label": "contradiction", "lang": "ru", "gold": "e38.f8", "text": "Дарья не владеет автомобилем."}
+{"id": "c267", "entity": "e38", "label": "supersedes", "lang": "ru", "gold": "e38.f12", "text": "С прошлой осени Дарья Снегирёва обычно проводит выходные на даче."}
+{"id": "c268", "entity": "e38", "label": "contradiction", "lang": "ru", "gold": "e38.f11", "text": "Дарья Снегирёва не курит."}
+{"id": "c269", "entity": "e38", "label": "duplicate", "lang": "ru", "gold": "e38.f3", "text": "В апреле 2025 года Дарья Снегирёва слушала вживую трибьют-группы «Кино»."}
+{"id": "c270", "entity": "e38", "label": "none", "lang": "ru", "gold": "", "text": "На заметку: Дарья Снегирёва работает полностью удалённо."}
+{"id": "c271", "entity": "e38", "label": "none", "lang": "ru", "gold": "", "text": "Дарья Снегирёва посидела с Мирой в раменной — это было в ноябре."}
+{"id": "c272", "entity": "e39", "label": "duplicate", "lang": "ru", "gold": "e39.f0", "text": "Он готов есть пад тай каждый день."}
+{"id": "c273", "entity": "e39", "label": "contradiction", "lang": "ru", "gold": "e39.f37", "text": "Роман Кедров без очков плохо видит."}
+{"id": "c274", "entity": "e39", "label": "supersedes", "lang": "ru", "gold": "e39.f22", "text": "У Романа Кедрова четырёхдневная рабочая неделя, пятница выходной (так с августа)."}
+{"id": "c275", "entity": "e39", "label": "duplicate", "lang": "ru", "gold": "e39.f23", "text": "Старшего брата его зовут Илья."}
+{"id": "c276", "entity": "e39", "label": "duplicate", "lang": "ru", "gold": "e39.f11", "text": "Он закончил онлайн-курс по личным финансам в ноябре 2023 года."}
+{"id": "c277", "entity": "e39", "label": "none", "lang": "ru", "gold": "", "text": "Роман работает бухгалтером."}
+{"id": "c278", "entity": "e39", "label": "none", "lang": "ru", "gold": "", "text": "Он закончил онлайн-курс по акварели в июне 2023 года."}
+{"id": "c279", "entity": "e40", "label": "duplicate", "lang": "ru", "gold": "e40.f13", "text": "Алёна Брусникина — веганка."}
+{"id": "c280", "entity": "e40", "label": "contradiction", "lang": "ru", "gold": "e40.f18", "text": "Алёна Брусникина добирается до офиса на велике."}
+{"id": "c281", "entity": "e40", "label": "supersedes", "lang": "ru", "gold": "e40.f30", "text": "Супруг Алёны — Саша, раньше было иначе."}
+{"id": "c282", "entity": "e40", "label": "duplicate", "lang": "ru", "gold": "e40.f17", "text": "У Алёны нет домашних животных."}
+{"id": "c283", "entity": "e40", "label": "duplicate", "lang": "ru", "gold": "e40.f37", "text": "В сентябре Алёна Брусникина встретилась с Леной в грузинском ресторанчике на углу."}
+{"id": "c284", "entity": "e40", "label": "none", "lang": "ru", "gold": "", "text": "У неё группа крови A(II), резус плюс."}
+{"id": "c285", "entity": "e40", "label": "none", "lang": "ru", "gold": "", "text": "Алёна Брусникина прочитала «Норвежский лес» в ноябре 2025 года, понравилось."}
+{"id": "c286", "entity": "e41", "label": "duplicate", "lang": "ru", "gold": "e41.f11", "text": "Он просыпается каждое утро в половине шестого."}
+{"id": "c287", "entity": "e41", "label": "contradiction", "lang": "ru", "gold": "e41.f36", "text": "Дом у Степана в Казани."}
+{"id": "c288", "entity": "e41", "label": "supersedes", "lang": "ru", "gold": "e41.f17", "text": "С прошлой весны Степан Журавлёв не владеет автомобилем."}
+{"id": "c289", "entity": "e41", "label": "duplicate", "lang": "ru", "gold": "e41.f23", "text": "Степан Журавлёв добирается до работы за рулём."}
+{"id": "c290", "entity": "e41", "label": "duplicate", "lang": "ru", "gold": "e41.f31", "text": "Степан посидел с Костей в грузинском ресторанчике на углу — это было в июне."}
+{"id": "c291", "entity": "e41", "label": "none", "lang": "ru", "gold": "", "text": "Степан Журавлёв почти каждый вечер выпивает бокал красного вина."}
+{"id": "c292", "entity": "e41", "label": "none", "lang": "ru", "gold": "", "text": "Он ездил в Лиссабон в июне 2025 года."}
+{"id": "c293", "entity": "e42", "label": "duplicate", "lang": "ru", "gold": "e42.f5", "text": "Кстати, Ольга дважды в неделю ходит на японский."}
+{"id": "c294", "entity": "e42", "label": "contradiction", "lang": "ru", "gold": "e42.f3", "text": "Дом у Ольги Тимофеевой в Лиссабоне."}
+{"id": "c295", "entity": "e42", "label": "supersedes", "lang": "ru", "gold": "e42.f20", "text": "Любимая музыка Ольги Тимофеевой — хеви-метал (так с октября)."}
+{"id": "c296", "entity": "e42", "label": "contradiction", "lang": "ru", "gold": "e42.f6", "text": "Ольга Тимофеева родилась 17 июля."}
+{"id": "c297", "entity": "e42", "label": "duplicate", "lang": "ru", "gold": "e42.f14", "text": "Она съездила в Белград — это было в январе 2023 года."}
+{"id": "c298", "entity": "e42", "label": "none", "lang": "ru", "gold": "", "text": "На заметку: Ольга обычно проводит выходные в походах."}
+{"id": "c299", "entity": "e42", "label": "none", "lang": "ru", "gold": "", "text": "Она прочитала «Солярис» в январе 2024 года, понравилось."}
+{"id": "c300", "entity": "e43", "label": "duplicate", "lang": "ru", "gold": "e43.f0", "text": "День рождения у Льва Сорокина 3 марта."}
+{"id": "c301", "entity": "e43", "label": "contradiction", "lang": "ru", "gold": "e43.f11", "text": "Любимое блюдо Льва — пад тай."}
+{"id": "c302", "entity": "e43", "label": "supersedes", "lang": "ru", "gold": "e43.f10", "text": "Любимый жанр кино у Льва Сорокина — документалки (так с октября)."}
+{"id": "c303", "entity": "e43", "label": "duplicate", "lang": "ru", "gold": "e43.f18", "text": "На заметку: он предпочитает крафтовое пиво."}
+{"id": "c304", "entity": "e43", "label": "duplicate", "lang": "ru", "gold": "e43.f5", "text": "В январе 2023 года он прошёл курс по выпечке хлеба."}
+{"id": "c305", "entity": "e43", "label": "none", "lang": "ru", "gold": "", "text": "Машина у него — потрёпанный универсал Volvo."}
+{"id": "c306", "entity": "e43", "label": "none", "lang": "ru", "gold": "", "text": "Лев Сорокин купил кофемашину в мае 2025 года."}
+{"id": "c307", "entity": "e44", "label": "duplicate", "lang": "ru", "gold": "e44.f11", "text": "Группа крови у Евгении — третья положительная."}
+{"id": "c308", "entity": "e44", "label": "contradiction", "lang": "ru", "gold": "e44.f0", "text": "В любительской группе Евгения — басист."}
+{"id": "c309", "entity": "e44", "label": "supersedes", "lang": "ru", "gold": "e44.f12", "text": "С августа Евгения обычно засыпает после двух часов ночи."}
+{"id": "c310", "entity": "e44", "label": "contradiction", "lang": "ru", "gold": "e44.f5", "text": "Любимый жанр кино у неё — ромкомы."}
+{"id": "c311", "entity": "e44", "label": "duplicate", "lang": "ru", "gold": "e44.f8", "text": "Евгения Пташкина порадовала себя покупкой: швейную машинку, октябре 2024 года."}
+{"id": "c312", "entity": "e44", "label": "none", "lang": "ru", "gold": "", "text": "У Евгении Пташкиной четырёхдневная рабочая неделя, пятница выходной."}
+{"id": "c313", "entity": "e44", "label": "none", "lang": "ru", "gold": "", "text": "В октябре она встретилась с Леной в ботаническом саду."}
+{"id": "c321", "entity": "e46", "label": "duplicate", "lang": "ru", "gold": "e46.f6", "text": "Лиана Аксёнова учит испанский."}
+{"id": "c322", "entity": "e46", "label": "contradiction", "lang": "ru", "gold": "e46.f10", "text": "На заметку: она пьёт только кофе без кофеина."}
+{"id": "c323", "entity": "e46", "label": "supersedes", "lang": "ru", "gold": "e46.f16", "text": "С 2026 года Лиана Аксёнова готова есть пад тай каждый день."}
+{"id": "c324", "entity": "e46", "label": "duplicate", "lang": "ru", "gold": "e46.f9", "text": "Она носит обувь 45-го размера."}
+{"id": "c325", "entity": "e46", "label": "duplicate", "lang": "ru", "gold": "e46.f15", "text": "В июле 2024 года Лиана провела неделю в Казани."}
+{"id": "c326", "entity": "e46", "label": "none", "lang": "ru", "gold": "", "text": "Кстати, Лиана обычно засыпает после двух часов ночи."}
+{"id": "c327", "entity": "e46", "label": "none", "lang": "ru", "gold": "", "text": "В апреле 2025 года она слушала вживую городского симфонического оркестра."}
+{"id": "c328", "entity": "e47", "label": "duplicate", "lang": "ru", "gold": "e47.f11", "text": "Размер обуви у Вадима — 41."}
+{"id": "c329", "entity": "e47", "label": "contradiction", "lang": "ru", "gold": "e47.f34", "text": "Кстати, Вадим пьёт пиво, в основном местный крафт."}
+{"id": "c330", "entity": "e47", "label": "supersedes", "lang": "ru", "gold": "e47.f25", "text": "С прошлой осени Вадим Стрельцов больше любит, когда звонят, а не пишут."}
+{"id": "c331", "entity": "e47", "label": "duplicate", "lang": "ru", "gold": "e47.f30", "text": "Вадим Стрельцов учит японский."}
+{"id": "c332", "entity": "e47", "label": "duplicate", "lang": "ru", "gold": "e47.f4", "text": "Вадим Стрельцов был у физиотерапевта в октябре 2025 года."}
+{"id": "c333", "entity": "e47", "label": "none", "lang": "ru", "gold": "", "text": "Он пользуется вейпом вместо сигарет."}
+{"id": "c334", "entity": "e47", "label": "none", "lang": "ru", "gold": "", "text": "Вадим Стрельцов посидел с Леной в старом рынке — это было в июне."}
+{"id": "c335", "entity": "e48", "label": "duplicate", "lang": "ru", "gold": "e48.f0", "text": "Мирослава Кузнецова курит электронные сигареты."}
+{"id": "c336", "entity": "e48", "label": "contradiction", "lang": "en", "gold": "e48.f27", "text": "Miroslava has her parents in Porto."}
+{"id": "c337", "entity": "e48", "label": "supersedes", "lang": "ru", "gold": "e48.f21", "text": "Теперь Мирослава предпочитает звонки сообщениям."}
+{"id": "c338", "entity": "e48", "label": "duplicate", "lang": "en", "gold": "e48.f18", "text": "Miroslava Kuznetsova's birthday is on 17 July."}
+{"id": "c339", "entity": "e48", "label": "duplicate", "lang": "ru", "gold": "e48.f23", "text": "Мирослава Кузнецова была у дерматолога в октябре 2025 года."}
+{"id": "c340", "entity": "e48", "label": "none", "lang": "ru", "gold": "", "text": "Кстати, она стоит на воротах в любительской футбольной команде."}
+{"id": "c341", "entity": "e48", "label": "none", "lang": "en", "gold": "", "text": "Miroslava Kuznetsova read Solaris in October 2024 and liked it."}
+{"id": "c342", "entity": "e49", "label": "duplicate", "lang": "ru", "gold": "e49.f18", "text": "Из всех цветов Тимур больше всего любит жёлтый."}
+{"id": "c343", "entity": "e49", "label": "contradiction", "lang": "ru", "gold": "e49.f17", "text": "Тимур совсем не ест мясо."}
+{"id": "c344", "entity": "e49", "label": "supersedes", "lang": "en", "gold": "e49.f40", "text": "Since last winter, Timur Aliev has a dachshund called Biscuit."}
+{"id": "c345", "entity": "e49", "label": "supersedes", "lang": "ru", "gold": "e49.f25", "text": "Теперь Тимур Алиев курит электронные сигареты."}
+{"id": "c346", "entity": "e49", "label": "duplicate", "lang": "en", "gold": "e49.f27", "text": "Timur Aliev and Tamar caught up over food at the old market in February."}
+{"id": "c347", "entity": "e49", "label": "none", "lang": "ru", "gold": "", "text": "Тимур Алиев учился на архитектора."}
+{"id": "c348", "entity": "e49", "label": "none", "lang": "ru", "gold": "", "text": "Он закончил онлайн-курс по выпечке хлеба в июне 2025 года."}
+{"id": "c349", "entity": "e50", "label": "duplicate", "lang": "en", "gold": "e50.f14", "text": "Nika Gordeeva has one son, Tim."}
+{"id": "c350", "entity": "e50", "label": "contradiction", "lang": "en", "gold": "e50.f31", "text": "Note: she is a non-smoker."}
+{"id": "c351", "entity": "e50", "label": "supersedes", "lang": "en", "gold": "e50.f42", "text": "As of December 2026, she eats fish but no other meat."}
+{"id": "c352", "entity": "e50", "label": "contradiction", "lang": "en", "gold": "e50.f46", "text": "For a holiday Nika Gordeeva always heads to the sea."}
+{"id": "c353", "entity": "e50", "label": "duplicate", "lang": "ru", "gold": "e50.f43", "text": "Ника ходила на концерт «Наутилуса» в июле 2024 года."}
+{"id": "c354", "entity": "e50", "label": "none", "lang": "ru", "gold": "", "text": "Кстати, она каждый будний день ходит в офис."}
+{"id": "c355", "entity": "e50", "label": "none", "lang": "ru", "gold": "", "text": "Ника съездила в Хельсинки — это было в августе 2024 года."}
+{"id": "c363", "entity": "e52", "label": "duplicate", "lang": "en", "gold": "e52.f8", "text": "Zlata lives in a rented apartment with one bedroom."}
+{"id": "c364", "entity": "e52", "label": "contradiction", "lang": "en", "gold": "e52.f22", "text": "Note: Zlata Efimova got divorced some years ago and lives alone."}
+{"id": "c365", "entity": "e52", "label": "supersedes", "lang": "ru", "gold": "e52.f11", "text": "Дом у Златы в Риге, раньше было иначе."}
+{"id": "c366", "entity": "e52", "label": "contradiction", "lang": "en", "gold": "e52.f9", "text": "FYI: Zlata is the parent of two girls."}
+{"id": "c367", "entity": "e52", "label": "duplicate", "lang": "ru", "gold": "e52.f2", "text": "В июле 2025 года Злата приобрела серый угловой диван."}
+{"id": "c368", "entity": "e52", "label": "none", "lang": "en", "gold": "", "text": "Note: she works night shifts."}
+{"id": "c369", "entity": "e52", "label": "none", "lang": "ru", "gold": "", "text": "В ноябре 2023 года она провела неделю в Белграде."}
+{"id": "c370", "entity": "e53", "label": "duplicate", "lang": "ru", "gold": "e53.f18", "text": "Дом у него в Казани."}
+{"id": "c371", "entity": "e53", "label": "contradiction", "lang": "en", "gold": "e53.f8", "text": "Mark has an older brother, Ilya."}
+{"id": "c372", "entity": "e53", "label": "supersedes", "lang": "ru", "gold": "e53.f2", "text": "С января Марк предпочитает крафтовое пиво."}
+{"id": "c373", "entity": "e53", "label": "supersedes", "lang": "en", "gold": "e53.f20", "text": "Since last summer, Mark uses daily contact lenses."}
+{"id": "c374", "entity": "e53", "label": "duplicate", "lang": "en", "gold": "e53.f5", "text": "Mark spent a week in Yerevan in October 2025."}
+{"id": "c375", "entity": "e53", "label": "none", "lang": "ru", "gold": "", "text": "Марк ест рыбу, но не ест мясо."}
+{"id": "c376", "entity": "e53", "label": "none", "lang": "en", "gold": "", "text": "In July Mark Lebedev met Mira at Café Lumen."}
+{"id": "c377", "entity": "e54", "label": "duplicate", "lang": "ru", "gold": "e54.f36", "text": "Ева устроена в компанию «Нордвинд Логистик»."}
+{"id": "c378", "entity": "e54", "label": "contradiction", "lang": "en", "gold": "e54.f33", "text": "Note: Eva Kravets prefers to be reached on Signal."}
+{"id": "c379", "entity": "e54", "label": "supersedes", "lang": "en", "gold": "e54.f23", "text": "Recently Eva Kravets usually spends weekends hiking."}
+{"id": "c380", "entity": "e54", "label": "duplicate", "lang": "ru", "gold": "e54.f8", "text": "Она дважды в неделю занимается испанским."}
+{"id": "c381", "entity": "e54", "label": "duplicate", "lang": "ru", "gold": "e54.f28", "text": "Ева Кравец ужинала с Леной в старом рынке в июле."}
+{"id": "c382", "entity": "e54", "label": "none", "lang": "ru", "gold": "", "text": "Она пользуется однодневными линзами."}
+{"id": "c383", "entity": "e54", "label": "none", "lang": "ru", "gold": "", "text": "Ева Кравец посидела с Зоей в кафе «Люмен» — это было в ноябре."}
+{"id": "c391", "entity": "e56", "label": "duplicate", "lang": "ru", "gold": "e56.f10", "text": "Лада Петрова учит испанский."}
+{"id": "c392", "entity": "e56", "label": "contradiction", "lang": "en", "gold": "e56.f9", "text": "Note: Lada prefers beach holidays."}
+{"id": "c393", "entity": "e56", "label": "supersedes", "lang": "ru", "gold": "e56.f1", "text": "Пёс Лады Бисквит — бигль (так с декабря)."}
+{"id": "c394", "entity": "e56", "label": "supersedes", "lang": "ru", "gold": "e56.f3", "text": "Любимый цвет Лады Петровой — тёмно-синий, раньше было иначе."}
+{"id": "c395", "entity": "e56", "label": "duplicate", "lang": "en", "gold": "e56.f7", "text": "In August 2025 Lada Petrova got an aquarium."}
+{"id": "c396", "entity": "e56", "label": "none", "lang": "ru", "gold": "", "text": "Лада живёт в Тбилиси."}
+{"id": "c397", "entity": "e56", "label": "none", "lang": "en", "gold": "", "text": "In November Lada Petrova met Rustam at the Georgian place on the corner."}
+{"id": "c405", "entity": "e58", "label": "duplicate", "lang": "ru", "gold": "e58.f1", "text": "У Ирины юридическое образование."}
+{"id": "c406", "entity": "e58", "label": "contradiction", "lang": "ru", "gold": "e58.f33", "text": "Для связи Она выбирает Telegram."}
+{"id": "c407", "entity": "e58", "label": "supersedes", "lang": "en", "gold": "e58.f24", "text": "These days Irina Belaya adores Adjarian khachapuri above all."}
+{"id": "c408", "entity": "e58", "label": "contradiction", "lang": "ru", "gold": "e58.f10", "text": "Старшего брата её зовут Илья."}
+{"id": "c409", "entity": "e58", "label": "duplicate", "lang": "en", "gold": "e58.f0", "text": "She saw the dentist in September 2024."}
+{"id": "c410", "entity": "e58", "label": "none", "lang": "en", "gold": "", "text": "Most weekends Irina Belaya stays in and plays video games."}
+{"id": "c411", "entity": "e58", "label": "none", "lang": "ru", "gold": "", "text": "Она закончила онлайн-курс по акварели в июле 2023 года."}
+{"id": "c412", "entity": "e59", "label": "duplicate", "lang": "en", "gold": "e59.f12", "text": "Savva is a pescatarian."}
+{"id": "c413", "entity": "e59", "label": "contradiction", "lang": "ru", "gold": "e59.f7", "text": "Савва Морозов слушает в основном хеви-метал."}
+{"id": "c414", "entity": "e59", "label": "supersedes", "lang": "ru", "gold": "e59.f9", "text": "Он играет в нападении в любительской футбольной команде (так с апреля)."}
+{"id": "c415", "entity": "e59", "label": "supersedes", "lang": "en", "gold": "e59.f8", "text": "Update: Savva Morozov prefers city breaks with museums."}
+{"id": "c416", "entity": "e59", "label": "duplicate", "lang": "en", "gold": "e59.f5", "text": "Savva Morozov had dinner with Rustam at the old market in May."}
+{"id": "c417", "entity": "e59", "label": "none", "lang": "ru", "gold": "", "text": "Савва Морозов владеет собственным домом с садом."}
+{"id": "c418", "entity": "e59", "label": "none", "lang": "en", "gold": "", "text": "In May 2025 Savva Morozov completed a photography course."}
+{"id": "c419", "entity": "e60", "label": "duplicate", "lang": "en", "gold": "e60.f40", "text": "Taisia Orlova has perfect eyesight and needs no glasses."}
+{"id": "c420", "entity": "e60", "label": "contradiction", "lang": "en", "gold": "e60.f18", "text": "Signal is the best way to reach her."}
+{"id": "c421", "entity": "e60", "label": "supersedes", "lang": "ru", "gold": "e60.f20", "text": "Недавно поменялось: Таисия играет в нападении в любительской футбольной команде."}
+{"id": "c422", "entity": "e60", "label": "duplicate", "lang": "ru", "gold": "e60.f31", "text": "Группа крови у Таисии Орловой — вторая положительная."}
+{"id": "c423", "entity": "e60", "label": "duplicate", "lang": "en", "gold": "e60.f22", "text": "Taisia Orlova read War and Peace in January 2024 and liked it."}
+{"id": "c424", "entity": "e60", "label": "none", "lang": "en", "gold": "", "text": "Note: she doesn't have kids."}
+{"id": "c425", "entity": "e60", "label": "none", "lang": "ru", "gold": "", "text": "В феврале 2025 года Таисия Орлова приобрела плёночный фотоаппарат."}
+{"id": "c426", "entity": "e61", "label": "duplicate", "lang": "ru", "gold": "e61.f16", "text": "Кирилл обосновался в Казани."}
+{"id": "c427", "entity": "e61", "label": "contradiction", "lang": "en", "gold": "e61.f29", "text": "Kirill Ushakov mostly watches documentaries."}
+{"id": "c428", "entity": "e61", "label": "supersedes", "lang": "en", "gold": "e61.f25", "text": "As of December 2024, Kirill Ushakov takes Japanese lessons twice a week."}
+{"id": "c429", "entity": "e61", "label": "duplicate", "lang": "ru", "gold": "e61.f5", "text": "Кирилл Ушаков ходит на работу пешком."}
+{"id": "c430", "entity": "e61", "label": "duplicate", "lang": "ru", "gold": "e61.f10", "text": "В июне 2025 года Кирилл Ушаков слушал вживую городского симфонического оркестра."}
+{"id": "c431", "entity": "e61", "label": "none", "lang": "ru", "gold": "", "text": "Он курит электронные сигареты."}
+{"id": "c432", "entity": "e61", "label": "none", "lang": "ru", "gold": "", "text": "В декабре 2024 года Кирилл Ушаков провёл неделю в Хельсинки."}
+{"id": "c433", "entity": "e62", "label": "duplicate", "lang": "ru", "gold": "e62.f17", "text": "Кстати, Мила растит двух дочек."}
+{"id": "c434", "entity": "e62", "label": "contradiction", "lang": "en", "gold": "e62.f23", "text": "Telegram is the best way to reach Mila."}
+{"id": "c435", "entity": "e62", "label": "supersedes", "lang": "en", "gold": "e62.f25", "text": "Mila Dobrynina's favourite dish is pad thai (that changed in December)."}
+{"id": "c436", "entity": "e62", "label": "duplicate", "lang": "ru", "gold": "e62.f15", "text": "На заметку: она ходит на работу пешком."}
+{"id": "c437", "entity": "e62", "label": "duplicate", "lang": "en", "gold": "e62.f11", "text": "She read Dune in July 2025 and liked it."}
+{"id": "c438", "entity": "e62", "label": "none", "lang": "ru", "gold": "", "text": "Размер обуви у неё — 45."}
+{"id": "c439", "entity": "e62", "label": "none", "lang": "ru", "gold": "", "text": "В сентябре 2025 года она прошла курс по ораторскому мастерству."}
+{"id": "c440", "entity": "e63", "label": "duplicate", "lang": "ru", "gold": "e63.f19", "text": "Ян Ковальский добирается до офиса пешком."}
+{"id": "c441", "entity": "e63", "label": "contradiction", "lang": "ru", "gold": "e63.f7", "text": "Любимое блюдо его — лазанья."}
+{"id": "c442", "entity": "e63", "label": "supersedes", "lang": "en", "gold": "e63.f17", "text": "Recently he plays drums in an amateur rock band."}
+{"id": "c443", "entity": "e63", "label": "supersedes", "lang": "en", "gold": "e63.f3", "text": "Yan Kovalsky is divorced since February 2026."}
+{"id": "c444", "entity": "e63", "label": "duplicate", "lang": "ru", "gold": "e63.f6", "text": "Ян был у физиотерапевта в июле 2025 года."}
+{"id": "c445", "entity": "e63", "label": "none", "lang": "ru", "gold": "", "text": "На заметку: Ян Ковальский учился в университете на химика."}
+{"id": "c446", "entity": "e63", "label": "none", "lang": "en", "gold": "", "text": "In April 2025 Yan Kovalsky saw Kino tribute band live."}
+{"id": "c447", "entity": "e64", "label": "duplicate", "lang": "ru", "gold": "e64.f0", "text": "У Софьи Рябовой есть бигль по кличке Бисквит."}
+{"id": "c448", "entity": "e64", "label": "contradiction", "lang": "en", "gold": "e64.f4", "text": "Sofya Ryabova's favourite dish is borscht."}
+{"id": "c449", "entity": "e64", "label": "supersedes", "lang": "en", "gold": "e64.f28", "text": "In amateur football Sofya Ryabova plays at the back since April 2024."}
+{"id": "c450", "entity": "e64", "label": "contradiction", "lang": "en", "gold": "e64.f18", "text": "Sofya's blood type is B positive."}
+{"id": "c451", "entity": "e64", "label": "duplicate", "lang": "en", "gold": "e64.f1", "text": "Sofya Ryabova saw a dermatologist in July 2025."}
+{"id": "c452", "entity": "e64", "label": "none", "lang": "ru", "gold": "", "text": "Софья Рябова просыпается каждое утро в половине шестого."}
+{"id": "c453", "entity": "e64", "label": "none", "lang": "ru", "gold": "", "text": "Софья закончила онлайн-курс по Python в августе 2025 года."}
+{"id": "c454", "entity": "e65", "label": "duplicate", "lang": "ru", "gold": "e65.f21", "text": "Группа крови у Бориса — третья положительная."}
+{"id": "c455", "entity": "e65", "label": "contradiction", "lang": "ru", "gold": "e65.f33", "text": "Для связи Борис Нечаев выбирает Signal."}
+{"id": "c456", "entity": "e65", "label": "supersedes", "lang": "ru", "gold": "e65.f36", "text": "Борис добирается до офиса на велике — с августа 2026 года."}
+{"id": "c457", "entity": "e65", "label": "supersedes", "lang": "en", "gold": "e65.f3", "text": "Recently he usually spends weekends at home playing video games."}
+{"id": "c458", "entity": "e65", "label": "duplicate", "lang": "en", "gold": "e65.f17", "text": "In February 2024 he saw the city symphony orchestra live."}
+{"id": "c459", "entity": "e65", "label": "none", "lang": "en", "gold": "", "text": "Boris's home is in Tbilisi."}
+{"id": "c460", "entity": "e65", "label": "none", "lang": "en", "gold": "", "text": "Boris Nechaev finished an online course in watercolour painting in January 2023."}
+{"id": "c461", "entity": "e66", "label": "duplicate", "lang": "ru", "gold": "e66.f13", "text": "У Агаты нет машины."}
+{"id": "c462", "entity": "e66", "label": "contradiction", "lang": "ru", "gold": "e66.f0", "text": "На заметку: Агата Левина обосновалась в Казани."}
+{"id": "c463", "entity": "e66", "label": "supersedes", "lang": "ru", "gold": "e66.f14", "text": "Теперь Агата Левина ест рыбу, но не ест мясо."}
+{"id": "c464", "entity": "e66", "label": "duplicate", "lang": "en", "gold": "e66.f8", "text": "She is an only child."}
+{"id": "c465", "entity": "e66", "label": "duplicate", "lang": "ru", "gold": "e66.f12", "text": "В июне Агата Левина встретилась с Рустамом в раменной."}
+{"id": "c466", "entity": "e66", "label": "none", "lang": "ru", "gold": "", "text": "На заметку: Агата Левина носит обувь 45-го размера."}
+{"id": "c467", "entity": "e66", "label": "none", "lang": "en", "gold": "", "text": "Agata Levina bought hiking boots in June 2025."}
+{"id": "c468", "entity": "e67", "label": "duplicate", "lang": "en", "gold": "e67.f32", "text": "Note: Daniyar is the lead singer of an amateur rock band."}
+{"id": "c469", "entity": "e67", "label": "contradiction", "lang": "ru", "gold": "e67.f40", "text": "На заметку: Данияр не пьёт кофе, только чай."}
+{"id": "c470", "entity": "e67", "label": "supersedes", "lang": "ru", "gold": "e67.f30", "text": "Данияр Сеитов предпочитает звонки сообщениям — с января 2024 года."}
+{"id": "c471", "entity": "e67", "label": "supersedes", "lang": "ru", "gold": "e67.f6", "text": "С 2026 года Данияр ездит на работу на метро."}
+{"id": "c472", "entity": "e67", "label": "duplicate", "lang": "en", "gold": "e67.f39", "text": "Daniyar went to a concert of Kino tribute band in June 2024."}
+{"id": "c473", "entity": "e67", "label": "none", "lang": "ru", "gold": "", "text": "У Данияра есть такса по кличке Бисквит."}
+{"id": "c474", "entity": "e67", "label": "none", "lang": "ru", "gold": "", "text": "Данияр Сеитов ездил в Хельсинки в июле 2023 года."}
+{"id": "c482", "entity": "e69", "label": "duplicate", "lang": "ru", "gold": "e69.f41", "text": "Сестру-близнеца Арсения Котова зовут Вера."}
+{"id": "c483", "entity": "e69", "label": "contradiction", "lang": "en", "gold": "e69.f35", "text": "In his amateur band he is the drummer."}
+{"id": "c484", "entity": "e69", "label": "supersedes", "lang": "en", "gold": "e69.f18", "text": "As of April 2024, Arseny is an early riser and gets up at 5:30."}
+{"id": "c485", "entity": "e69", "label": "contradiction", "lang": "en", "gold": "e69.f11", "text": "Arseny Kotov is learning Japanese."}
+{"id": "c486", "entity": "e69", "label": "duplicate", "lang": "en", "gold": "e69.f13", "text": "Arseny and Bogdan caught up over food at Café Lumen in July."}
+{"id": "c487", "entity": "e69", "label": "none", "lang": "ru", "gold": "", "text": "Арсений Котов работает четыре дня в неделю."}
+{"id": "c488", "entity": "e69", "label": "none", "lang": "en", "gold": "", "text": "Arseny Kotov treated himself to hiking boots in May 2024."}
+{"id": "c489", "entity": "e70", "label": "duplicate", "lang": "en", "gold": "e70.f16", "text": "Note: she would eat pad thai every day if she could."}
+{"id": "c490", "entity": "e70", "label": "contradiction", "lang": "ru", "gold": "e70.f22", "text": "У неё один сын, Тима."}
+{"id": "c491", "entity": "e70", "label": "supersedes", "lang": "ru", "gold": "e70.f26", "text": "Вероника всю неделю работает из дома — с августа 2026 года."}
+{"id": "c492", "entity": "e70", "label": "duplicate", "lang": "en", "gold": "e70.f5", "text": "Note: she is an accountant."}
+{"id": "c493", "entity": "e70", "label": "duplicate", "lang": "ru", "gold": "e70.f13", "text": "Она ходила на концерт трибьют-группы Radiohead в апреле 2025 года."}
+{"id": "c494", "entity": "e70", "label": "none", "lang": "ru", "gold": "", "text": "На заметку: она ездит на работу на велосипеде."}
+{"id": "c495", "entity": "e70", "label": "none", "lang": "en", "gold": "", "text": "Veronika Sazonova treated herself to hiking boots in April 2024."}
+{"id": "c496", "entity": "e71", "label": "duplicate", "lang": "en", "gold": "e71.f18", "text": "Ilya Bragin prefers to be reached on Telegram."}
+{"id": "c497", "entity": "e71", "label": "contradiction", "lang": "en", "gold": "e71.f5", "text": "He is married to Sasha."}
+{"id": "c498", "entity": "e71", "label": "supersedes", "lang": "ru", "gold": "e71.f4", "text": "Теперь он — жаворонок, встаёт в 5:30."}
+{"id": "c499", "entity": "e71", "label": "duplicate", "lang": "ru", "gold": "e71.f9", "text": "Илья учит турецкий."}
+{"id": "c500", "entity": "e71", "label": "duplicate", "lang": "en", "gold": "e71.f10", "text": "In May 2023 Ilya Bragin travelled to Vienna."}
+{"id": "c501", "entity": "e71", "label": "none", "lang": "en", "gold": "", "text": "Note: Ilya Bragin loves horror films."}
+{"id": "c502", "entity": "e71", "label": "none", "lang": "en", "gold": "", "text": "Ilya saw a dermatologist in January 2025."}

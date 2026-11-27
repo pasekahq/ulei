@@ -11,8 +11,9 @@ prompt, C7 `pointers` on owner turns, and C7 `search` and `propose` behind the t
 installed and run by `deploy/systemd/ulei-garden.service` (ADR-0075). Of the other modules,
 only the engine calls the daemon today: its turns, and the night gardener `ulei-engine night`
 (ADR-0078), run by the user timer `ulei-night.timer`, which calls `seedbed_take`,
-`seedbed_done`, `forget_take` and `forget_done`; until it processes them, seedbed records do not
-become facts and the digest receives nothing new from them.
+`seedbed_done`, `forget_take`, `forget_done`, `reconcile_take` and `reconcile_done`; until it
+processes them, seedbed records do not become facts and the digest receives nothing new from
+them. The engine's tool `garden_review` reads `reconcile_review`.
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
@@ -177,8 +178,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   it is then (no check while it holds the ONNX model and no engine file, which also ends a hold
   of an earlier verdict); a corrupted verdict holds the helper down
   without restarts and drops, in one unit of work, the vectors computed since the last passed
-  check (`fact_vectors.computed_at`, `model_checks`), withdraws the open `contradiction` items
-  reconciliation wrote from them and queues their facts for reconciliation again; a passed one
+  check (`fact_vectors.computed_at`, `model_checks`), and puts the facts whose dense hints
+  were computed since back to waiting for their hints (ADR-0096 section 6); a passed one
   brings it back. After a check that does not pass (corrupted, unusable or without a result) the
   next one comes `worker::CHECK_RETRY` seconds later, doubling up to `worker::CHECK_RETRY_MAX`
   and never past the interval; `health` shows the last check (`model_check`) and the versions
@@ -211,11 +212,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   of every pointer, for facts and records alike; `api` only formats them.
 - A request embeds only its own query and never calls the second level or waits for the inbox;
   everything else, helper restarts and the passages of facts without a vector of the helper's
-  model and the top-k reconciliation of new facts without an attribute
-  (`Edge::reconcile_similar`) included, runs on the daemon's worker thread (`worker`), on its
-  own store connection, which sleeps until its nearest deadline. The worker embeds current
-  versions first, then reconciles, then embeds the closed versions an `as_of` search can reach.
-  It sends one passage or reconciles one fact per tick, only with the helper ready; with a
+  model and the hints of new facts without an attribute (`Edge::hint`) included, runs on the
+  daemon's worker thread (`worker`), on its own store connection, which sleeps until its
+  nearest deadline. The worker embeds current versions first, then hints, then embeds the
+  closed versions an `as_of` search can reach.
+  It sends one passage or gives one fact its dense hints per tick, only with the helper ready; with a
   helper of two lanes at once, as a query does not wait for the passage in flight, with one of
   a single lane after `worker::QUIET` seconds without a `search` or `pointers`, but never later
   than `worker::QUIET_CAP` seconds after that work was first held back, and a waiting query
@@ -227,6 +228,44 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   helper's model is skipped, one stderr line without its text, and a failed one goes behind
   the others. The worker and the request path read time only through `worker::Clock`
   (ADR-0047 section 6).
+- A fact the edge accepts without `attribute` and `secret_ref` waits in `reconcile_queue`
+  (ADR-0096). `Edge::hint` gives it once its hints, the `edge::HINTS` (5) current facts of its
+  entity nearest to it by `search::nearest`, other than facts queued after it and pairs an undo
+  kept: by cosine of the stored vectors of the helper's model when the fact has one, with no
+  threshold and no lexical fusion (the worker, after the passage), else by the
+  entity-filtered lexical ranking, at once without an embedder and `edge::HINT_WAIT` after the
+  fact's recording while no helper is ready or its passage is skipped, computed by
+  `reconcile_take` (`judge::hint_lexically`), never in the background, so a garden without an
+  embedder idles as before. The hints go into
+  `reconcile_hint`, the row becomes `hinted`, and a fact alone in its entity leaves the queue.
+  The worker never decides anything and never writes a digest item; there is no cosine
+  threshold of any model. `garden.edge.reconcile_min_cosine` is read and ignored with one
+  stderr line. The selection eval `tests/reconcile_eval.rs` runs the frozen synthetic set of
+  `tests/fixtures/reconcile-eval/` (`ci/reconcile_eval/gen.py` writes and `--check`s it).
+- The night's judge (ADR-0096) runs in `ulei-engine night`, never here: `judge` is the
+  garden's side. `reconcile_take` gives the due lexical hints, then reads the `hinted` facts
+  with their current hints.
+  `reconcile_done` checks every item before it applies any (`judge::check`: a fact that neither
+  waits with hints nor was judged is `not_found`, a verdict on a fact not among its hints
+  `invalid_request`), adds the judge's `stats` to the counters, then runs `judge::apply` per
+  fact, one unit of work each: every contradiction becomes an open `contradiction` digest item
+  with `fact_id` the new fact, `conflicts_with` the hint and the note in its
+  `reconcile_judgement` row; only without one are supersedes applied by `edge::source_rank`
+  (`Edge::retract` of the hint, kept outside the new fact's interval), one the rank forbids
+  becoming a contradiction; only without either is the first duplicate applied, the new fact
+  retracted in favour of the hint with a `duplicate` proof row; a verdict on a hint or fact no
+  longer current is `stale`, others `not_applied`. Every verdict is a `reconcile_judgement` row
+  (the audit: both ids, entity, relation, what was applied, note, judge, basis, embedder,
+  time), the fact a `reconcile_judged` row, and it leaves the queue; a fact judged before
+  answers its stored outcomes. Nothing is pushed: no C1 event, no message. `search` marks a
+  fact in an open judged contradiction `disputed` with `conflicts_with` and `conflict_note`
+  (`judge::open_conflict`). `reconcile_review` only reads; `reconcile_undo` reverses one change
+  in one unit of work (`Store::restore` writes the retracted fact back as a new current copy;
+  a merge's proof row becomes `undone`; a supersede's kept slices are closed; a contradiction's
+  open item is `withdrawn`) and keeps the pair in `reconcile_kept`. `health.reconcile` holds the
+  anonymous counters of `reconcile_stats` (no text, no ids) and nothing leaves the host. A
+  `reconcile_done` that retracted a fact, and every undo, render the core profile and wake the
+  worker.
 - The dense side of the daemon scans `matrix::Matrix`, the resident f32 rows of the helper's
   model that only the worker writes: it rebuilds them, deleting the vectors of every other
   model, when the helper's model changes and syncs them with the store after every tick that

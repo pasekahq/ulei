@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use ulei_garden::api::ApiConfig;
-use ulei_garden::edge::EdgeConfig;
+use ulei_garden::edge::{EdgeConfig, HINT_WAIT};
 use ulei_garden::embed::check::Verdict;
 use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, INDEX_NICE, StartError, lower_this_thread};
 use ulei_garden::embed::supervisor::{STEADY, Supervisor};
@@ -1243,8 +1243,37 @@ fn drain(worker: &mut Worker<Fake>, clock: &Fake) -> usize {
     due
 }
 
-/// "Ada eats meat." at `NOW` and "Ada is vegetarian." at `NOW + 10`, both written, and the
-/// worker over `helper` ticked until the contradiction is queued.
+/// The hints stored for fact `id`, best first, with their basis.
+fn hints_of(path: &Path, id: &str) -> Vec<(String, String)> {
+    Store::open(path)
+        .unwrap()
+        .conn()
+        .prepare("SELECT hint, basis FROM reconcile_hint WHERE fact = ?1 ORDER BY rank")
+        .unwrap()
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The night's judge's verdict over C7 `reconcile_done`: `new` contradicts `earlier`.
+fn judge_contradiction<C: Clock>(server: &mut Server<C>, new: &str, earlier: &str) {
+    let answer: c7::ReconcileDoneResponse = serde_json::from_slice(&call(
+        server,
+        "reconcile_done",
+        &json!({"judge": "scripted judge-v1", "items": [{"fact_id": new, "verdicts": [
+            {"hint": earlier, "relation": "contradiction", "note": "meat vs vegetarian"}]}]}),
+    ))
+    .unwrap();
+    assert_eq!(
+        answer.items[0].outcomes[0].applied,
+        c7::ReconcileApplied::Contradiction
+    );
+}
+
+/// "Ada eats meat." at `NOW` and "Ada is vegetarian." at `NOW + 10`, both written, the worker
+/// over `helper` ticked until the second has its hints, and the contradiction the night's judge
+/// recorded between them.
 struct Contradiction {
     server: Server<Fake>,
     clock: Fake,
@@ -1263,6 +1292,9 @@ fn contradiction(scratch: &Scratch) -> Contradiction {
     clock.0.set(NOW + 10);
     let vegetarian = accepted(&mut server, "Ada is vegetarian.");
     drain(&mut worker, &clock);
+    assert_eq!(hints_of(&scratch.store(), &vegetarian)[0].0, meat);
+    clock.0.set(NOW + 20);
+    judge_contradiction(&mut server, &vegetarian, &meat);
     let mut items = digest(&mut server);
     assert_eq!(items.len(), 1);
     Contradiction {
@@ -1279,7 +1311,7 @@ fn texts(found: &c7::SearchResponse) -> Vec<&str> {
 }
 
 #[test]
-fn a_new_fact_close_to_a_current_one_is_written_and_queued_as_a_contradiction_once_reconciled() {
+fn a_new_fact_gets_its_nearest_earlier_facts_as_hints_once_embedded_and_no_digest_item() {
     let scratch = Scratch::new();
     let store = private_store(&scratch);
     let helper = diet_helper(&scratch);
@@ -1293,7 +1325,6 @@ fn a_new_fact_close_to_a_current_one_is_written_and_queued_as_a_contradiction_on
         scripted::log(&scratch.0, "diet").is_empty(),
         "a propose embeds nothing"
     );
-    assert_eq!(digest(&mut server).len(), 0);
 
     assert_eq!(worker.tick(), NOW + 10);
     assert_eq!(worker.tick(), NOW + 10, "both passages embedded");
@@ -1304,28 +1335,27 @@ fn a_new_fact_close_to_a_current_one_is_written_and_queued_as_a_contradiction_on
     assert_eq!(
         worker.tick(),
         NOW + 10 + QUIET,
-        "the reconciliation waits for the query"
+        "the hints wait for the query"
     );
-    assert_eq!(digest(&mut server).len(), 0);
+    assert_eq!(hints_of(&scratch.store(), &vegetarian), []);
 
     clock.0.set(NOW + 10 + QUIET);
     assert_eq!(drain(&mut worker, &clock), 2, "each new fact once");
-    let items = digest(&mut server);
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].reason, c7::DigestReason::Contradiction);
-    assert_eq!(items[0].candidate.fact, "Ada is vegetarian.");
-    assert_eq!(items[0].conflicts_with.as_deref(), Some(meat.as_str()));
-    assert_eq!(items[0].conflicting_fact.as_deref(), Some("Ada eats meat."));
+    assert_eq!(
+        hints_of(&scratch.store(), &vegetarian),
+        [(meat.clone(), "dense".to_owned())]
+    );
+    assert_eq!(
+        hints_of(&scratch.store(), &meat),
+        [],
+        "the earlier fact is weighed when the later one is"
+    );
+    assert_eq!(digest(&mut server).len(), 0, "the worker decides nothing");
     assert!(current(&scratch.store(), &meat));
     assert!(current(&scratch.store(), &vegetarian));
 
     clock.0.set(NOW + 100);
     assert_eq!(drain(&mut worker, &clock), 0);
-    assert_eq!(
-        digest(&mut server).len(),
-        1,
-        "a reconciled fact is not taken again"
-    );
 }
 
 #[test]
@@ -1405,43 +1435,27 @@ fn replace_writes_the_replacement_and_retracts_the_new_fact_in_its_favour() {
 }
 
 #[test]
-fn a_dissimilar_fact_of_the_same_entity_makes_no_item() {
+fn a_dissimilar_fact_of_the_same_entity_is_still_a_hint_since_no_threshold_cuts_it() {
     let scratch = Scratch::new();
     let store = private_store(&scratch);
     let helper = diet_helper(&scratch);
     let clock = Fake::at(NOW);
     let mut server = server_over(&scratch, &helper, &clock);
     let mut worker = worker_over(&scratch, store, &helper, &clock);
-    accepted(&mut server, "Ada eats meat.");
+    let meat = accepted(&mut server, "Ada eats meat.");
     clock.0.set(NOW + 10);
     let chess = accepted(&mut server, "Ada plays chess.");
     assert_eq!(drain(&mut worker, &clock), 4);
     assert_eq!(digest(&mut server).len(), 0);
+    assert_eq!(
+        hints_of(&scratch.store(), &chess),
+        [(meat, "dense".to_owned())]
+    );
     assert!(current(&scratch.store(), &chess));
 }
 
 #[test]
-fn a_rival_with_the_same_normalised_text_is_no_contradiction() {
-    let scratch = Scratch::new();
-    let store = private_store(&scratch);
-    let helper = diet_helper(&scratch);
-    let clock = Fake::at(NOW);
-    let mut server = server_over(&scratch, &helper, &clock);
-    let mut worker = worker_over(&scratch, store, &helper, &clock);
-    accepted(&mut server, "Ada eats meat.");
-    Store::open(&scratch.store())
-        .unwrap()
-        .insert_fact(&Fact {
-            entity: EntityId("ada-example".into()),
-            ..fact("f-same", "ADA  eats meat!", None)
-        })
-        .unwrap();
-    assert_eq!(drain(&mut worker, &clock), 3);
-    assert_eq!(digest(&mut server).len(), 0);
-}
-
-#[test]
-fn without_a_helper_nothing_is_reconciled_and_the_item_comes_once_the_helper_is_there() {
+fn without_an_embedder_the_nights_take_hints_lexically_at_once() {
     let scratch = Scratch::new();
     let store = private_store(&scratch);
     let clock = Fake::at(NOW);
@@ -1465,16 +1479,60 @@ fn without_a_helper_nothing_is_reconciled_and_the_item_comes_once_the_helper_is_
     .unwrap();
     let meat = accepted(&mut server, "Ada eats meat.");
     clock.0.set(NOW + 10);
-    accepted(&mut server, "Ada is vegetarian.");
-    assert_eq!(lexical.tick(), NOW + SCHEDULE.maintain_interval);
+    let vegetarian = accepted(&mut server, "Ada no longer eats meat.");
+    assert_eq!(
+        lexical.tick(),
+        NOW + SCHEDULE.maintain_interval,
+        "the worker idles: lexical hints are the night's"
+    );
+    assert_eq!(hints_of(&scratch.store(), &vegetarian), []);
+    let taken = take(&mut server);
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].basis, c7::HintBasis::Lexical);
+    assert_eq!(
+        hints_of(&scratch.store(), &vegetarian),
+        [(meat, "lexical".to_owned())]
+    );
     assert_eq!(digest(&mut server).len(), 0);
+}
 
-    let helper = diet_helper(&scratch);
-    let mut dense = worker_over(&scratch, scratch.open(), &helper, &clock);
-    assert_eq!(drain(&mut dense, &clock), 4);
-    let items = digest(&mut server);
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].conflicts_with.as_deref(), Some(meat.as_str()));
+/// C7 `reconcile_take` over `server`.
+fn take<C: Clock>(server: &mut Server<C>) -> Vec<c7::ReconcileItem> {
+    let answer: c7::ReconcileTakeResponse =
+        serde_json::from_slice(&call(server, "reconcile_take", &json!({}))).unwrap();
+    answer.items
+}
+
+#[test]
+fn with_the_helper_down_the_nights_take_hints_lexically_an_hour_after_the_fact() {
+    let scratch = Scratch::new();
+    let store = private_store(&scratch);
+    let clock = Fake::at(NOW);
+    let exits = scripted::script(&scratch.0, "exits", &scripted::exits_after(0));
+    let (helper, _) = supervised(move |n| match n {
+        0 => scripted::start(&exits, CALL_DEADLINE),
+        _ => Err(StartError::Refused("down in this test".into())),
+    });
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+    let meat = accepted(&mut server, "Ada eats meat.");
+    clock.0.set(NOW + 10);
+    let vegetarian = accepted(&mut server, "Ada no longer eats meat.");
+    for _ in 0..3 {
+        worker.tick();
+    }
+    assert!(
+        helper.helper().is_err(),
+        "the helper fell on its first passage"
+    );
+    assert_eq!(take(&mut server), [], "not an hour yet");
+    assert_eq!(hints_of(&scratch.store(), &vegetarian), []);
+    clock.0.set(NOW + 10 + HINT_WAIT);
+    assert_eq!(take(&mut server).len(), 1);
+    assert_eq!(
+        hints_of(&scratch.store(), &vegetarian),
+        [(meat, "lexical".to_owned())]
+    );
 }
 
 /// Asserts that the dense side over the resident matrix of `helper` equals the one over the

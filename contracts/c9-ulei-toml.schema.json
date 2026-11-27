@@ -458,7 +458,7 @@
             },
             "reconcile_min_cosine": {
               "type": ["integer", "string"],
-              "description": "Least cosine at which a new fact and a current fact of the same entity are reconciled, a decimal; default `\"0.85\"`."
+              "description": "No longer read (ADR-0096): the daemon accepts it with one stderr line and ignores it; removed in the next release. Embeddings only pick the earlier facts a model judges at night."
             }
           }
         },
@@ -692,7 +692,7 @@
     },
     "night": {
       "type": "object",
-      "description": "The night gardener, `ulei-engine night` (ADR-0078): it sorts the seedbed, the forget queue and the configured archive history into the garden through the extraction model; it also reads `qb.socket`, `garden.socket` and `memory.socket`.",
+      "description": "The night gardener, `ulei-engine night` (ADR-0078): it sorts the seedbed, the forget queue and the configured archive history into the garden through the extraction model, and has the judge weigh new facts against their hints (ADR-0096); it also reads `qb.socket`, `garden.socket` and `memory.socket`.",
       "additionalProperties": false,
       "properties": {
         "route": {
@@ -738,6 +738,14 @@
         "seed_batch": {
           "type": "integer",
           "description": "Seedbed records per extraction call, 1 to 100; default 20."
+        },
+        "judge_max_usd": {
+          "type": ["integer", "string"],
+          "description": "Most USD the judge of stage d spends in one run, a decimal, a budget of its own beside `max_usd` under the same prices, so the extraction stages cannot starve it; facts left when it is spent wait for the next run (ADR-0096); default `\"0.5\"`."
+        },
+        "judge_batch": {
+          "type": "integer",
+          "description": "New facts per judge call of stage d, whole entities, 1 to 100; default 25."
         },
         "sources": {
           "type": "string",

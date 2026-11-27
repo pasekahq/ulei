@@ -534,7 +534,7 @@ impl<C: Clock> Worker<C> {
 
     /// Restarts the helper when it is down and its pause is over, else does one piece of
     /// [`Worker::work`]: embeds one passage or reconciles one new fact with the facts most like
-    /// it ([`Edge::reconcile_similar`]); the deadline of the next restart, passage or
+    /// it, its hints for the night's judge ([`Edge::hint`]); the deadline of the next restart, passage or
     /// reconciliation. With a helper of two lanes the work runs at once; with one of a single
     /// lane it waits until no `search` or `pointers` has arrived for [`QUIET`] seconds, but at
     /// most [`QUIET_CAP`] seconds from the tick that first held it back. A passage the helper refuses is one stderr line `garden: worker: embed`;
@@ -590,14 +590,14 @@ impl<C: Clock> Worker<C> {
         self.deferred_since = None;
         let (fact, text) = match work {
             Work::Passage(fact, text) => (fact, text),
-            Work::Reconcile(fact) => {
+            Work::Hint(fact) => {
                 let edge = self.edge;
-                return match Edge::new(&mut self.store, edge).reconcile_similar(
+                return match Edge::new(&mut self.store, edge).hint(
                     &fact,
-                    helper.model_id(),
+                    Some(helper.model_id()),
                     now,
                 ) {
-                    Ok(()) => Some(now),
+                    Ok(_) => Some(now),
                     Err(e) => {
                         self.fail(e.class());
                         None
@@ -775,8 +775,8 @@ impl<C: Clock> Worker<C> {
         if let Some((fact, text)) = self.store.missing_vector_skipping(model, false, &waiting)? {
             return Ok(Some(Work::Passage(fact, text)));
         }
-        if let Some(fact) = Edge::new(&mut self.store, self.edge).unreconciled(model)? {
-            return Ok(Some(Work::Reconcile(fact)));
+        if let Some(fact) = Edge::new(&mut self.store, self.edge).dense_waiting(model)? {
+            return Ok(Some(Work::Hint(fact)));
         }
         let closed = self.store.missing_vector_skipping(model, true, &waiting)?;
         Ok(closed.map(|(fact, text)| Work::Passage(fact, text)))
@@ -928,8 +928,8 @@ struct Deferral {
 enum Work {
     /// A current fact or a closed version without a vector and the passage to embed for it.
     Passage(FactId, String),
-    /// A new fact waiting for its reconciliation.
-    Reconcile(FactId),
+    /// A new fact waiting for its hints, with a vector of the helper's model.
+    Hint(FactId),
 }
 
 /// Acts on a passed check of the model file `file` with content `digest`: records the file as
