@@ -1,14 +1,17 @@
 #!/bin/sh
 # Installs a ulei release for the current account, without root (ADR-0042 section 10, ADR-0056
 # section 6, ADR-0070, ADR-0071 section 8, ADR-0075, ADR-0078,
-# ADR-0097, ADR-0101).
+# ADR-0097, ADR-0101, ADR-0103).
 #   deploy/install.sh RELEASE_DIR
 #   deploy/install.sh --connector NAME --dir DIR RELEASE_DIR
 # Before copying anything, both check every file RELEASE_DIR/SHA256SUMS lists against it, and that
 # it lists every ulei binary and otherwise only the root helper ulei-priv and connector files
 # connectors/<name>/<file>. The first puts the binaries into $HOME/.local/bin (mode 0755) and the
 # user units beside this script into ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user (mode 0644),
-# no connector and not ulei-priv, which the owner installs as root (ADR-0073). The second
+# no connector and not ulei-priv, which the owner installs as root (ADR-0073). The class slices
+# hive-heads, hive-urgent and background get their caps appended (ADR-0103): CPUQuota a share of
+# the CPUs (nproc), and the IOPS caps shares of the [host.io] table of ulei.toml, without which
+# they get none; it says so, and whether the user manager has the io controller. The second
 # puts the files of connectors/NAME into DIR/NAME: connector.json with mode 0644, the others 0755.
 # A file already in place with the same bytes is left as it is. It never writes ulei.toml or a
 # secret and never calls systemctl: it prints the next steps for the operator. A failure exits 1
@@ -53,6 +56,77 @@ entry() {
   file=${file#[ *]}
 }
 
+# Reads the table [host.io] of the ulei.toml $1 into $device, $read_iops and $write_iops, all
+# empty without the table; only that table form is read, so a host key in another form, a missing
+# key or a malformed value fails the install.
+host_io() {
+  device="" read_iops="" write_iops="" table=""
+  [ -f "$1" ] || return 0
+  found=$(awk '
+    function bad(why) { print "!" why; exit }
+    /^[ \t]*(#|$)/ { next }
+    /^[ \t]*\[/ {
+      table = $0
+      sub(/^[ \t]*\[[ \t]*/, "", table); sub(/[ \t]*\].*$/, "", table)
+      if (table == "host" || (table ~ /^host\./ && table != "host.io")) bad("[" table "] is not read; use the table [host.io]")
+      if (table == "host.io") print "table=host.io"
+      next
+    }
+    table == "" && /^[ \t]*host[ \t]*[.=]/ { bad("host keys are read only from the table [host.io]") }
+    table != "host.io" { next }
+    {
+      line = $0
+      key = line; sub(/^[ \t]*/, "", key); sub(/[ \t]*=.*$/, "", key)
+      value = line; sub(/^[^=]*=[ \t]*/, "", value); sub(/[ \t]*(#.*)?$/, "", value)
+      if (key == "device") {
+        if (value !~ /^"\/dev\/[A-Za-z0-9._:\/-]+"$/) bad("host.io.device must be a quoted path under /dev/, got " value)
+        gsub(/"/, "", value)
+      } else if (key == "read_iops" || key == "write_iops") {
+        if (value !~ /^[1-9][0-9]*$/ || length(value) > 8 || value + 0 > 10000000) bad("host.io." key " must be an integer 1 to 10000000, got " value)
+      } else bad("host.io has no key " key)
+      print key "=" value
+    }
+  ' "$1") || fail host.io "cannot read $1"
+  for item in $found; do
+    case "$item" in
+      !*) fail host.io "$1: $(printf '%s' "$found" | sed -n 's/^!//p')" ;;
+      table=*) table=${item#table=} ;;
+      device=*) device=${item#device=} ;;
+      read_iops=*) read_iops=${item#read_iops=} ;;
+      write_iops=*) write_iops=${item#write_iops=} ;;
+    esac
+  done
+  if [ -n "$table" ] && { [ -z "$device" ] || [ -z "$read_iops" ] || [ -z "$write_iops" ]; }; then
+    fail host.io "$1: [host.io] needs device, read_iops and write_iops"
+  fi
+}
+
+# Writes to $2 the class slice $1 of deploy/systemd with its caps appended: CPUQuota of $cpus
+# CPUs and, with $device set, the IOPS shares of $read_iops and $write_iops; the percentages are
+# ADR-0103's.
+class_slice() {
+  case "$1" in
+    hive-heads.slice) cpu=50 read=33 write=20 ;;
+    hive-urgent.slice) cpu=0 read=15 write=10 ;;
+    background.slice) cpu=25 read=25 write=20 ;;
+  esac
+  {
+    cat "$here/systemd/$1"
+    if [ "$cpu" -gt 0 ]; then echo "CPUQuota=$((cpus * cpu))%"; fi
+    if [ -n "$device" ]; then
+      echo "IOReadIOPSMax=$device $(share "$read_iops" "$read")"
+      echo "IOWriteIOPSMax=$device $(share "$write_iops" "$write")"
+    fi
+  } > "$2"
+}
+
+# $2 percent of $1, at least 1.
+share() {
+  n=$(($1 * $2 / 100))
+  if [ "$n" -lt 1 ]; then n=1; fi
+  echo "$n"
+}
+
 # Whether $1 is a C11 connector name.
 is_name() {
   case "$1" in
@@ -80,6 +154,7 @@ set -- ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors ulei-memory 
 units="ulei-engine.service ulei-inbox.service ulei-tg.service ulei-connectors.service ulei-memory.service
   ulei-hive-mcp.service ulei-garden.service ulei-night.service ulei-night.timer ulei-uncertain.service
   ulei-uncertain.timer ulei-hive-watchdog.service ulei-hive-watchdog.timer ulei.slice"
+slices="hive-heads.slice hive-urgent.slice background.slice"
 
 [ "$(id -u)" -ne 0 ] || fail account "run as the account that owns the deployment, not root"
 case "${HOME:-}" in
@@ -167,9 +242,11 @@ case "${XDG_CONFIG_HOME:-}" in
 esac
 bindir=$HOME/.local/bin
 unitdir=$config/systemd/user
-for unit in $units; do
+for unit in $units $slices; do
   [ -f "$here/systemd/$unit" ] || fail verify "$unit is missing in $here/systemd"
 done
+host_io "$config/ulei/ulei.toml"
+cpus=$(nproc 2>&1) || fail slices "nproc: $cpus"
 
 reason=$(mkdir -p "$bindir" 2>&1) || fail binaries "$reason"
 for bin in "$@"; do
@@ -180,6 +257,25 @@ reason=$(mkdir -p "$unitdir" 2>&1) || fail units "$reason"
 for unit in $units; do
   place "$here/systemd/$unit" "$unitdir/$unit" 0644 || fail units "$reason"
 done
+for slice in $slices; do
+  made="$unitdir/.$slice.$$"
+  reason=$(class_slice "$slice" "$made" 2>&1) || { rm -f "$made"; fail slices "$reason"; }
+  place "$made" "$unitdir/$slice" 0644 || { rm -f "$made"; fail slices "$reason"; }
+  rm -f "$made"
+done
+if [ -z "$device" ]; then
+  echo "no [host.io] in $config/ulei/ulei.toml: the class slices have no IOPS caps until it names the device and its read and write IOPS and this script runs again (docs/runbooks/io-classes.md)"
+fi
+uid=$(id -u)
+controllers="/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service/cgroup.controllers"
+if [ ! -r "$controllers" ]; then
+  echo "cannot read $controllers: whether the user manager has the io controller is unknown, and without it the IOPS caps take no effect (docs/runbooks/io-classes.md)"
+else
+  case " $(cat "$controllers") " in
+    *" io "*) ;;
+    *) echo "the user manager has no io controller ($controllers): the IOPS caps take no effect until io is delegated to user@.service (docs/runbooks/io-classes.md)" ;;
+  esac
+fi
 
 if [ ! -f "$config/ulei/ulei.toml" ]; then
   echo "write $config/ulei/ulei.toml before the first start (see docs/ulei.example.toml)"

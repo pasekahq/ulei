@@ -796,6 +796,32 @@
           "description": "Most characters of one history message in a transcript, 200 to 16,384; default 3000."
         }
       }
+    },
+    "host": {
+      "type": "object",
+      "description": "The host the units run on (ADR-0103). No daemon reads it; `deploy/install.sh` derives the caps of the class slices it installs from it.",
+      "additionalProperties": false,
+      "properties": {
+        "io": {
+          "type": "object",
+          "description": "The disk the class slices cap and what it sustains; without all three keys the slices are installed without IOPS caps.",
+          "additionalProperties": false,
+          "properties": {
+            "device": {
+              "type": "string",
+              "description": "The block device of the data, a path under `/dev/` without spaces, as `IOReadIOPSMax=` names it."
+            },
+            "read_iops": {
+              "type": "integer",
+              "description": "Random 4 KiB read IOPS the device sustains, 1 to 10,000,000; the slices get shares of it."
+            },
+            "write_iops": {
+              "type": "integer",
+              "description": "Random 4 KiB write IOPS the device sustains, 1 to 10,000,000; the slices get shares of it."
+            }
+          }
+        }
+      }
     }
   },
   "$defs": {

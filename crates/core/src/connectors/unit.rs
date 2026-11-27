@@ -37,7 +37,8 @@ pub(super) fn unit_name(name: &str, at: u64) -> String {
 
 /// The `systemd-run` options and properties of a run in `unit` that may last `timeout`
 /// seconds, gets the broker at `broker` as fd 3 and, when `direct`, its own `AF_INET` and
-/// `AF_INET6` sockets; the launcher's argv follows them after `--`.
+/// `AF_INET6` sockets, in the background class (ADR-0103); the launcher's argv follows them
+/// after `--`.
 pub(super) fn systemd_run(unit: &str, timeout: u64, broker: &Path, direct: bool) -> Vec<String> {
     let unit = unit.strip_suffix(".service").unwrap_or(unit);
     // Without `--quiet`, systemd-run reports on stderr that it started the unit and the unit's
@@ -46,6 +47,7 @@ pub(super) fn systemd_run(unit: &str, timeout: u64, broker: &Path, direct: bool)
         .map(str::to_owned)
         .to_vec();
     args.push(format!("--unit={unit}"));
+    args.push("--slice=background.slice".to_owned());
     // An empty allow list is `none` on the bus; systemd-run passes the word `none` on as a
     // family name, which the manager refuses.
     let families = if direct { "AF_INET AF_INET6" } else { "" };
@@ -63,6 +65,8 @@ pub(super) fn systemd_run(unit: &str, timeout: u64, broker: &Path, direct: bool)
         "UMask=0077".to_owned(),
         "MemoryMax=256M".to_owned(),
         "TasksMax=64".to_owned(),
+        "IOSchedulingClass=idle".to_owned(),
+        "Nice=10".to_owned(),
         "TimeoutStopSec=10s".to_owned(),
     ];
     args.extend(properties.iter().map(|p| format!("--property={p}")));
@@ -322,11 +326,14 @@ mod tests {
             args.last().map(String::as_str),
             Some("--property=RuntimeMaxSec=7s")
         );
+        assert_eq!(args[5], "--slice=background.slice");
         for property in [
             "NoNewPrivileges=yes",
             "RestrictAddressFamilies=",
             "SystemCallErrorNumber=EPERM",
             "OpenFile=/run/c/ulei-connector-notes-1700000000.sock:broker",
+            "IOSchedulingClass=idle",
+            "Nice=10",
         ] {
             assert!(
                 args.contains(&format!("--property={property}")),

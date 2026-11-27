@@ -116,35 +116,84 @@ def test_detached_gates_consume_shared_pool(env, monkeypatch):
     assert calls[0][:5] == ['/usr/bin/ionice', '-c3', '/usr/bin/nice', '-n', '10']
 
 
+def systemd_launches(cfg, conn, d, monkeypatch, cards):
+    """The systemd-run argv of each head the dispatcher launches for `cards` (kwargs of mk) in one tick."""
+    d.launcher = 'systemd'
+    cfg['concurrency'] = 5
+    calls = []
+    real_run = dispatcher.subprocess.run
+    def run(argv, **kw):
+        if argv[0] == 'systemd-run':
+            return calls.append(argv)
+        return real_run(argv, **kw)
+    monkeypatch.setattr(dispatcher.subprocess, 'run', run)
+    for i, kw in enumerate(cards):
+        mk(conn, f'[ok] head {i}', **kw)
+    d.tick()
+    assert len(calls) == len(cards)
+    return calls
+
+
+URGENT_OWNER = dict(card_class='owner_task', step=3, urgent=True)
+
+
 def test_systemd_children_inherit_io_and_memory_bounds(env, monkeypatch):
-    _, _, d = env
-    d.launcher = 'systemd'
-    calls = []
-    monkeypatch.setattr(dispatcher.subprocess, 'run', lambda argv, **kw: calls.append(argv))
-    d.spawn(42, '/tmp')
-    assert {'IOSchedulingClass=idle', 'Nice=10', 'MemoryHigh=768M', 'MemoryMax=1280M'} <= set(calls[0])
+    cfg, conn, d = env
+    [argv] = systemd_launches(cfg, conn, d, monkeypatch, [{}])
+    assert {'--slice=hive-heads.slice', 'IOSchedulingClass=idle', 'Nice=10', 'MemoryHigh=768M',
+            'MemoryMax=1280M'} <= set(argv)
+    assert not [a for a in argv if a.startswith(('IOWeight', 'CPUWeight'))]
 
 
-def test_systemd_heads_get_io_caps_only_when_configured(env, monkeypatch):
-    cfg, _, d = env
-    d.launcher = 'systemd'
-    calls = []
-    monkeypatch.setattr(dispatcher.subprocess, 'run', lambda argv, **kw: calls.append(argv))
-    d.spawn(1, '/tmp')
-    assert not [a for a in calls[0] if a.startswith(('IOWriteBandwidthMax', 'IOReadBandwidthMax'))]
-    cfg.setdefault('resources', {}).update(head_io_device='/dev/sda', head_io_write_max='10M', head_io_read_max='20M')
-    d.spawn(2, '/tmp')
-    assert {'IOWriteBandwidthMax=/dev/sda 10M', 'IOReadBandwidthMax=/dev/sda 20M'} <= set(calls[1])
-    assert calls[1].index('--') > calls[1].index('IOReadBandwidthMax=/dev/sda 20M')
+def test_systemd_urgent_head_runs_in_the_urgent_slice_with_cpu_weight_and_high_io_class(env, monkeypatch):
+    cfg, conn, d = env
+    [argv] = systemd_launches(cfg, conn, d, monkeypatch, [URGENT_OWNER])
+    assert {'--slice=hive-urgent.slice', 'CPUWeight=1000', 'IOSchedulingClass=best-effort', 'IOSchedulingPriority=0',
+            'MemoryHigh=768M', 'MemoryMax=1280M'} <= set(argv)
+    assert not [a for a in argv if a.startswith(('IOWeight', 'Nice=', '--slice=hive-heads'))]
+    assert argv.index('CPUWeight=1000') < argv.index('--')
 
 
-@pytest.mark.parametrize('bad', [dict(head_io_device='sda'), dict(head_io_write_max='10 M'), dict(head_io_write_max=10)])
+def test_systemd_heads_get_iops_caps_only_when_configured(env, monkeypatch):
+    cfg, conn, d = env
+    cfg.setdefault('resources', {}).update(head_io_device='/dev/vdz', head_io_read_iops=40, head_io_write_iops=20)
+    capped = systemd_launches(cfg, conn, d, monkeypatch, [{}, URGENT_OWNER])
+    for argv in capped:
+        assert {'IOReadIOPSMax=/dev/vdz 40', 'IOWriteIOPSMax=/dev/vdz 20'} <= set(argv)
+        assert argv.index('--') > argv.index('IOWriteIOPSMax=/dev/vdz 20')
+    for key in ('head_io_device', 'head_io_read_iops', 'head_io_write_iops'):
+        del cfg['resources'][key]
+    [plain] = systemd_launches(cfg, conn, d, monkeypatch, [{}])
+    assert not [a for a in plain if a.startswith(('IOReadIOPSMax', 'IOWriteIOPSMax'))]
+
+
+@pytest.mark.parametrize('bad', [dict(head_io_device='vdz'), dict(head_io_read_iops='40'), dict(head_io_write_iops=0),
+                                 dict(head_io_read_iops=True), dict(head_io_device=None)])
 def test_head_io_caps_config_is_checked(env, bad):
     cfg, _, _ = env
-    good = dict(head_io_device='/dev/sda', head_io_write_max='10M', head_io_read_max='20M')
+    good = dict(head_io_device='/dev/vdz', head_io_read_iops=40, head_io_write_iops=20)
     store.check_deployment(dict(cfg, resources={**cfg.get('resources', {}), **good}))
+    res = {k: v for k, v in {**cfg.get('resources', {}), **good, **bad}.items() if v is not None}
     with pytest.raises(ValueError, match='head_io_'):
-        store.check_deployment(dict(cfg, resources={**cfg.get('resources', {}), **good, **bad}))
+        store.check_deployment(dict(cfg, resources=res))
+
+
+@pytest.mark.parametrize('table, line', [('admission', 'urgent_reserve = 1'), ('admission', 'urgent_max_step = 2'),
+                                         ('resources', 'head_io_read_max = "20M"'),
+                                         ('resources', 'head_io_write_max = "10M"')])
+def test_config_with_an_obsolete_key_loads_with_one_warning_naming_it(env, tmp_path, capsys, table, line):
+    cfg, _, _ = env
+    old = tmp_path / 'old.toml'
+    text = Path(cfg['_path']).read_text()
+    old.write_text(text.replace(f'[{table}]\n', f'[{table}]\n{line}\n') if f'[{table}]\n' in text
+                   else f'{text}\n[{table}]\n{line}\n')
+    capsys.readouterr()
+    loaded = store.load_config(old)
+    store.load_config(old)
+    key = line.split()[0]
+    assert key not in loaded[table]
+    warnings = capsys.readouterr().err.splitlines()
+    assert len(warnings) == 1 and f'{table}.{key}' in warnings[0] and 'obsolete' in warnings[0]
 
 
 REAL_SAMPLE = resources.sample
@@ -209,11 +258,10 @@ def test_unreadable_cgroup_pressure_is_recorded_and_admits(env, tmp_path, monkey
 
 def test_urgent_passes_a_gate_closed_by_protected_cgroup_pressure(env, tmp_path, monkeypatch):
     cfg, conn, d = env
-    cfg['admission']['urgent_reserve'] = 1
     fake_host(tmp_path, monkeypatch, cfg, conn, 0, {GATEWAY: 25, HIVE: 0})
     monkeypatch.setattr(d, 'spawn', lambda *a: None)
     background = mk(conn, 'background')
-    owner = mk(conn, 'owner step 2', card_class='owner_task', step=2)
+    owner = mk(conn, 'owner step 3', card_class='owner_task', step=3, urgent=True)
     d.tick()
     claimed = [r[0] for r in conn.execute('SELECT card_id FROM runs')]
     assert claimed == [owner]

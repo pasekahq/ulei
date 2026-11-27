@@ -31,7 +31,8 @@ use ulei_engine::journal::{self, Journal, unix_now};
 use ulei_engine::mcp::{self, Server};
 use ulei_engine::policy::{
     Chain, Classifier, DEFAULT_TIMEOUT, GuardrailConfig, Hardline, INSTRUCTION_FIELDS, NOTE_FIELDS,
-    NoAskGuard, Origin, Policy, Sender, StateDbGuard, TextTemplate, ToolGuardrails, TurnReminder,
+    NoAskGuard, Origin, OwnerUrgent, Policy, Sender, StateDbGuard, TextTemplate, ToolGuardrails,
+    TurnReminder,
 };
 use ulei_engine::prompt::core::Core;
 use ulei_engine::prompt::garden::{self as garden_prompt, CoreProfile, DEFAULT_CORE_CHAR_LIMIT};
@@ -704,7 +705,11 @@ fn policies(
         redactor(config),
     );
     let guard = StateDbGuard::new(db.to_path_buf())?;
-    let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(hardline), Box::new(guard)];
+    let mut policies: Vec<Box<dyn Policy>> = vec![
+        Box::new(hardline),
+        Box::new(guard),
+        Box::new(OwnerUrgent::default()),
+    ];
     let reminder = config::TURN_REMINDER_FILE;
     if let Some(text) = config.file_text(reminder, env(reminder.env))? {
         policies.push(Box::new(TurnReminder::new(text)));

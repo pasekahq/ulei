@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import api, heads as heads_mod, liveness, store
 
-VERSION = 1
+VERSION = 2
 REPORT_CHARS = 6000       # a run's report and a judge's reason in the snapshot; the whole file through read_file
 OUTPUT_CHARS = 2000       # a gate's output
 GOAL_CHARS = 4000
@@ -675,9 +675,10 @@ def queue_order(conn, cfg, now):
 
 
 def slot_holders(conn):
-    """The runs holding a head slot now (any card, board or not: series runs, reviewers, synthesis) and the scripts."""
-    rows = conn.execute("""SELECT r.id AS run_id, r.card_id, r.role, r.vendor, r.model, r.effort, r.unit, r.started_at,
-                                  c.title, c.card_class, c.kind, c.executor, c.script
+    """The active head runs (any card, board or not: series runs, reviewers, synthesis), the scripts and the external
+    jobs, each marked `urgent` when claimed on the urgent lane."""
+    rows = conn.execute(f"""SELECT r.id AS run_id, r.card_id, r.role, r.vendor, r.model, r.effort, r.unit, r.started_at,
+                                  c.title, c.card_class, c.kind, c.executor, c.script, {api.URGENT_RUN} AS urgent
                            FROM runs r JOIN cards c ON c.id=r.card_id
                            WHERE r.status IN ('starting','running') ORDER BY r.started_at""").fetchall()
     heads = [dict(r) for r in rows if r['script'] is None and r['vendor'] != r['executor']]
@@ -734,14 +735,16 @@ def queue(conn, cfg, card, now, cgroup_root=liveness.CGROUP_ROOT):
 
 
 def slots(cfg, card, heads):
+    """The slots the card waits for: an urgent card the urgent lane's URGENT_MAX cards, any other the concurrency
+    head runs outside it."""
     urgent = api.admission_class(card, cfg) == 'urgent'
-    reserve = cfg['admission']['urgent_reserve']
     ceiling = int(cfg.get('concurrency', 2))
-    limit = ceiling + reserve if urgent else ceiling - reserve
-    return {'concurrency': ceiling, 'urgent_reserve': reserve, 'limit_for_this_card': limit, 'used': len(heads),
-            'free': max(0, limit - len(heads)),
+    lane = [h for h in heads if bool(h['urgent']) == urgent]
+    limit, used = (api.URGENT_MAX, len({h['card_id'] for h in lane})) if urgent else (ceiling, len(lane))
+    return {'concurrency': ceiling, 'urgent_max': api.URGENT_MAX, 'limit_for_this_card': limit, 'used': used,
+            'free': max(0, limit - used),
             'holders': [{k: h[k] for k in ('run_id', 'card_id', 'role', 'card_class', 'started_at', 'title')}
-                        for h in heads]}
+                        for h in lane]}
 
 
 def card(conn, cfg, card_id, now, probe=None, adapter=None):
@@ -967,8 +970,10 @@ def health(conn, cfg, now, adapter=None):
                                  'daily_runs': v.get('daily_runs'), 'disabled': bool(v.get('disabled'))}
                           for name, v in (cfg.get('vendors') or {}).items()},
         'cards_by_state': counts,
-        'slots': {'concurrency': int(cfg.get('concurrency', 2)), 'urgent_reserve': cfg['admission']['urgent_reserve'],
-                  'used': len(heads), 'heads': heads, 'scripts': scripts, 'external': external,
+        'slots': {'concurrency': int(cfg.get('concurrency', 2)), 'urgent_max': api.URGENT_MAX,
+                  'used': sum(not h['urgent'] for h in heads),
+                  'urgent_used': len({h['card_id'] for h in heads + scripts if h['urgent']}),
+                  'heads': heads, 'scripts': scripts, 'external': external,
                   'script_concurrency': cfg.get('script_concurrency', 4), 'gate_jobs': gate_jobs},
         'queue': {'length': len(order),
                   'next': [{'position': i + 1, 'card_id': c['id'], 'state': c['state'], 'title': c['title'],

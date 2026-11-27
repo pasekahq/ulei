@@ -107,20 +107,22 @@ def test_report_repeat_and_payload_tail(env):
     assert payload['report_excerpt'].endswith('TAIL BLOCKER')
 
 
-def test_owner_priority_and_fifth_slot(env, monkeypatch):
+def test_owner_card_takes_the_next_free_slot_ahead_of_background(env, monkeypatch):
     cfg, conn, d = env
     cfg['concurrency'] = 5
-    cfg['admission']['urgent_reserve'] = 1
     monkeypatch.setattr(d, 'spawn', lambda *args: None)
     backgrounds = [create(conn, title=f'background {i}', priority=999) for i in range(6)]
     d.tick()
-    assert d.active_runs('task') == 4
+    assert d.active_runs('task') == 5
     owner = create(conn, created_by='owner', source='msg:owner:123')
     assert row(conn, owner)['priority'] == 100
     d.tick()
+    assert row(conn, owner)['state'] == 'queued'
+    conn.execute("UPDATE runs SET status='exited', handled=1 WHERE id=(SELECT min(id) FROM runs)")
+    d.tick()
     assert row(conn, owner)['state'] == 'running'
     assert d.active_runs('task') == 5
-    assert sum(row(conn, c)['state'] == 'queued' for c in backgrounds) == 2
+    assert sum(row(conn, c)['state'] == 'queued' for c in backgrounds) == 1
 
 
 def test_different_verbose_gate_outputs_do_not_stop(env):

@@ -8,6 +8,10 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=exec
+# Background class (ADR-0103): idle IO class, the CPU only when no other class wants it.
+Slice=background.slice
+IOSchedulingClass=idle
+Nice=10
 Environment=ULEI_CONFIG=%E/ulei/ulei.toml
 ExecStart=%h/.local/bin/ulei-connectors serve
 Restart=on-failure

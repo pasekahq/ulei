@@ -163,7 +163,7 @@ fn snapshot(
                 eprintln!("no such card");
                 return Err(ExitCode::from(1));
             }
-            let snap = json!({"version": 1, "card_id": id,
+            let snap = json!({"version": 2, "card_id": id,
                 "card": {"state": "running", "round": 1, "title": "Synthetic card", "result": null},
                 "rounds": [{"round": 1, "runs": [{"report": "# Synthetic report"}]}],
                 "heads": {"heads": [{"waiting_on": {"command": "gh pr checks 7 --watch", "for_s": 60.0,
@@ -171,7 +171,7 @@ fn snapshot(
             let _ = writeln!(out, "{snap}");
         }
         "health" => {
-            let snap = json!({"version": 1, "dispatcher": {"ticking": true, "tick_age_s": 2.0},
+            let snap = json!({"version": 2, "dispatcher": {"ticking": true, "tick_age_s": 2.0},
                 "slots": {"used": 4, "concurrency": 5}, "queue": {"length": 3}});
             let _ = writeln!(out, "{snap}");
         }

@@ -11,8 +11,8 @@ from hive import delivery, store
 HERE = Path(__file__).resolve().parent
 EXAMPLE = HERE.parents[1] / 'config.example.toml'
 TOML_TYPES = {str: 'string', int: 'integer', float: 'float', bool: 'boolean', list: 'array'}
-# Nullable columns the reform adds to the source cards table (ADR-0068 section 5), appended by the add-column path.
-REFORM_CARD_COLUMNS = ', tag TEXT, reminder TEXT'
+# Columns the reform adds to the source cards table (ADR-0068 section 5), appended by the add-column path.
+REFORM_CARD_COLUMNS = ', tag TEXT, reminder TEXT, urgent INTEGER NOT NULL DEFAULT 0'
 # Indexes the reform adds (ADR-0068 section 5: additive, through CREATE INDEX IF NOT EXISTS): the board's (store.BOARD_INDEXES).
 REFORM_INDEXES = [['index', 'cards_board', 'cards', 'CREATE INDEX cards_board ON cards(card_class, kind, id)'],
                   ['index', 'links_followup', 'links', "CREATE INDEX links_followup ON links(card_id) WHERE kind='followup'"]]
@@ -71,9 +71,10 @@ def test_source_store_gains_the_reform_columns_on_connect(tmp_path):
 
 def test_config_with_every_source_key_and_the_new_keys_loads():
     source = json.loads((HERE / 'source_config_keys.json').read_text())
+    current = {k: v for k, v in source.items() if tuple(k.split('.', 1)) not in store.OBSOLETE_KEYS}
     with EXAMPLE.open('rb') as f:
         keys = flat(tomllib.load(f))
-    assert {k: keys.get(k) for k in source} == source
+    assert {k: keys.get(k) for k in current} == current
     cfg = store.load_config(EXAMPLE)
     assert set(store.REQUIRED_KEYS) <= set(cfg) and set(cfg['texts']) == set(store.TEXTS)
 

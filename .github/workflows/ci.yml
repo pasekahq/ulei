@@ -468,9 +468,10 @@ jobs:
   # started under the runner user's manager from the release deploy/install.sh put in place.
   # ADR-0056 section 5.7: source connector runs in their transient units under that manager, the
   # per-run budgets of its section 8, and section 9's end to end run with the real archive.
+  # ADR-0103: the IO classes measured with the io controller delegated.
   systemd-units:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -512,10 +513,13 @@ jobs:
           cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
       # The checks below run even after an earlier one failed, so one run shows every result as
       # an annotation; any failed check fails the job.
+      # The passed checks of each of these two steps fold into one notice, one line per unit: GitHub
+      # keeps at most 10 notices per step and 50 annotations per job. A failure is an error of its own.
       - name: Exposure of every unit within its threshold
         if: ${{ !cancelled() }}
         run: |
           status=0
+          passed=""
           for unit in deploy/systemd/*.service; do
             name="${unit##*/}"
             case "$name" in
@@ -535,17 +539,20 @@ jobs:
               status=1
               continue
             fi
-            echo "::notice title=exposure $name::measured $measured, threshold $limit"
             if [ "${measured/./}" -gt "$threshold" ]; then
               echo "::error title=exposure $name::measured $measured is above the threshold $limit"
               status=1
+            else
+              passed="$passed${passed:+%0A}$name: measured $measured, threshold $limit"
             fi
           done
+          if [ -n "$passed" ]; then echo "::notice title=exposure within threshold::$passed"; fi
           exit "$status"
       - name: Verify the units
         if: ${{ !cancelled() }}
         run: |
           status=0
+          passed=""
           for unit in deploy/systemd/*.service deploy/systemd/*.timer deploy/systemd/*.slice; do
             name="${unit##*/}"
             out=$(systemd-analyze --user verify "$unit" 2>&1) && rc=0 || rc=$?
@@ -554,9 +561,12 @@ jobs:
               echo "::error title=verify $name::exit $rc: $(grep -F "$name" <<<"$out" | tail -n 1)"
               status=1
             else
-              echo "::notice title=verify $name::systemd-analyze --user verify passed"
+              passed="$passed${passed:+%0A}$name"
             fi
           done
+          if [ -n "$passed" ]; then
+            echo "::notice title=verify passed::systemd-analyze --user verify passed:%0A$passed"
+          fi
           exit "$status"
       - name: Load the installed units
         if: ${{ !cancelled() }}
@@ -626,6 +636,26 @@ jobs:
         run: |
           python3 ci/connectors_e2e.py "$RUNNER_TEMP/release" "$RUNNER_TEMP/release/ulei-memory" \
             "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-e2e.XXXXXX)"
+      # ADR-0103: the IO classes measured on this runner. Last, because it restarts the user
+      # manager with the io controller delegated. It reports the probe reads of the urgent and
+      # background classes under load and the disk's scheduler, and fails only when the capped
+      # hive-heads.slice reads more than its IOReadIOPSMax allows within the script's tolerance.
+      - name: IO classes measured with io delegated
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          sudo mkdir -p /etc/systemd/system/user@.service.d
+          printf '[Service]\nDelegate=cpu cpuset io memory pids\n' \
+            | sudo tee /etc/systemd/system/user@.service.d/90-ulei-io.conf
+          sudo systemctl daemon-reload
+          sudo systemctl restart "user@$(id -u).service"
+          for _ in $(seq 60); do
+            if [ -S "$XDG_RUNTIME_DIR/systemd/private" ]; then break; fi
+            sleep 1
+          done
+          systemctl --user is-system-running --wait || true
+          cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+          python3 ci/io_classes_run.py "$RUNNER_TEMP/release" "$(mktemp -d -p "$RUNNER_TEMP" ulei-io.XXXXXX)"
       - name: Unit status and logs
         if: failure()
         run: |

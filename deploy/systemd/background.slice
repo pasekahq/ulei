@@ -1,0 +1,10 @@
+# Background class (user unit, ADR-0103): work nobody waits for, at the idle IO class: the night
+# gardener, the connector runner and its runs, and the host's own background work (backups,
+# imports) that the owner places here. CPUWeight=1 yields the CPU to every other class.
+# deploy/install.sh appends CPUQuota, a quarter of the CPUs, and with [host.io] in ulei.toml
+# IOReadIOPSMax and IOWriteIOPSMax, 25 % and 20 % of the device's read and write IOPS.
+[Unit]
+Description=ulei and host background work
+
+[Slice]
+CPUWeight=1

@@ -207,6 +207,10 @@
           "type": "boolean",
           "description": "Independent review by the other vendor (`--review`). Off by default; only `review: true` turns it on, never `accept_review`, `kind` or `step`. Set it for code cards (pull requests, code changes) first, for complex research that needs a second check, and for anything else the author decides to review; small errands (look, switch, check a status) go without."
         },
+        "urgent": {
+          "type": "boolean",
+          "description": "The owner waits for this result now (`--urgent`): the card runs on the hive's urgent lane, past its IO gate and above its concurrency, at most two such cards at once. Only for a card of the owner's own request on the main chat; the engine refuses it on any other turn (ADR-0103). Only with kind `owner_task` (the default) and a head: not with `every`, `cron` or `reminder`."
+        },
         "hold": {
           "type": "boolean",
           "description": "Park the card until the owner runs `hive.py release`. Not with `not_before`, `every` or `cron`."
@@ -534,7 +538,7 @@
     },
     "HiveInspectOutput": {
       "type": "object",
-      "description": "A read-only snapshot of one card from the inside at the time of the call (the hive's `inspect --json`, version 1): the summary fields, then `snapshot` with `card` (fields, goal, acceptance, result, judge feedback), `links` (parent, children, followup_of, followups, blocked_by, blocks, series), `rounds` (per round every run with role, vendor, model, effort, unit, start, end, outcome, verdict and report; the gate's result and output; the judge's verdict and reason; the round's retry, block or finish), `heads` (each live run: its unit, its processes, the commands it waits on and for how long, the other units those name, the pull requests and workflow runs they wait on with their checks), `queue` (board column and wait, position in the launch queue, slot holders, budget wait), `steers` (text and delivery), `deliveries` (outbox row and owner inbox status and outcome) and `files` (the workspace's entries, each a path `hive_file` reads).",
+      "description": "A read-only snapshot of one card from the inside at the time of the call (the hive's `inspect --json`, version 2): the summary fields, then `snapshot` with `card` (fields, goal, acceptance, result, judge feedback), `links` (parent, children, followup_of, followups, blocked_by, blocks, series), `rounds` (per round every run with role, vendor, model, effort, unit, start, end, outcome, verdict and report; the gate's result and output; the judge's verdict and reason; the round's retry, block or finish), `heads` (each live run: its unit, its processes, the commands it waits on and for how long, the other units those name, the pull requests and workflow runs they wait on with their checks), `queue` (board column and wait, position in the launch queue, the slots it waits for, `concurrency` or for an urgent card the urgent lane, and their holders, budget wait), `steers` (text and delivery), `deliveries` (outbox row and owner inbox status and outcome) and `files` (the workspace's entries, each a path `hive_file` reads).",
       "properties": {
         "card_id": {
           "type": "string",
@@ -584,7 +588,7 @@
     },
     "HiveHealthOutput": {
       "type": "object",
-      "description": "A read-only snapshot of the hive as a whole at the time of the call (the hive's `health --json`, version 1): the summary fields, then `snapshot` with `config` (concurrency, urgent reserve, ladder of models and efforts per step, vendors, executors, timeouts, budgets; no paths, environments, commands or texts), `dispatcher` (last tick and its summary), `resource_gate`, `weekly_left`, `provider_cooldowns`, `cards_by_state`, `slots` (every run holding a head slot, board card or not: series runs, reviewers; scripts; external jobs; gate jobs), `queue` (the launch order), `series` (each schedule or series: rule, next start, runs, last runs, whether one holds a slot) and `outbox` (unpublished count, the latest events with their owner inbox status).",
+      "description": "A read-only snapshot of the hive as a whole at the time of the call (the hive's `health --json`, version 2): the summary fields, then `snapshot` with `config` (concurrency, ladder of models and efforts per step, vendors, executors, timeouts, budgets; no paths, environments, commands or texts), `dispatcher` (last tick and its summary), `resource_gate`, `weekly_left`, `provider_cooldowns`, `cards_by_state`, `slots` (every head run, board card or not: series runs, reviewers, each marked `urgent` on the urgent lane above `concurrency` with its own count `urgent_used` of `urgent_max` cards; scripts; external jobs; gate jobs), `queue` (the launch order), `series` (each schedule or series: rule, next start, runs, last runs, whether one holds a slot) and `outbox` (unpublished count, the latest events with their owner inbox status).",
       "properties": {
         "ticking": {
           "type": "boolean",
@@ -597,7 +601,7 @@
         },
         "slots_used": {
           "type": "integer",
-          "description": "Head runs holding a slot now.",
+          "description": "Head runs holding one of the `concurrency` slots now; urgent runs hold none.",
           "minimum": 0
         },
         "concurrency": {

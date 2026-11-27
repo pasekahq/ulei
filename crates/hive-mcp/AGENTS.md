@@ -21,6 +21,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   option-like value stays a value. `hive_file`'s `path` is the one path an input names (ADR-0086
   section 3): relative, no `..`, read-only, checked here and again by the CLI. The filter
   `created_by` of `hive_list` goes as `--creator`, never as `--created-by`.
+- `hive_create`'s `urgent: true` goes as `--urgent` (ADR-0103), refused here as by the hive with a
+  `kind` other than `owner_task`, a series or a reminder. Who may set it is not this server's
+  decision: the engine's `owner-urgent` policy refuses it outside a top-level owner turn.
+  `hive_health`'s text names the urgent lane, at most two cards above the slots.
 - A refusal is the tool error with the CLI's own words: exit 2 `hive: <text>`, and for
   `hive_reminder` also exit 1 `hive: reminder send failed: <text>`, become `<text>`.
 - The CLI runs as an argv vector (values as `--flag=value`, positionals after `--`), never a

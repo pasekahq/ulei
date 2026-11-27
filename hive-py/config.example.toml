@@ -183,11 +183,12 @@ limits_ttl_s = 900
 limits_command = ["/srv/hive/bin/limits", "--label", "hive", "--json"]
 limits_home = "/srv/hive/account"   # HOME of limits_command
 
+# Urgent: an owner_task created with --urgent (hive_create's `urgent`, the owner's main chat only) and the cards of
+# urgent_sources. At most two urgent cards run at once, above concurrency, script_concurrency and max_local_runs, past
+# the IO PSI gate and its cooldown, in hive-urgent.slice; nothing running is paused for them.
 [admission]
-urgent_max_step = 2        # owner_task at or below this step, queued or in review, launches as urgent
 urgent_sources = ["cron:000000000001", "cron:000000000002"]  # and their :conditional children
-urgent_reserve = 1         # per ceiling: non-urgent stops this many short, urgent may run this many over
-urgent_floor_mb = 768      # urgent passes a closed gate while MemAvailable - starting x per_run_mb stays at or above this
+urgent_floor_mb = 768      # an urgent start needs MemAvailable - starting x per_run_mb at or above this
 
 [head_wait_nudge]
 # A running worker whose head has run one command this long gets a nudge over its live input, again every interval
@@ -198,16 +199,17 @@ text = "You have been waiting for a command for {minutes} minutes: {command}\nAr
 
 [resources]
 enabled = true
-max_local_runs = 5         # all heads + scripts + detached acceptance checks together
+max_local_runs = 5         # all heads + scripts + detached acceptance checks together, urgent runs aside
 priority_sources = ["cron:backup"] # and its conditional children before ordinary cron
 reserve_mb = 1024
 per_run_mb = 512           # budget each new run before its RSS is visible
 disk = "/srv/hive"         # the free-space floor samples this path's filesystem
-# Optional disk throughput caps of every systemd head (IOWriteBandwidthMax / IOReadBandwidthMax of its transient unit).
-# Effective only when the io controller is delegated to the user manager (Delegate=io on user@.service); unset = no caps.
-# head_io_device = "/dev/sda"
-# head_io_write_max = "10M"
-# head_io_read_max = "20M"
+# Optional IOPS caps of every systemd head (IOReadIOPSMax / IOWriteIOPSMax of its transient unit), within the caps
+# of its slice. Effective only when the io controller is delegated to the user manager (Delegate=io on
+# user@.service); unset = no per-head caps.
+# head_io_device = "/dev/vdz"
+# head_io_read_iops = 40
+# head_io_write_iops = 20
 # Ordinary admission pauses while any of these cgroups (relative to /sys/fs/cgroup) has io.pressure some avg10
 # at or above protected_io_some_pct; the host PSI and iowait limits below are the emergency stop.
 psi_cgroups = ["user.slice/app.slice/gateway.service", "user.slice/app.slice/hive-dispatcher.service"]

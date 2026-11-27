@@ -4,6 +4,7 @@
 
 mod hardline;
 mod no_ask_guard;
+mod owner_urgent;
 mod state_db_guard;
 mod tool_guardrails;
 mod turn_reminder;
@@ -19,6 +20,7 @@ pub use no_ask_guard::{
     Classifier, DEFAULT_TIMEOUT, INSTRUCTION_FIELDS, NOTE_FIELDS, NoAskGuard, TextTemplate,
     ends_with_question,
 };
+pub use owner_urgent::OwnerUrgent;
 pub use state_db_guard::{InvalidDbPath, StateDbGuard};
 pub use tool_guardrails::{GuardrailConfig, IDEMPOTENT_TOOLS, MUTATING_TOOLS, ToolGuardrails};
 pub use turn_reminder::TurnReminder;

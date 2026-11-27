@@ -1,0 +1,9 @@
+# Urgent owner heads class (user unit, ADR-0103): the at most two urgent runs of the hive's
+# dispatcher, each a unit with CPUWeight=1000 and the best-effort IO class at level 0. No CPU
+# quota; deploy/install.sh appends, with [host.io] in ulei.toml, IOReadIOPSMax and IOWriteIOPSMax,
+# 15 % and 10 % of the device's read and write IOPS.
+[Unit]
+Description=Hive urgent owner heads
+
+[Slice]
+CPUWeight=1000

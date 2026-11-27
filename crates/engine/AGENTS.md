@@ -25,6 +25,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   ignored in the ordinary run and run by the CI job `qb-contract` (ADR-0038 section 6).
 - MCP servers are reached only on loopback over the `gateway.rs` reader (ADR-0015, ADR-0026);
   tests use the fake Streamable HTTP server `tests/fake_mcp/` with `mod fake_gateway; mod fake_mcp;`.
+- The policy `owner-urgent` (`src/policy/owner_urgent.rs`, ADR-0103), always in the chain, is the
+  one place that decides who may ask for urgent work: a tool call whose arguments set `urgent` to
+  `true`, such as `hive_create`'s, is refused unless the turn is `Origin::TopLevelOwner`. An
+  owner-designed addition, not a port.
 - Synchronous: no async runtime, no background threads or timers when idle.
 - `ulei-engine` is held to the daemon budgets of ADR-0010; a new dependency needs its own ADR.
 - Sort through `crate::sort`, not the slice sorts or a collected `BTreeSet` or JSON `Map`:

@@ -1,0 +1,9 @@
+# Hive heads class (user unit, ADR-0103): every head and script of the hive's dispatcher,
+# `systemd-run --user --slice=hive-heads.slice` at the idle IO class. deploy/install.sh appends the
+# aggregate caps: CPUQuota, half of the CPUs, and with [host.io] in ulei.toml IOReadIOPSMax and
+# IOWriteIOPSMax, 33 % and 20 % of the device's read and write IOPS.
+[Unit]
+Description=Hive heads
+
+[Slice]
+CPUWeight=50

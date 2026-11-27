@@ -167,8 +167,6 @@ def env(tmp_path, monkeypatch, gateway):
     monkeypatch.delenv('HIVE_DB', raising=False)
     cfg = store.load_config(config)
     cfg['budget']['limits_command'] = None
-    # Pool-count tests use the full ceilings; the urgent reserve tests set their own.
-    cfg['admission']['urgent_reserve'] = 0
     inbox_dir = Path(cfg['inbox'])
     conn = store.connect(cfg['db'])
     inbox_dir.mkdir(mode=0o700)

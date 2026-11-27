@@ -11,6 +11,10 @@ After=ulei-garden.service ulei-memory.service
 
 [Service]
 Type=oneshot
+# Background class (ADR-0103): idle IO class, the CPU only when no other class wants it.
+Slice=background.slice
+IOSchedulingClass=idle
+Nice=10
 Environment=ULEI_CONFIG=%E/ulei/ulei.toml
 Environment=ULEI_NIGHT_STATE=%S/ulei/night
 ExecStart=%h/.local/bin/ulei-engine night

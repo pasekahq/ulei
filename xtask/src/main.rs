@@ -9,6 +9,7 @@
 //!   and (with a base) schema compatibility against REV
 //! - `adr [--base REV]`         ADR format, and (with a base) "new crate/dependency/pin/contract
 //!   needs an ADR with a matching `Affects:` line"
+//! - `units`                    every user service of deploy/systemd sets a class `Slice=`
 //! - `check [--base REV]`       all of the above in check mode
 
 mod adr;
@@ -17,6 +18,7 @@ mod codegen;
 mod contracts;
 mod map;
 mod pytree;
+mod units;
 mod util;
 
 use std::process::ExitCode;
@@ -38,13 +40,15 @@ fn main() -> ExitCode {
         "gen-contracts" => codegen::run(&root, check),
         "contracts" => contracts::run(&root, base),
         "adr" => adr::run(&root, base),
+        "units" => units::run(&root),
         "check" => arch::run(&root)
             .and_then(|()| map::run(&root, true))
             .and_then(|()| contracts::run(&root, base))
-            .and_then(|()| adr::run(&root, base)),
+            .and_then(|()| adr::run(&root, base))
+            .and_then(|()| units::run(&root)),
         _ => {
             eprintln!(
-                "usage: cargo xtask <arch | module-map [--check] | gen-contracts [--check] | contracts [--base REV] | adr [--base REV] | check [--base REV]>"
+                "usage: cargo xtask <arch | module-map [--check] | gen-contracts [--check] | contracts [--base REV] | adr [--base REV] | units | check [--base REV]>"
             );
             return ExitCode::from(2);
         }
