@@ -3,7 +3,8 @@
 Status: accepted
 Date: 2026-11-19
 Affects: crates/channels, dep:signal-hook
-Amended by: ADR-0040 (the config path order and the shared decoder of `ulei.toml`).
+Amended by: ADR-0040 (the config path order and the shared decoder of `ulei.toml`), ADR-0097
+(the one-shot `ulei-tg notify`).
 
 ## Context
 
@@ -26,7 +27,8 @@ lifecycle (`ulei_channels::tg`) and the settings are library code tested through
 
 Usage: `ulei-tg [--config PATH]`, the path else found as ADR-0040 section 2 orders it;
 `ulei-tg --version`. Exit codes: 0 after a signal stop, 1 for a startup or polling failure,
-2 for a usage error.
+2 for a usage error. `ulei-tg notify [--config PATH] [--file PATH]` sends one notice to the
+owner and exits, with the exit codes of ADR-0097 section 4.
 
 ### 2. Threads
 

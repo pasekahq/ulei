@@ -52,6 +52,16 @@ pub struct Settings {
     pub guest_gate: Option<GuestGateConfig>,
 }
 
+/// The keys a direct notice needs (ADR-0097): the Bot API client and the owner ids, without the
+/// daemon's engine socket and attachments directory. `Debug` hides the token.
+#[derive(Debug, Clone)]
+pub struct Transport {
+    /// Bot API client settings: token, base URLs, timeouts.
+    pub bot: Config,
+    /// Telegram user ids of the owner.
+    pub owner_ids: Vec<i64>,
+}
+
 /// Why the settings could not be loaded: one line naming the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsError(String);
@@ -75,6 +85,23 @@ impl Settings {
     pub fn load(flag: Option<&Path>) -> Result<Self, SettingsError> {
         let file = File::read(flag).map_err(|e| fail(e.to_string()))?;
         Reader(&file).settings()
+    }
+}
+
+impl Transport {
+    /// Decodes the config file as [`Settings::load`] does and reads only the `telegram` keys of
+    /// the Bot API client and `telegram.owner_ids`; it creates nothing.
+    ///
+    /// # Errors
+    /// No file is found, it is unreadable or refused by the decoder, the token file or the owner
+    /// ids are missing or invalid, or a client key is invalid.
+    pub fn load(flag: Option<&Path>) -> Result<Self, SettingsError> {
+        let file = File::read(flag).map_err(|e| fail(e.to_string()))?;
+        let reader = Reader(&file);
+        Ok(Self {
+            bot: reader.bot()?,
+            owner_ids: reader.owner_ids()?,
+        })
     }
 }
 
@@ -133,23 +160,7 @@ impl Reader<'_> {
     }
 
     fn settings(&self) -> Result<Settings, SettingsError> {
-        let token = self.token()?;
-        let base_url = self.url("telegram.base_url")?;
-        let mut bot = Config::new(token, base_url.as_deref());
-        if let Some(file_base_url) = self.url("telegram.file_base_url")? {
-            bot.file_base_url = file_base_url;
-        }
-        bot.connect_timeout = self.seconds("telegram.connect_timeout", bot.connect_timeout)?;
-        bot.read_timeout = self.seconds("telegram.read_timeout", bot.read_timeout)?;
-        bot.write_timeout = self.seconds("telegram.write_timeout", bot.write_timeout)?;
-        bot.media_read_timeout =
-            self.seconds("telegram.media_read_timeout", bot.media_read_timeout)?;
-        bot.poll_timeout = self.seconds("telegram.poll_timeout", bot.poll_timeout)?;
-        if bot.poll_timeout.subsec_nanos() != 0 {
-            return Err(fail(
-                "telegram.poll_timeout must be a whole number of seconds".to_owned(),
-            ));
-        }
+        let bot = self.bot()?;
         let owner_ids = self.owner_ids()?;
         let coalesce_quiet = self.duration("telegram.coalesce_quiet", Duration::from_secs(2))?;
         let coalesce_max = self.duration("telegram.coalesce_max", Duration::from_secs(7))?;
@@ -180,6 +191,28 @@ impl Reader<'_> {
             reactions,
             guest_gate,
         })
+    }
+
+    /// The Bot API client settings: the token from its file, the base URLs and the timeouts.
+    fn bot(&self) -> Result<Config, SettingsError> {
+        let token = self.token()?;
+        let base_url = self.url("telegram.base_url")?;
+        let mut bot = Config::new(token, base_url.as_deref());
+        if let Some(file_base_url) = self.url("telegram.file_base_url")? {
+            bot.file_base_url = file_base_url;
+        }
+        bot.connect_timeout = self.seconds("telegram.connect_timeout", bot.connect_timeout)?;
+        bot.read_timeout = self.seconds("telegram.read_timeout", bot.read_timeout)?;
+        bot.write_timeout = self.seconds("telegram.write_timeout", bot.write_timeout)?;
+        bot.media_read_timeout =
+            self.seconds("telegram.media_read_timeout", bot.media_read_timeout)?;
+        bot.poll_timeout = self.seconds("telegram.poll_timeout", bot.poll_timeout)?;
+        if bot.poll_timeout.subsec_nanos() != 0 {
+            return Err(fail(
+                "telegram.poll_timeout must be a whole number of seconds".to_owned(),
+            ));
+        }
+        Ok(bot)
     }
 
     /// `telegram.guest_gate_url` and `telegram.guest_gate_token_file`, both or neither. An error
