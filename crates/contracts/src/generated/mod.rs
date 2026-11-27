@@ -90,7 +90,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C9",
-        version: "0.13.0",
+        version: "0.14.0",
         file: "c9-ulei-toml.schema.json",
         title: "ulei.toml",
         status: "draft",

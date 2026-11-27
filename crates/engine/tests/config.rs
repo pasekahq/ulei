@@ -17,6 +17,7 @@ use ulei_engine::config::{
     ROUTE_MAX_TOKENS, WEB_BASE_URL,
 };
 use ulei_engine::policy::GuardrailConfig;
+use ulei_engine::tools::Budget;
 
 const DEFAULT: Duration = Duration::from_secs(420);
 
@@ -525,5 +526,65 @@ fn a_server_section_header_without_keys_that_the_list_does_not_name_is_refused_w
              (ULEI_ENGINE_MCP_SERVERS)",
             path.display()
         )
+    );
+}
+
+#[test]
+fn the_spill_keys_set_the_thresholds_of_saving_tool_results_to_files() {
+    let no_env = |_: &str| None;
+    let defaults = Budget::from_settings(&empty(), &no_env).unwrap();
+    assert_eq!(
+        defaults,
+        Budget {
+            result_size: 100_000,
+            turn_budget: 200_000,
+            preview_size: 1_500,
+            mcp_result_size: 50_000,
+        }
+    );
+    assert_eq!(defaults, Budget::default());
+
+    let config = file(
+        "spill_result_chars = 80000\n\
+         spill_mcp_result_chars = 30000\n\
+         spill_step_chars = 150000\n\
+         spill_preview_chars = 800",
+    );
+    let configured = Budget::from_settings(&config, &no_env).unwrap();
+    assert_eq!(
+        configured,
+        Budget {
+            result_size: 80_000,
+            turn_budget: 150_000,
+            preview_size: 800,
+            mcp_result_size: 30_000,
+        }
+    );
+    assert_eq!(configured.threshold("mcp__hive__hive_health"), Some(30_000));
+    assert_eq!(configured.threshold("terminal"), Some(80_000));
+    // A window only lowers the configured thresholds.
+    assert_eq!(configured.for_window(Some(1_000_000)), configured);
+    assert_eq!(configured.for_window(Some(65_536)).result_size, 39_321);
+
+    let env =
+        |name: &str| (name == "ULEI_ENGINE_SPILL_STEP_CHARS").then(|| OsString::from("90000"));
+    assert_eq!(
+        Budget::from_settings(&config, &env).unwrap().turn_budget,
+        90_000
+    );
+
+    for line in ["spill_preview_chars = 0", "spill_mcp_result_chars = -5"] {
+        let error = Budget::from_settings(&file(line), &no_env).unwrap_err();
+        assert!(matches!(error, Error::NotPositive(_)), "{line}: {error}");
+    }
+    assert_eq!(
+        Budget::from_settings(&file("spill_result_chars = 0"), &no_env)
+            .unwrap_err()
+            .to_string(),
+        "engine.spill_result_chars (ULEI_ENGINE_SPILL_RESULT_CHARS) must be a positive integer"
+    );
+    assert_eq!(
+        refused("spill_step_chars = \"lots\""),
+        "config {path} line 2: engine.spill_step_chars must be an integer"
     );
 }

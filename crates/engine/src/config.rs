@@ -126,6 +126,32 @@ pub const TERMINAL_OUTPUT: Setting = Setting {
     env: "ULEI_ENGINE_TERMINAL_OUTPUT",
 };
 
+/// Characters of one tool result past which it is saved to a file with a preview; above zero.
+pub const SPILL_RESULT_CHARS: Setting = Setting {
+    key: "engine.spill_result_chars",
+    env: "ULEI_ENGINE_SPILL_RESULT_CHARS",
+};
+
+/// Characters of one result of an MCP tool past which it is saved to a file, at most
+/// [`SPILL_RESULT_CHARS`]; above zero.
+pub const SPILL_MCP_RESULT_CHARS: Setting = Setting {
+    key: "engine.spill_mcp_result_chars",
+    env: "ULEI_ENGINE_SPILL_MCP_RESULT_CHARS",
+};
+
+/// Characters of all the tool results of one step past which the largest are saved to files;
+/// above zero.
+pub const SPILL_STEP_CHARS: Setting = Setting {
+    key: "engine.spill_step_chars",
+    env: "ULEI_ENGINE_SPILL_STEP_CHARS",
+};
+
+/// Most characters of the preview of a saved tool result; above zero.
+pub const SPILL_PREVIEW_CHARS: Setting = Setting {
+    key: "engine.spill_preview_chars",
+    env: "ULEI_ENGINE_SPILL_PREVIEW_CHARS",
+};
+
 /// Deadline in seconds of one parallel segment of tool calls; `0` or less waits for every call.
 pub const CONCURRENT_TOOL_TIMEOUT: Setting = Setting {
     key: "engine.concurrent_tool_timeout",
