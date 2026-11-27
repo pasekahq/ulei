@@ -73,7 +73,7 @@ pub enum Form {
     Range,
     /// Terms separated by commas.
     List,
-    /// Opening hours; any text is stored, the subset of section 2 is read later.
+    /// Opening hours; any text is stored, [`hours`] reads the subset of section 2.
     Hours,
     /// `open`, `temporarily_closed` or `permanently_closed`.
     Status,
@@ -1257,6 +1257,94 @@ pub(crate) fn point(value: &str) -> Option<(f64, f64)> {
     ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
 }
 
+const WEEKDAYS: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+const DAY_MINUTES: u16 = 1_440;
+
+/// The intervals of each weekday from Monday of an `hours` value, in minutes from that day's
+/// midnight; an end past [`DAY_MINUTES`] reaches into the next day.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Hours([Vec<(u16, u16)>; 7]);
+
+impl Hours {
+    /// Whether the hours say open at `minute` of `weekday`, 0 being Monday: inside an interval
+    /// of that day, or of the day before when it ends past midnight.
+    pub(crate) fn open_at(&self, weekday: usize, minute: u16) -> bool {
+        let (today, before) = (&self.0[weekday % 7], &self.0[(weekday + 6) % 7]);
+        today.iter().any(|&(s, e)| s <= minute && minute < e)
+            || before.iter().any(|&(_, e)| minute + DAY_MINUTES < e)
+    }
+}
+
+/// The [`Hours`] of an `hours` value in the subset of ADR-0080 section 2, `None` for any
+/// other text. A day no rule names is closed.
+pub(crate) fn hours(value: &str) -> Option<Hours> {
+    let mut week: [Vec<(u16, u16)>; 7] = Default::default();
+    if value.trim() == "24/7" {
+        for day in &mut week {
+            day.push((0, DAY_MINUTES));
+        }
+        return Some(Hours(week));
+    }
+    for rule in value.split(';') {
+        let (days, times) = rule.trim().split_once(char::is_whitespace)?;
+        let times = times.trim();
+        let intervals = if times == "off" {
+            Vec::new()
+        } else {
+            times
+                .split(',')
+                .map(|t| interval(t.trim()))
+                .collect::<Option<Vec<_>>>()?
+        };
+        for day in weekdays(days)? {
+            week[day].clone_from(&intervals);
+        }
+    }
+    Some(Hours(week))
+}
+
+/// The weekdays from Monday 0 of a comma list of days `Mo` and ranges `Mo-Fr`; a range may run
+/// past Sunday.
+fn weekdays(days: &str) -> Option<Vec<usize>> {
+    let day = |d: &str| WEEKDAYS.iter().position(|w| *w == d);
+    let mut out = Vec::new();
+    for part in days.split(',') {
+        let (first, last) = match part.split_once('-') {
+            Some((a, b)) => (day(a)?, day(b)?),
+            None => (day(part)?, day(part)?),
+        };
+        let mut d = first;
+        out.push(d);
+        while d != last {
+            d = (d + 1) % 7;
+            out.push(d);
+        }
+    }
+    Some(out)
+}
+
+/// `HH:MM-HH:MM` in minutes; an end at or before its start is past midnight.
+fn interval(s: &str) -> Option<(u16, u16)> {
+    let (a, b) = s.split_once('-')?;
+    let (start, end) = (clock(a)?, clock(b)?);
+    if start == DAY_MINUTES {
+        return None;
+    }
+    Some((start, if end <= start { end + DAY_MINUTES } else { end }))
+}
+
+/// The minutes of `HH:MM` from `00:00` to `24:00`.
+pub(crate) fn clock(s: &str) -> Option<u16> {
+    let (h, m) = s.split_once(':')?;
+    let two = |p: &str| {
+        (p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| p.parse::<u16>().ok())
+            .flatten()
+    };
+    let (h, m) = (two(h)?, two(m)?);
+    (m < 60 && (h < 24 || (h == 24 && m == 0))).then_some(h * 60 + m)
+}
+
 fn current(c: &Connection, place: &EntityId, key: &str) -> Result<Option<Reading>, BedError> {
     Ok(c.query_row(
         "SELECT value, checked_at, source, confidence FROM bed_attr
@@ -1346,4 +1434,111 @@ fn follow(s: &mut Store, place: &EntityId, key: &str, value: &str) -> Result<(),
     e.attrs = Attrs::Place(attrs);
     s.upsert_entity_unresolved(&e)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MO: usize = 0;
+    const TU: usize = 1;
+    const WE: usize = 2;
+    const TH: usize = 3;
+    const FR: usize = 4;
+    const SA: usize = 5;
+    const SU: usize = 6;
+
+    fn at(h: u16, m: u16) -> u16 {
+        h * 60 + m
+    }
+
+    /// The weekdays on which `value` says open at `minute`.
+    fn open_days(value: &str, minute: u16) -> Vec<usize> {
+        let read = hours(value).unwrap();
+        (0..7).filter(|&d| read.open_at(d, minute)).collect()
+    }
+
+    #[test]
+    fn twenty_four_seven_is_open_every_minute() {
+        let read = hours("24/7").unwrap();
+        for d in 0..7 {
+            assert!(read.open_at(d, 0) && read.open_at(d, at(23, 59)), "{d}");
+        }
+    }
+
+    #[test]
+    fn day_ranges_and_lists_name_their_days_and_no_other() {
+        assert_eq!(
+            open_days("Mo-Fr 09:00-18:00", at(12, 0)),
+            [MO, TU, WE, TH, FR]
+        );
+        assert_eq!(open_days("Mo,We 09:00-18:00", at(12, 0)), [MO, WE]);
+        assert_eq!(
+            open_days("Mo-We,Sa 09:00-18:00", at(12, 0)),
+            [MO, TU, WE, SA]
+        );
+        assert_eq!(open_days("Sa-Mo 09:00-18:00", at(12, 0)), [MO, SA, SU]);
+    }
+
+    #[test]
+    fn several_intervals_open_inside_each_and_close_between_and_at_the_end() {
+        let v = "Mo-Su 12:00-15:00, 18:00-23:00";
+        assert_eq!(open_days(v, at(12, 0)).len(), 7);
+        assert_eq!(open_days(v, at(14, 59)).len(), 7);
+        assert_eq!(open_days(v, at(15, 0)), [] as [usize; 0]);
+        assert_eq!(open_days(v, at(19, 30)).len(), 7);
+        assert_eq!(open_days(v, at(23, 0)), [] as [usize; 0]);
+        assert_eq!(open_days(v, at(11, 59)), [] as [usize; 0]);
+    }
+
+    #[test]
+    fn off_closes_the_days_it_names() {
+        assert_eq!(
+            open_days("Mo-Sa 12:00-22:00; Su off", at(13, 0)),
+            [MO, TU, WE, TH, FR, SA]
+        );
+    }
+
+    #[test]
+    fn an_interval_past_midnight_belongs_to_the_day_it_starts() {
+        let v = "Fr 20:00-02:00";
+        assert_eq!(open_days(v, at(23, 0)), [FR]);
+        assert_eq!(
+            open_days(v, at(1, 30)),
+            [SA],
+            "after midnight of Friday's interval"
+        );
+        assert_eq!(open_days(v, at(2, 0)), [] as [usize; 0]);
+        assert_eq!(open_days("Mo-Su 18:00-24:00", at(0, 30)), [] as [usize; 0]);
+        assert_eq!(open_days("Su 22:00-00:00", at(23, 59)), [SU]);
+    }
+
+    #[test]
+    fn a_later_rule_overrides_an_earlier_one_for_the_days_it_names() {
+        let v = "Mo-Fr 09:00-18:00; We 12:00-14:00; Fr off";
+        assert_eq!(open_days(v, at(10, 0)), [MO, TU, TH]);
+        assert_eq!(open_days(v, at(13, 0)), [MO, TU, WE, TH]);
+    }
+
+    #[test]
+    fn text_outside_the_subset_is_not_read() {
+        for v in [
+            "",
+            "Mo-Fr",
+            "09:00-18:00",
+            "Mo-Fr 9:00-18:00",
+            "Mo-Fr 09:00-18:60",
+            "Mo-Fr 09:00-25:00",
+            "Mo-Fr 24:00-02:00",
+            "Mo-Fr 09:00-18:00;",
+            "Mo-Fr 09:00-18:00; PH off",
+            "Jan-Mar Mo 09:00-18:00",
+            "Mo-Fr 09:00+",
+            "Mon 09:00-18:00",
+            "mo 09:00-18:00",
+            "by appointment",
+        ] {
+            assert_eq!(hours(v), None, "{v:?}");
+        }
+    }
 }

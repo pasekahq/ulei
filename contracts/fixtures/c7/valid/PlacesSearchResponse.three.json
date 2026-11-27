@@ -125,11 +125,6 @@
       "marks": [
         {
           "kind": "stale",
-          "key": "hours",
-          "age_days": 19
-        },
-        {
-          "kind": "stale",
           "key": "rating",
           "age_days": 45
         },
@@ -137,6 +132,11 @@
           "kind": "stale",
           "key": "review_count",
           "age_days": 45
+        },
+        {
+          "kind": "open_unconfirmed",
+          "key": "hours",
+          "age_days": 19
         },
         {
           "kind": "ban_risk",
@@ -164,6 +164,9 @@
       ],
       "open": "unknown",
       "marks": [
+        {
+          "kind": "open_unconfirmed"
+        },
         {
           "kind": "possible_duplicate",
           "other": "place-tide-pool-kitchen"

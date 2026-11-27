@@ -273,6 +273,15 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.13.0
+- `PlaceMarkKind` gains `open_unconfirmed` (additive, ADR-0080 section 5 items 5 and 6): in a
+  `places_search` with `open_now`, a place whose `open` is `probably_open` or `unknown` ranks as
+  if one more attribute were stale and carries this mark, with `key` `hours` and its `age_days`
+  when the place has `hours`; a stale `hours` gets no `stale` mark. The description of
+  `open_now` says that a fresh `operating_status` `temporarily_closed` drops a place, and those
+  of `local_time` and `ErrorCode` that with `open_now` a `local_time` on no real date from 1970
+  (such as `2031-02-30`) is `invalid_request`.
+
 ## C7 0.12.1
 - Descriptions of `PlaceWrite.name`, `PlaceRefusal` and `PlaceMark` only (no keyword changes):
   a place written by name is matched by the bed's dedup rule (ADR-0080 section 6), by `osm_id`,
