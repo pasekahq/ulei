@@ -360,8 +360,8 @@ def create(conn, *, title, goal, acceptance=None, step, source, created_by, revi
         validate_external(cfg, executor, kind, assignee, model, effort, panel, task_type)
     members = None
     if panel is not None:
-        if any(v is not None for v in (model, effort, assignee)) or review or kind != 'task':
-            raise CardError('panel takes no model, effort, assignee, review, epic or recurring card')
+        if any(v is not None for v in (model, effort, assignee)) or review or kind != 'task' or acceptance_kind != 'command':
+            raise CardError('panel takes no model, effort, assignee, review, judge acceptance, epic or recurring card')
         cfg = store.load_config() if cfg is None else cfg
         if int(step) not in range(1, 6):
             raise CardError('step must be 1..5')
