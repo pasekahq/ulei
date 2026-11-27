@@ -36,8 +36,8 @@ def sample(disk, cgroups, root=Path('/proc'), cgroup_root=Path('/sys/fs/cgroup')
 
 
 def evaluate(current, previous, cfg, now, urgent_floor_mb):
-    """Return extra memory slots, urgent launches the closed gate still allows on its hard floors, and durable
-    cooldown state (survives dispatcher recreation)."""
+    """Return extra memory slots, the urgent launches the RAM and disk floors allow whether or not the gate is closed,
+    and durable cooldown state (survives dispatcher recreation)."""
     state = dict(previous or {})
     reasons = []
     old_cpu = state.get('cpu')
@@ -69,7 +69,7 @@ def evaluate(current, previous, cfg, now, urgent_floor_mb):
         'waiting for second CPU sample' if iowait is None else None)
     state['sample'] = {**current, 'iowait_pct': iowait}
     urgent = 0
-    if state['reason'] and current['free_mb'] >= cfg.get('min_free_mb', 5120) and current['available_mb'] >= urgent_floor_mb:
+    if current['free_mb'] >= cfg.get('min_free_mb', 5120) and current['available_mb'] >= urgent_floor_mb:
         # The k-th urgent start of a tick sees k more starting runs at per_run_mb each.
         urgent = int((current['available_mb'] - urgent_floor_mb) // cfg.get('per_run_mb', 768)) + 1
     return (0 if state['reason'] else slots), urgent, state

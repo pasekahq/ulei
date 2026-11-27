@@ -9,7 +9,7 @@
                  [--every DURATION | --cron EXPR [--tz IANA] [--misfire skip|latest] [--start-window HH:MM-HH:MM]]
                  [--max-runs N] [--until TIMESTAMP] [--overlap skip|queue]
                  [--script PATH [--script-timeout SECONDS]] [--deliver telegram|owner-inbox|local] [--tag TAG]
-                 [--reminder TEXT] [--wait SECONDS] [--json]
+                 [--reminder TEXT] [--urgent] [--wait SECONDS] [--json]
   hive.py list [--state S ...] [--class C] [--parent EPIC] [--followup-of CARD] [--creator ACTOR]
                  [--placement board|hidden] [--query TEXT] [--limit N] [--json]
   hive.py board [--json] [--archive [--limit N]]   columns in progress, waiting (with a badge) and done;
@@ -182,12 +182,13 @@ def print_health(h, tz):
     d = h['dispatcher']
     print(f"dispatcher: {'ticking' if d['ticking'] else 'NOT ticking'}, last tick {ts(d['last_tick_at'], tz)}")
     sl = h['slots']
-    print(f"slots: {sl['used']}/{sl['concurrency']} (urgent reserve {sl['urgent_reserve']}: "
-          f"{sl['concurrency'] - sl['urgent_reserve']} for non-urgent); scripts {len(sl['scripts'])}/{sl['script_concurrency']}")
+    print(f"slots: {sl['used']}/{sl['concurrency']} (urgent lane above them: {sl['urgent_used']}/{sl['urgent_max']} "
+          f"cards); scripts {len(sl['scripts'])}/{sl['script_concurrency']}")
     if h['resource_gate'] and h['resource_gate']['reason']:
         print(f"resource gate: {h['resource_gate']['reason']}")
     for r in sl['heads']:
-        print(f"  run {r['run_id']} {r['card_id']} {r['role']} {r['card_class']} since {ts(r['started_at'], tz)}  {r['title'][:80]}")
+        print(f"  run {r['run_id']} {r['card_id']} {r['role']} {r['card_class']}{' urgent' if r['urgent'] else ''} "
+              f"since {ts(r['started_at'], tz)}  {r['title'][:80]}")
     for name, v in h['vendors_today'].items():
         print(f"vendor {name}: {'disabled' if v['disabled'] else 'enabled'}, runs today {v['runs_today']}"
               + (f" of {v['daily_runs']}" if v['daily_runs'] else ''))
@@ -226,6 +227,8 @@ def main(argv=None):
     c.add_argument('--idem', dest='idem_key')
     c.add_argument('--gate-timeout', type=float, help='acceptance timeout in seconds')
     c.add_argument('--priority', type=int, default=None)
+    c.add_argument('--urgent', action='store_true',
+                   help='owner_task only: launch on the urgent lane, past the IO gate and above concurrency')
     schedule = c.add_mutually_exclusive_group()
     schedule.add_argument('--hold', action='store_true', help='park until `hive.py release` (card waits for a trigger)')
     schedule.add_argument('--not-before', type=parse_timestamp, help='offset-aware ISO-8601 time before which the card is held')
@@ -424,7 +427,7 @@ def main(argv=None):
                                       every=a.every, max_runs=a.max_runs, until=a.until, overlap=a.overlap,
                                       cron=a.cron, tz=a.tz, misfire=a.misfire, start_window=a.start_window, script=a.script,
                                       script_timeout=a.script_timeout, deliver=a.deliver, gate_timeout=a.gate_timeout,
-                                      tag=a.tag, reminder=a.reminder)
+                                      tag=a.tag, reminder=a.reminder, urgent=a.urgent)
         except api.CardError as e:
             print(f'hive: card rejected: {e}', file=sys.stderr)
             return 2

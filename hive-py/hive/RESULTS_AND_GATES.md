@@ -193,44 +193,51 @@ even if the owner created their container.
 Admission launches candidates by class, highest first, across all lanes before
 the next class: external-executor sends, then head lanes, then the script pool.
 
-- `urgent`: an `owner_task` at step `[admission] urgent_max_step` (default 2) or
-  below in `queued` or `review`, or a card whose source is in
-  `[admission] urgent_sources` or is such a source with `:conditional`.
+- `urgent`: an `owner_task` created urgent (`hive.py create --urgent`, C2 `hive_create`'s
+  `urgent`, which the engine accepts only on a turn of the owner on the main channel,
+  ADR-0103) in `queued` or `review`, at any step, or a card whose source is in
+  `[admission] urgent_sources` or is such a source with `:conditional`. An urgent card is a
+  one-off `owner_task` run by a head: no epic, series, script, reminder or external executor.
 - `owner`: any other `owner_task`.
 - `followup`: card class `followup`.
 - `priority`: source in `[resources] priority_sources` or its `:conditional`.
 - `background`: everything else.
 
-`[admission] urgent_sources` has no default; the other keys default to step 2,
-an urgent reserve of 1 and an urgent floor of 768 MiB. Within a class, reviews
-go before queued work, then higher `priority`, then older `created_at`. The
+`[admission] urgent_sources` has no default; `urgent_floor_mb` defaults to 768 MiB. Within
+a class, reviews go before queued work, then higher `priority`, then older `created_at`. The
 `claimed` event of a head, script or external run records `admission_class`, and
 `hive.py list` prints it.
 
-`[admission] urgent_reserve` (R) holds room for urgent work on every local
-ceiling: the shared `[resources] max_local_runs` (heads, scripts and detached
-gates), each lane's `slots` and `script_concurrency`. A non-urgent launch or gate
-needs active < ceiling − R on each ceiling it counts against; an urgent one needs
-active < ceiling + R, so at most R urgent runs exceed a full ceiling. The resource
-gate closes every class on IO pressure felt by the protected services: `some avg10`
-of `io.pressure` at or above `[resources] protected_io_some_pct` (default 10) in any
-cgroup of `[resources] psi_cgroups` (paths under `/sys/fs/cgroup`, required when
-`[resources]` is enabled, as is `disk`, the path whose filesystem the free-space
-floor samples), with a reason naming that cgroup. A missing or
-unreadable cgroup file does not close the gate and is listed in
-`sample.missing_cgroups` of Hive meta `resource_gate`. Host IO PSI at
-`io_some_pct`/`io_full_pct`, CPU iowait at `iowait_pct`, RAM reserve, disk, cooldown
-and the missing second CPU sample close it too; the host IO thresholds are the
-emergency stop. An urgent head or script still starts
-through a closed gate while three hard floors hold: the host sample was read, free
+The other classes share the local ceilings: the shared `[resources] max_local_runs`
+(heads, scripts and detached gates), each lane's `slots` and `script_concurrency`; a launch
+or gate needs active < ceiling on each ceiling it counts against. The resource gate closes
+them on IO pressure felt by the protected services: `some avg10` of `io.pressure` at or
+above `[resources] protected_io_some_pct` (default 10) in any cgroup of
+`[resources] psi_cgroups` (paths under `/sys/fs/cgroup`, required when `[resources]` is
+enabled, as is `disk`, the path whose filesystem the free-space floor samples), with a
+reason naming that cgroup. A missing or unreadable cgroup file does not close the gate and
+is listed in `sample.missing_cgroups` of Hive meta `resource_gate`. Host IO PSI at
+`io_some_pct`/`io_full_pct`, CPU iowait at `iowait_pct`, RAM reserve, disk, cooldown and the
+missing second CPU sample close it too; the host IO thresholds are the emergency stop.
+
+The urgent lane runs above every ceiling: an urgent head or script is counted against none
+of them and holds no slot of the other classes. At most two urgent cards (`URGENT_MAX`) hold
+starting or running runs at once; a third waits in `queued`. An urgent launch passes the IO
+PSI gate and its cooldown and needs only three hard floors: the host sample was read, free
 disk is at least `[resources] min_free_mb`, and MemAvailable minus starting runs ×
 `per_run_mb` is at least `[admission] urgent_floor_mb` (this floor replaces the
-`reserve_mb` arithmetic for urgent work). At most R runs admitted this way are
-starting or running at once, and detached gates never pass a closed gate.
-Running work is never stopped to make room. The `claimed` event of a head or
-script carries `bypass`: `"pressure"` when the launch passed the closed host gate,
-else `"cap"` when it fit only through the reserve or overflow, otherwise `null`.
-Hive meta `resource_gate` keeps the last urgent admission under `last_urgent`:
-card, run, bypass, the gate reasons it bypassed and the time. Owner tasks above `urgent_max_step` keep their rank
-but get no reserve. Panels count each head, including synthesis; external
-executors keep their own limits.
+`reserve_mb` arithmetic for urgent work). Detached gates never pass a closed gate. Running
+work is never stopped, paused or frozen to make room. The `claimed` event of a head or
+script carries `bypass`: `"pressure"` when the host gate admitted no ordinary run, else
+`"cap"` when a ceiling it skipped was full, otherwise `null`. Hive meta `resource_gate`
+keeps the last urgent admission under `last_urgent`: card, run, bypass, the gate reasons it
+bypassed and the time. Panels count each head, including synthesis; external executors keep
+their own limits.
+
+A systemd head or script runs in `hive-heads.slice` at the idle IO class and nice 10, or,
+when claimed on the urgent lane, in `hive-urgent.slice` with `CPUWeight=1000` and the
+best-effort IO class at level 0; both slices and their caps ship in `deploy/systemd`
+(ADR-0103). `[resources] head_io_read_iops` and `head_io_write_iops` with `head_io_device`
+cap each head's unit (`IOReadIOPSMax`, `IOWriteIOPSMax`). A config that still names
+`urgent_reserve`, `urgent_max_step`, `head_io_read_max` or `head_io_write_max` loads without
+it and with one stderr line naming the key.

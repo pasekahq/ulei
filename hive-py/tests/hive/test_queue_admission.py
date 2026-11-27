@@ -145,10 +145,11 @@ CLASS_CASES = [
     ('watchdog', dict(source='cron:000000000001', card_class='series_run')),
     ('watchdog child', dict(source='cron:000000000002:conditional', card_class='series_run')),
 ]
-LAUNCH_ORDER = ['owner step 1', 'watchdog', 'watchdog child', 'owner step 4', 'followup', 'background a',
+LAUNCH_ORDER = ['watchdog', 'watchdog child', 'owner step 4', 'owner step 1', 'followup', 'background a',
                 'background b']
-CLASS_OF = {'owner step 1': 'urgent', 'watchdog': 'urgent', 'watchdog child': 'urgent', 'owner step 4': 'owner',
+CLASS_OF = {'owner step 1': 'owner', 'watchdog': 'urgent', 'watchdog child': 'urgent', 'owner step 4': 'owner',
             'followup': 'followup', 'background a': 'background', 'background b': 'background'}
+URGENT_OWNER = dict(source='msg:9', card_class='owner_task', step=3, urgent=True)
 
 
 def make_pool_card(pool, cfg, conn, tmp_path, title, kw):
@@ -180,6 +181,19 @@ def test_classes_launch_in_one_order_in_every_pool(env, tmp_path, monkeypatch, p
     assert claimed == CLASS_OF
 
 
+def test_urgent_owner_card_at_step_3_launches_first(env, tmp_path, monkeypatch):
+    cfg, conn, d = env
+    cfg['concurrency'] = 10
+    ids = {title: make_pool_card('head', cfg, conn, tmp_path, title, kw) for title, kw in CLASS_CASES}
+    urgent = make_pool_card('head', cfg, conn, tmp_path, 'owner urgent step 3', URGENT_OWNER)
+    monkeypatch.setattr(d, 'spawn', lambda *a: None)
+    d.tick()
+    assert next(iter(launched(conn))) == urgent
+    assert api.admission_class(api.card_row(conn, urgent), cfg) == claim(conn, urgent)['admission_class'] == 'urgent'
+    assert api.card_row(conn, urgent)['urgent'] == 1
+    assert all(api.card_row(conn, cid)['urgent'] == 0 for cid in ids.values())
+
+
 def test_within_a_class_review_precedes_higher_priority_which_precedes_older(env, monkeypatch):
     cfg, conn, d = env
     cfg['concurrency'] = 10
@@ -195,27 +209,20 @@ def test_within_a_class_review_precedes_higher_priority_which_precedes_older(env
 def test_admission_section_defaults_and_checked_in_values(env, tmp_path, monkeypatch, capsys):
     cfg, conn, _ = env
     checked_in = store.load_config(Path(__file__).resolve().parents[2] / 'config.example.toml')
-    for title, kw in CLASS_CASES:
+    for title, kw in [*CLASS_CASES, ('owner urgent step 3', URGENT_OWNER)]:
         cid = make_pool_card('head', cfg, conn, tmp_path, title, kw)
         conn.execute("UPDATE cards SET state='queued' WHERE id=?", (cid,))
         card = api.card_row(conn, cid)
-        assert api.admission_class(card, cfg) == api.admission_class(card, checked_in) == CLASS_OF[title]
+        assert api.admission_class(card, cfg) == api.admission_class(card, checked_in) == CLASS_OF.get(title, 'urgent')
     assert hive_cli(monkeypatch, cfg, 'list') == 0
     lines = capsys.readouterr().out.splitlines()
     for title, cls in CLASS_OF.items():
         assert cls in next(line for line in lines if line.endswith(title)).split()
     assert hive_cli(monkeypatch, cfg, 'list', '--json') == 0
     listed = {r['title']: r['admission_class'] for r in json.loads(capsys.readouterr().out)}
-    assert listed == CLASS_OF
-    owner_step_2 = dict(source='msg:3', card_class='owner_task', step=2)
-    cid = make_pool_card('head', cfg, conn, tmp_path, 'owner step 2', owner_step_2)
-    conn.execute("UPDATE cards SET state='queued' WHERE id=?", (cid,))
-    card = api.card_row(conn, cid)
-    assert api.admission_class(card, cfg) == 'urgent'
-    assert api.admission_class(card, cfg | {'admission': {'urgent_max_step': 1, 'urgent_sources': []}}) == 'owner'
+    assert listed == {**CLASS_OF, 'owner urgent step 3': 'urgent'}
     config = Path(cfg['_path'])
-    for section in ('urgent_max_step = 6', 'urgent_sources = "cron:x"', 'urgent_reserve = -1', 'urgent_reserve = true',
-                    'urgent_floor_mb = -1'):
+    for section in ('urgent_sources = "cron:x"', 'urgent_floor_mb = -1', 'urgent_floor_mb = true'):
         bad = tmp_path / 'bad.toml'
         text = config.read_text()
         if section.startswith('urgent_sources'):
@@ -225,34 +232,50 @@ def test_admission_section_defaults_and_checked_in_values(env, tmp_path, monkeyp
             store.load_config(bad)
 
 
+@pytest.mark.parametrize('kw', [dict(card_class='system'), dict(card_class='followup'), dict(kind='epic'),
+                                dict(reminder='synthetic reminder', not_before=4102444800.0),
+                                dict(urgent='yes')])
+def test_urgent_belongs_to_an_owner_task_run_by_a_head(env, kw):
+    _, conn, _ = env
+    kw = {'card_class': 'owner_task', 'urgent': True, **kw}
+    with pytest.raises(api.CardError, match='urgent'):
+        api.create(conn, title='urgent', goal='g', acceptance='true', step=1, source='msg:7', created_by='secretary', **kw)
+    assert conn.execute('SELECT count(*) FROM cards').fetchone()[0] == 0
+
+
+def test_cli_creates_an_urgent_owner_card_and_refuses_other_classes(env, monkeypatch, capsys):
+    cfg, conn, _ = env
+    base = ('create', '--title', 'now', '--goal', 'g', '--acceptance', 'true', '--step', '3', '--source', 'msg:8',
+            '--created-by', 'secretary', '--json')
+    assert hive_cli(monkeypatch, cfg, *base, '--kind', 'owner_task', '--urgent') == 0
+    created = json.loads(capsys.readouterr().out)
+    assert api.card_row(conn, created['id'])['urgent'] == 1
+    assert hive_cli(monkeypatch, cfg, *base, '--kind', 'system', '--urgent') == 2
+    assert 'urgent applies only to an owner_task card' in capsys.readouterr().err
+    assert hive_cli(monkeypatch, cfg, *base, '--kind', 'owner_task') == 0
+    assert api.card_row(conn, json.loads(capsys.readouterr().out)['id'])['urgent'] == 0
+
+
 WATCHDOG = dict(source='cron:000000000001', card_class='series_run')
 
 
-def reserve_one(env, monkeypatch):
+def no_spawn(env, monkeypatch):
     cfg, conn, d = env
-    cfg['admission']['urgent_reserve'] = 1
     monkeypatch.setattr(d, 'spawn', lambda *a: None)
     return cfg, conn, d
 
 
-def shared_pool(env, monkeypatch):
-    """Healthy host with a fresh CPU sample every tick and memory for many runs; lanes wider than the shared pool."""
-    cfg, conn, d = reserve_one(env, monkeypatch)
+def shared_pool(env, monkeypatch, **sample):
+    """A host with a fresh CPU sample every tick and memory for many runs, shaped by `sample`; concurrency 5 and a
+    shared pool as wide."""
+    cfg, conn, d = no_spawn(env, monkeypatch)
     enable(cfg, conn, monkeypatch)
-    cfg['resources']['max_local_runs'] = 5
-    cfg['concurrency'] = 10
+    cfg['resources']['max_local_runs'] = cfg['concurrency'] = 5
+    cfg['script_concurrency'] = 2
     idle = itertools.count(1000, 100)
-    monkeypatch.setattr(resources, 'sample',
-                        lambda **_: {**healthy(cpu=[100, 0, 100, next(idle), 0, 0, 0, 0]), 'available_mb': 64000})
+    monkeypatch.setattr(resources, 'sample', lambda **_: {**healthy(cpu=[100, 0, 100, next(idle), 0, 0, 0, 0]),
+                                                          'available_mb': 64000, **sample})
     return cfg, conn, d
-
-
-def fill(cfg, d, cards):
-    """Start every queued card with no reserve, as if the pool had filled before the reserve applied."""
-    cfg['admission']['urgent_reserve'] = 0
-    d.tick()
-    cfg['admission']['urgent_reserve'] = 1
-    assert list(launched(d.conn)) == cards
 
 
 def launched(conn):
@@ -270,49 +293,68 @@ def assert_still_active(conn, run_ids):
     assert all(r['status'] == 'starting' and r['ended_at'] is None for r in rows)
 
 
-def test_urgent_owner_task_overflows_a_full_shared_pool_by_the_reserve_only(env, monkeypatch):
+def gate_state(conn):
+    return store.meta_get(conn, 'resource_gate')[0]
+
+
+def close_gate(monkeypatch, **sample):
+    monkeypatch.setattr(resources, 'sample', lambda **_: {**healthy(), 'available_mb': 64000, 'some': 90, **sample})
+
+
+def test_urgent_owner_card_runs_sixth_above_concurrency_5_while_the_psi_gate_is_closed(env, tmp_path, monkeypatch):
     cfg, conn, d = shared_pool(env, monkeypatch)
     background = [mk(conn, f'background {i}') for i in range(5)]
-    fill(cfg, d, background)
+    d.tick()
+    assert list(launched(conn)) == background
     held = list(launched(conn).values())
-    owner = mk(conn, 'owner step 2', card_class='owner_task', step=2)
+    close_gate(monkeypatch)
+    d.clock = lambda: 1000
+    owner = mk(conn, 'owner step 3', card_class='owner_task', step=3)
     later = mk(conn, 'background late')
-    second = mk(conn, 'owner step 1', card_class='owner_task', step=1)
+    urgent = make_pool_card('head', cfg, conn, tmp_path, 'owner urgent step 3', URGENT_OWNER)
     d.tick()
-    assert list(launched(conn))[5:] == [owner]
-    assert claim(conn, owner)['admission_class'] == 'urgent' and claim(conn, owner)['bypass'] == 'cap'
-    assert api.card_row(conn, later)['state'] == api.card_row(conn, second)['state'] == 'queued'
+    assert list(launched(conn))[5:] == [urgent]
+    assert claim(conn, urgent)['admission_class'] == 'urgent' and claim(conn, urgent)['bypass'] == 'pressure'
+    assert gate_state(conn)['last_urgent'] == {'card': urgent, 'run': launched(conn)[urgent], 'bypass': 'pressure',
+                                               'bypassed': 'io PSI some', 'at': 1000}
+    assert api.card_row(conn, owner)['state'] == api.card_row(conn, later)['state'] == 'queued'
     assert_still_active(conn, held)
 
 
-def test_background_stops_one_short_of_the_shared_pool_and_a_watchdog_takes_the_reserve(env, tmp_path, monkeypatch):
+def test_a_third_urgent_card_waits_until_one_of_two_ends(env, tmp_path, monkeypatch):
     cfg, conn, d = shared_pool(env, monkeypatch)
-    background = [mk(conn, f'background {i}') for i in range(5)]
+    cfg['resources']['max_local_runs'] = cfg['concurrency'] = 1
+    background = [mk(conn, f'background {i}') for i in range(2)]
+    urgent = [make_pool_card('head', cfg, conn, tmp_path, f'owner urgent {i}', URGENT_OWNER) for i in range(3)]
     d.tick()
-    assert list(launched(conn)) == background[:4]
-    assert all(claim(conn, cid)['bypass'] is None for cid in background[:4])
-    held = list(launched(conn).values())
-    watchdog = make_pool_card('head', cfg, conn, tmp_path, 'watchdog', WATCHDOG)
     d.tick()
-    assert list(launched(conn))[4:] == [watchdog]
-    assert claim(conn, watchdog)['bypass'] == 'cap'
-    assert api.card_row(conn, background[4])['state'] == 'queued'
-    assert_still_active(conn, held)
+    assert list(launched(conn)) == [*urgent[:2], background[0]]
+    assert [claim(conn, cid)['admission_class'] for cid in urgent[:2]] == ['urgent', 'urgent']
+    assert api.card_row(conn, urgent[2])['state'] == api.card_row(conn, background[1])['state'] == 'queued'
+    conn.execute("UPDATE runs SET status='exited', handled=1 WHERE card_id=?", (urgent[0],))
+    conn.execute("UPDATE cards SET state='done' WHERE id=?", (urgent[0],))
+    d.tick()
+    assert list(launched(conn))[3:] == [urgent[2]]
+    assert api.card_row(conn, background[1])['state'] == 'queued'
 
 
-def test_urgent_launch_with_room_below_the_reserve_has_no_bypass(env, monkeypatch):
-    _, conn, d = shared_pool(env, monkeypatch)
-    owner = mk(conn, 'owner step 1', card_class='owner_task', step=1)
+def test_urgent_runs_take_no_ordinary_slot(env, tmp_path, monkeypatch):
+    cfg, conn, d = shared_pool(env, monkeypatch)
+    cfg['resources']['max_local_runs'] = cfg['concurrency'] = 2
+    urgent = [make_pool_card('head', cfg, conn, tmp_path, f'owner urgent {i}', URGENT_OWNER) for i in range(2)]
     d.tick()
-    assert claim(conn, owner)['admission_class'] == 'urgent' and claim(conn, owner)['bypass'] is None
+    background = [mk(conn, f'background {i}') for i in range(3)]
+    d.tick()
+    assert list(launched(conn)) == [*urgent, *background[:2]]
+    assert d.active_runs('task') == 2 and d.urgent_cards() == set(urgent)
 
 
 def test_watchdog_script_overflows_a_full_script_pool_and_background_script_waits(env, tmp_path, monkeypatch):
-    cfg, conn, d = reserve_one(env, monkeypatch)
-    cfg['script_concurrency'] = 2
+    cfg, conn, d = shared_pool(env, monkeypatch)
     scripts = [make_pool_card('script', cfg, conn, tmp_path, f'script {i}', {'source': 'system:test'})
                for i in range(2)]
-    fill(cfg, d, scripts)
+    d.tick()
+    assert list(launched(conn)) == scripts
     held = list(launched(conn).values())
     background = make_pool_card('script', cfg, conn, tmp_path, 'background script', {'source': 'system:test'})
     watchdog = make_pool_card('script', cfg, conn, tmp_path, 'watchdog script', WATCHDOG)
@@ -323,59 +365,35 @@ def test_watchdog_script_overflows_a_full_script_pool_and_background_script_wait
     assert_still_active(conn, held)
 
 
-def test_lane_slots_hold_the_same_reserve(env, monkeypatch):
-    cfg, conn, d = reserve_one(env, monkeypatch)
-    cfg['concurrency'] = 3
-    background = [mk(conn, f'background {i}') for i in range(3)]
+def test_urgent_launch_with_room_has_no_bypass(env, tmp_path, monkeypatch):
+    cfg, conn, d = shared_pool(env, monkeypatch)
+    urgent = make_pool_card('head', cfg, conn, tmp_path, 'owner urgent', URGENT_OWNER)
     d.tick()
-    assert list(launched(conn)) == background[:2]
-    held = list(launched(conn).values())
-    urgent = [mk(conn, f'owner step 1 #{i}', card_class='owner_task', step=1) for i in range(3)]
-    d.tick()
-    assert list(launched(conn))[2:] == urgent[:2]
-    assert [claim(conn, cid)['bypass'] for cid in urgent[:2]] == ['cap', 'cap']
-    assert api.card_row(conn, urgent[2])['state'] == api.card_row(conn, background[2])['state'] == 'queued'
-    assert_still_active(conn, held)
+    assert claim(conn, urgent)['admission_class'] == 'urgent' and claim(conn, urgent)['bypass'] is None
 
 
-OWNER_STEP_2 = dict(card_class='owner_task', step=2)
-
-
-def pressured(env, monkeypatch, **sample):
-    """Host gate shaped by the given sample, one urgent reserve, every ceiling wide enough to stay out of the way."""
-    cfg, conn, d = reserve_one(env, monkeypatch)
-    enable(cfg, conn, monkeypatch, **sample)
-    cfg['resources']['max_local_runs'] = 5
-    cfg['concurrency'] = cfg['script_concurrency'] = 10
+@pytest.mark.parametrize('pool, kw', [('head', URGENT_OWNER), ('script', WATCHDOG)])
+def test_host_psi_holds_background_while_urgent_passes_with_pressure_bypass(env, tmp_path, monkeypatch, pool, kw):
+    cfg, conn, d = shared_pool(env, monkeypatch, some=90)
     d.clock = lambda: 1000
-    return cfg, conn, d
-
-
-def gate_state(conn):
-    return store.meta_get(conn, 'resource_gate')[0]
-
-
-@pytest.mark.parametrize('pool', ['head', 'script'])
-def test_host_psi_holds_background_while_urgent_passes_with_pressure_bypass(env, tmp_path, monkeypatch, pool):
-    cfg, conn, d = pressured(env, monkeypatch, some=90)
     background = make_pool_card(pool, cfg, conn, tmp_path, 'background', {'source': 'system:test'})
-    owner = make_pool_card(pool, cfg, conn, tmp_path, 'owner step 2', {'source': 'msg:2', **OWNER_STEP_2})
+    urgent = make_pool_card(pool, cfg, conn, tmp_path, 'urgent', kw)
     d.tick()
-    assert list(launched(conn)) == [owner]
-    assert claim(conn, owner)['admission_class'] == 'urgent' and claim(conn, owner)['bypass'] == 'pressure'
+    assert list(launched(conn)) == [urgent]
+    assert claim(conn, urgent)['admission_class'] == 'urgent' and claim(conn, urgent)['bypass'] == 'pressure'
     assert api.card_row(conn, background)['state'] == 'queued'
-    assert gate_state(conn)['last_urgent'] == {'card': owner, 'run': launched(conn)[owner], 'bypass': 'pressure',
-                                               'bypassed': 'io PSI some', 'at': 1000}
+    assert gate_state(conn)['last_urgent']['bypassed'] == 'io PSI some'
 
 
-def test_cooldown_alone_lets_urgent_start(env, monkeypatch):
-    _, conn, d = pressured(env, monkeypatch)
+def test_cooldown_alone_lets_urgent_start(env, tmp_path, monkeypatch):
+    cfg, conn, d = shared_pool(env, monkeypatch)
+    d.clock = lambda: 1000
     store.meta_set(conn, 'resource_gate', {'cpu': [0] * 8, 'blocked_until': 1030})
     background = mk(conn, 'background')
-    owner = mk(conn, 'owner step 2', **OWNER_STEP_2)
+    urgent = make_pool_card('head', cfg, conn, tmp_path, 'owner urgent', URGENT_OWNER)
     d.tick()
-    assert list(launched(conn)) == [owner]
-    assert claim(conn, owner)['bypass'] == 'pressure'
+    assert list(launched(conn)) == [urgent]
+    assert claim(conn, urgent)['bypass'] == 'pressure'
     assert gate_state(conn)['last_urgent']['bypassed'] == 'cooldown'
     assert api.card_row(conn, background)['state'] == 'queued'
 
@@ -385,51 +403,45 @@ def unavailable(**_):
 
 
 @pytest.mark.parametrize('floor', ['ram', 'disk', 'sample'])
-def test_hard_floors_hold_urgent_under_pressure(env, monkeypatch, floor):
-    _, conn, d = pressured(env, monkeypatch, some=90,
-                           **{'ram': {'available_mb': 767}, 'disk': {'free_mb': 5119}, 'sample': {}}[floor])
+def test_hard_floors_hold_urgent_under_pressure(env, tmp_path, monkeypatch, floor):
+    cfg, conn, d = shared_pool(env, monkeypatch, some=90,
+                               **{'ram': {'available_mb': 767}, 'disk': {'free_mb': 5119}, 'sample': {}}[floor])
     if floor == 'sample':
         monkeypatch.setattr(resources, 'sample', unavailable)
-    owner = mk(conn, 'owner step 2', **OWNER_STEP_2)
+    urgent = make_pool_card('head', cfg, conn, tmp_path, 'owner urgent', URGENT_OWNER)
     d.tick()
     assert not launched(conn)
-    assert api.card_row(conn, owner)['state'] == 'queued'
+    assert api.card_row(conn, urgent)['state'] == 'queued'
 
 
-def test_urgent_floor_budgets_starting_runs(env, monkeypatch):
-    _, conn, d = pressured(env, monkeypatch)
+def test_memory_below_urgent_floor_refuses_with_the_gate_open(env, tmp_path, monkeypatch):
+    cfg, conn, d = shared_pool(env, monkeypatch, available_mb=2000)
+    cfg['resources']['reserve_mb'] = 512
+    cfg['admission']['urgent_floor_mb'] = 2048
+    urgent = make_pool_card('head', cfg, conn, tmp_path, 'owner urgent', URGENT_OWNER)
     background = mk(conn, 'background')
     d.tick()
     assert list(launched(conn)) == [background]
-    owner = mk(conn, 'owner step 2', **OWNER_STEP_2)
+    assert api.card_row(conn, urgent)['state'] == 'queued'
+
+
+def test_urgent_floor_budgets_starting_runs(env, tmp_path, monkeypatch):
+    cfg, conn, d = shared_pool(env, monkeypatch)
+    background = mk(conn, 'background')
+    d.tick()
+    assert list(launched(conn)) == [background]
+    urgent = make_pool_card('head', cfg, conn, tmp_path, 'owner urgent', URGENT_OWNER)
     # One starting run at per_run_mb 768 against urgent_floor_mb 768.
-    monkeypatch.setattr(resources, 'sample', lambda **_: healthy() | {'some': 90, 'available_mb': 1535})
+    close_gate(monkeypatch, available_mb=1535)
     d.tick()
-    assert api.card_row(conn, owner)['state'] == 'queued'
-    monkeypatch.setattr(resources, 'sample', lambda **_: healthy() | {'some': 90, 'available_mb': 1536})
+    assert api.card_row(conn, urgent)['state'] == 'queued'
+    close_gate(monkeypatch, available_mb=1536)
     d.tick()
-    assert claim(conn, owner)['bypass'] == 'pressure'
-
-
-def test_one_pressure_bypass_run_holds_the_next_urgent_until_it_ends(env, monkeypatch):
-    cfg, conn, d = pressured(env, monkeypatch, some=90)
-    cfg['resources']['max_local_runs'] = 1
-    first, second = (mk(conn, f'owner step 1 #{i}', card_class='owner_task', step=1) for i in range(2))
-    d.tick()
-    d.tick()
-    assert list(launched(conn)) == [first]
-    # The empty pool already sits at the non-urgent limit, so the cap bypass applies too.
-    assert claim(conn, first)['bypass'] == 'pressure'
-    assert api.card_row(conn, second)['state'] == 'queued'
-    conn.execute("UPDATE runs SET status='exited', handled=1")
-    conn.execute("UPDATE cards SET state='done' WHERE id=?", (first,))
-    d.tick()
-    assert list(launched(conn)) == [first, second]
-    assert claim(conn, second)['bypass'] == 'pressure'
+    assert claim(conn, urgent)['bypass'] == 'pressure'
 
 
 def test_detached_gate_of_an_urgent_card_never_takes_the_pressure_bypass(env, tmp_path, monkeypatch):
-    cfg, conn, d = pressured(env, monkeypatch, some=90)
+    cfg, conn, d = shared_pool(env, monkeypatch, some=90)
     monkeypatch.setattr(dispatcher.Dispatcher, 'schedule_gate', REAL_SCHEDULE_GATE)
     gates, real_popen = [], subprocess.Popen
     def popen(argv, **kw):
@@ -439,8 +451,8 @@ def test_detached_gate_of_an_urgent_card_never_takes_the_pressure_bypass(env, tm
     monkeypatch.setattr(dispatcher.subprocess, 'Popen', popen)
     watchdog = make_pool_card('head', cfg, conn, tmp_path, 'watchdog', WATCHDOG)
     conn.execute("UPDATE cards SET state='check' WHERE id=?", (watchdog,))
-    owner = mk(conn, 'owner step 2', **OWNER_STEP_2)
+    urgent = make_pool_card('head', cfg, conn, tmp_path, 'owner urgent', URGENT_OWNER)
     d.tick()
-    assert list(launched(conn)) == [owner] and claim(conn, owner)['bypass'] == 'pressure'
+    assert list(launched(conn)) == [urgent] and claim(conn, urgent)['bypass'] == 'pressure'
     assert not gates and conn.execute('SELECT count(*) FROM gate_jobs').fetchone()[0] == 0
     assert api.card_row(conn, watchdog)['state'] == 'check'

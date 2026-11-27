@@ -233,6 +233,71 @@ fn create_list_show_steer_cancel_on_the_real_hive_without_a_dispatcher() {
     assert_eq!(steers[0]["by"], "secretary");
 }
 
+#[test]
+fn an_urgent_owner_card_at_step_3_on_the_real_hive() {
+    let dir = Scratch::new();
+    let command = format!(
+        "{} {}",
+        python().display(),
+        repo().join("hive-py/scripts/hive.py").display()
+    );
+    let server = Running::start(&write_config(
+        &dir.0,
+        &command,
+        &hive_config(&dir.0),
+        "timeout = 60\n",
+        0o600,
+    ));
+    let session = server.session();
+    let created = server.call(
+        &session,
+        "hive_create",
+        &json!({"title": "Synthetic urgent errand", "goal": "Answer the owner now.",
+            "acceptance": "true", "step": 3, "source": "msg:1003", "urgent": true}),
+    );
+    assert_eq!(created["isError"], false, "{created} {:?}", server.stderr());
+    let id = created["structuredContent"]["card_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let plain = server.call(
+        &session,
+        "hive_create",
+        &json!({"title": "Synthetic errand", "goal": "Answer later.",
+            "acceptance": "true", "step": 3, "source": "msg:1004"}),
+    );
+    let plain_id = plain["structuredContent"]["card_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let urgent_of = |id: &str| -> Value {
+        let out = Command::new(python())
+            .arg(repo().join("hive-py/scripts/hive.py"))
+            .args(["show", "--json", id])
+            .env("HIVE_CONFIG", dir.0.join("hive-config.toml"))
+            .output()
+            .unwrap();
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["urgent"].clone()
+    };
+    assert_eq!(urgent_of(&id), 1);
+    assert_eq!(urgent_of(&plain_id), 0);
+
+    let health = server.call(&session, "hive_health", &json!({}));
+    let slots = &health["structuredContent"]["snapshot"]["slots"];
+    assert_eq!(slots["urgent_max"], 2, "{health}");
+    assert_eq!(slots["urgent_used"], 0, "{health}");
+
+    let refused = server.call(
+        &session,
+        "hive_create",
+        &json!({"title": "T", "goal": "G", "acceptance": "true", "step": 1, "source": "manual",
+            "kind": "system", "urgent": true}),
+    );
+    assert_eq!(refused["isError"], true);
+    let said = refused["content"][0]["text"].as_str().unwrap();
+    assert!(said.starts_with("urgent applies only"), "{said}");
+}
+
 /// Whether the hive's one runtime package, `cronsim`, imports in the environment the server
 /// gives the CLI (`HOME` the scratch directory): the hive needs it for `--cron`.
 fn has_cronsim(home: &Path) -> bool {

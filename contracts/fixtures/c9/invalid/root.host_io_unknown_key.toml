@@ -1,0 +1,5 @@
+[host.io]
+device = "/dev/vdz"
+read_iops = 300
+write_iops = 200
+p90_target_ms = 10

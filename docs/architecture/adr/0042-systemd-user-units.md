@@ -206,7 +206,8 @@ ADR-0001 section 8 and ADR-0027.
 an owner turn while the owner waits for the reply, so they set `Slice=ulei.slice`, a slice unit
 installed beside them (`deploy/systemd/ulei.slice`) that sets no IO, CPU or memory limit; each
 unit keeps its own `MemoryMax` and `TasksMax`. `ulei-connectors` and `ulei-night` run on a
-schedule and stay in the manager's default slice, where a deployment may cap them.
+schedule in `background.slice`, the background class of ADR-0103, which also gives every class
+slice its caps.
 Cause: a deployment put every `ulei-` unit into one IO-capped slice for its background work
 (80 read and 60 write IOPS) with a drop-in `ulei-.service.d/`. The hive CLI of `ulei-hive-mcp`
 then waited about 100 s for the SQLite writes of each `hive_create` and timed out a `hive_list`
@@ -225,6 +226,6 @@ the slice's `io.max` is empty, and `systemd-analyze --user verify` covers the sl
   the four namespace options of section 8.
 - An operator installs a release with `deploy/install.sh` from a checkout of the release's commit,
   writes `ulei.toml` by hand and runs the `systemctl --user` commands it prints.
-- The owner turn's units share no IO budget with the deployment's background work: an operator
-  who caps background IO in a slice names the scheduled units (`ulei-connectors`, `ulei-night`) in
-  its `Slice=` drop-ins, not a prefix drop-in for every `ulei-` unit.
+- The owner turn's units share no IO budget with the deployment's background work: the scheduled
+  units (`ulei-connectors`, `ulei-night`) run in the capped `background.slice` (ADR-0103), and no
+  prefix drop-in for every `ulei-` unit moves the owner turn's units out of `ulei.slice`.

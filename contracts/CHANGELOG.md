@@ -74,6 +74,16 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `source`, `owner_visible` and `priority` from the product shape are not fields yet (adding
   them would break the Python consumers, which reject unknown fields): planned for C1 2.0.0 in S1.
 
+## C2 0.7.0
+- `hive_create` takes the optional boolean `urgent` (additive, ADR-0103): the card runs on the
+  hive's urgent lane (`hive.py create --urgent`), past its IO gate and above its concurrency, at
+  most two such cards at once. The engine refuses `urgent: true` on any turn but the owner's on
+  the main channel; the hive takes it only on an `owner_task` run by a head.
+- Descriptions of `HiveHealthOutput` and `HiveInspectOutput` only: their snapshots are version 2
+  of the hive's `health --json` and `inspect --json`; `slots` names the urgent lane
+  (`urgent_max`, `urgent_used`, each run's `urgent`) in place of the urgent reserve, and
+  `slots_used` counts the head runs on the `concurrency` slots.
+
 ## C2 0.6.0
 - `hive_create` takes the optional `reminder` (additive, ADR-0101): the text of a reminder card,
   verbatim, 1 to 32768 characters (the server also caps it at 32768 bytes of UTF-8); no head runs.
@@ -575,6 +585,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft records of the engine's session journal (ADR-0014): `Session` (id and session key),
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
+
+## C9 0.17.0
+- Section `host` with the table `host.io` (additive, ADR-0103): `device` (`string`, a path under
+  `/dev/`), `read_iops` and `write_iops` (`integer`, what the device sustains). No daemon reads
+  them; `deploy/install.sh` derives the IOPS caps of the class slices it installs from them.
 
 ## C9 0.16.0
 - Key `engine.owner_call_budget` (`integer` or `string` seconds, default 45, 0 or less for none;

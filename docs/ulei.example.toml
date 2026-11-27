@@ -293,3 +293,10 @@ hive_config = "/srv/example/hive/config.toml"
 actor = "secretary"
 timeout = 120
 hold = false
+
+# The host's disk for the class slices deploy/install.sh writes (ADR-0103): no daemon reads it.
+# The slices' IOPS caps are shares of these capacities; without the table they get none.
+[host.io]
+device = "/dev/vdz"
+read_iops = 300
+write_iops = 300

@@ -65,8 +65,8 @@ reads as the hive's user. None of it needs a write, a stream or a new daemon.
   read, not followed.
 - `queue` is the card's board place and wait (`api.placement`, `api.waiting_since`), its
   position in the dispatcher's launch order (admission class, reviewers first, priority, age),
-  the slot limit for its class (`concurrency` minus or plus `admission.urgent_reserve`) with every
-  run holding a slot, and the dispatcher's last `budget_wait` note while the card still waits.
+  the slot limit for its class (`concurrency`, or for an urgent card the urgent lane's two cards,
+  ADR-0103) with every run holding one, and the dispatcher's last `budget_wait` note while the card still waits.
 - `deliveries` is each outbox row with, once published, the owner inbox's row through the
   delivery adapter's new read `status(event_id)` (`drop`: the library's `get`; `ulei`: C1 `get`):
   status, attempts, outcome. The hive reads the inbox only through its adapter, as before.

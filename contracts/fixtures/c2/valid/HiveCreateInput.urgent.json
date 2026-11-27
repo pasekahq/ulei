@@ -1,0 +1,8 @@
+{
+  "title": "Synthetic urgent card",
+  "goal": "Do a synthetic thing the owner waits for.",
+  "acceptance": "test -f out.txt",
+  "step": 3,
+  "source": "msg:1002",
+  "urgent": true
+}

@@ -50,6 +50,15 @@ outside sources, without which their condition is off (Watchdog, below). `[head_
 a non-negative interval, 0 for off, and a text naming no placeholder but `{minutes}` and `{command}` (`hive/LIVE_STEER.md`, Wait nudge). `HIVE_DB` overrides `db`. The live config and texts
 are the deployment's and are never in the tree; `config.example.toml` lists every key.
 
+## Admission and head classes (ADR-0103)
+
+`hive/RESULTS_AND_GATES.md` (Admission) is the canonical description. In short: `api.admission_class` ranks
+cards; an `owner_task` created with `urgent` (the engine passes it only from the owner's main chat) and the cards
+of `[admission] urgent_sources` form the urgent lane, at most `api.URGENT_MAX` cards at once, above every ceiling and
+past the IO PSI gate, held only by the RAM and disk floors. `Dispatcher.spawn` puts a systemd head into
+`hive-heads.slice`, an urgent one into `hive-urgent.slice` with `CPUWeight=1000` and the best-effort IO class; no
+`IOWeight`. `store.OBSOLETE_KEYS` lists the keys a config may still name and the hive ignores with one stderr line.
+
 ## Snapshots (ADR-0086)
 
 `inspect.card`, `inspect.health`, `inspect.find` and `inspect.read_file` are the read-only views behind `hive.py

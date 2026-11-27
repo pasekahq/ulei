@@ -28,7 +28,14 @@ FINISHED_RUN = ('exited', 'timeout', 'crashed', 'failed_launch', 'interrupted')
 SYNTHESIS = '@synthesis'
 EXECUTOR_LIMITS = ('poll_s', 'call_timeout_s', 'timeout_s', 'cooldown_s')
 EXECUTOR_COUNTS = ('max_parallel', 'daily_sends')
-ADMISSION_DEFAULTS = {'urgent_max_step': 2, 'urgent_reserve': 1, 'urgent_floor_mb': 768}
+ADMISSION_DEFAULTS = {'urgent_floor_mb': 768}
+# Keys the hive no longer reads: a config naming one loads without it, with one stderr line per process and key.
+OBSOLETE_KEYS = {('admission', 'urgent_reserve'): 'urgent cards run above the ceilings, at most two at once',
+                 ('admission', 'urgent_max_step'): 'only a card created with --urgent is urgent, at any step',
+                 ('resources', 'head_io_read_max'): 'use resources.head_io_read_iops',
+                 ('resources', 'head_io_write_max'): 'use resources.head_io_write_iops'}
+HEAD_IO_IOPS = ('head_io_read_iops', 'head_io_write_iops')
+_warned = set()
 # Deployment values without a default: a config that lacks one is refused with the key's name.
 REQUIRED_KEYS = ('owner_actor', 'owner_tz', 'delivery', 'results_dir', 'card_show_command',
                  'head_env', 'gate_env', 'script_env', 'script_env_file', 'steward_dir', 'rotation_log', 'texts',
@@ -161,6 +168,7 @@ def load_config(path=None):
         check_executor(name, ec)
     if 'retry_backoff' in cfg:
         check_retry_backoff(cfg['retry_backoff'])
+    drop_obsolete(cfg, path)
     cfg['admission'] = {**ADMISSION_DEFAULTS, **cfg.get('admission', {})}
     check_admission(cfg['admission'])
     from . import wait_nudge, watchdog
@@ -172,6 +180,17 @@ def load_config(path=None):
     return cfg
 
 
+def drop_obsolete(cfg, path):
+    """Remove each key of OBSOLETE_KEYS from cfg, naming it on stderr once per process and config file."""
+    for (table, key), instead in OBSOLETE_KEYS.items():
+        if key not in cfg.get(table, {}):
+            continue
+        del cfg[table][key]
+        if (str(path), table, key) not in _warned:
+            _warned.add((str(path), table, key))
+            print(f'hive: config {path}: {table}.{key} is obsolete and ignored; {instead}', file=sys.stderr, flush=True)
+
+
 def missing(key):
     return ValueError(f'config: missing key {key}')
 
@@ -179,8 +198,9 @@ def missing(key):
 def check_deployment(cfg):
     """Refuse a config without a deployment value: the keys of REQUIRED_KEYS and TEXTS, the keys the delivery adapter
     reads, the home and the boolean tag_launcher of each vendor that runs heads, a daily_runs that is not a non-negative
-    integer, the disk and cgroups of enabled [resources], the home of a configured limits command and the [reminders]
-    table (reminder.config)."""
+    integer, the disk and cgroups of enabled [resources], a head_io_device that is no /dev/ path, per-head IOPS that are
+    not positive integers or lack the device, the home of a configured limits command and the [reminders] table
+    (reminder.config)."""
     for key in REQUIRED_KEYS:
         if key not in cfg:
             raise missing(key)
@@ -210,12 +230,18 @@ def check_deployment(cfg):
         for key in ('disk', 'psi_cgroups'):
             if key not in res:
                 raise missing(f'resources.{key}')
-    if res.get('head_io_device'):
-        for key in ('head_io_device', 'head_io_write_max', 'head_io_read_max'):
-            value = res.get(key, '')
-            if not isinstance(value, str) or ' ' in value or (key == 'head_io_device' and not value.startswith('/dev/')):
-                raise ValueError(f'config: resources.{key} must be a string without spaces'
-                                 f'{" starting with /dev/" if key == "head_io_device" else ""}, got {value!r}')
+    device = res.get('head_io_device')
+    if device is not None and (not isinstance(device, str) or ' ' in device or not device.startswith('/dev/')):
+        raise ValueError(f'config: resources.head_io_device must be a path starting with /dev/ without spaces, '
+                         f'got {device!r}')
+    for key in HEAD_IO_IOPS:
+        if key not in res:
+            continue
+        if device is None:
+            raise missing('resources.head_io_device')
+        value = res[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f'config: resources.{key} must be a positive integer of IOPS, got {value!r}')
     if cfg.get('budget', {}).get('limits_command') and 'limits_home' not in cfg['budget']:
         raise missing('budget.limits_home')
     if not isinstance(cfg['gateway_socket'], str) or not cfg['gateway_socket']:
@@ -293,19 +319,13 @@ def check_retry_backoff(rb):
 
 
 def check_admission(adm):
-    """Refuse an [admission] section whose urgent_max_step is not a step 1..5, whose urgent_sources is not a list of
-    strings, whose urgent_reserve is not a non-negative integer or whose urgent_floor_mb is not a non-negative number."""
+    """Refuse an [admission] section whose urgent_sources is not a list of strings or whose urgent_floor_mb is not a
+    non-negative number."""
     if 'urgent_sources' not in adm:
         raise missing('admission.urgent_sources')
-    step = adm['urgent_max_step']
-    if isinstance(step, bool) or not isinstance(step, int) or not 1 <= step <= 5:
-        raise ValueError(f'admission: urgent_max_step must be a step 1..5, got {step!r}')
     sources = adm['urgent_sources']
     if not isinstance(sources, list) or not all(isinstance(s, str) for s in sources):
         raise ValueError(f'admission: urgent_sources must be a list of strings, got {sources!r}')
-    reserve = adm['urgent_reserve']
-    if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve < 0:
-        raise ValueError(f'admission: urgent_reserve must be a non-negative integer, got {reserve!r}')
     floor = adm['urgent_floor_mb']
     if isinstance(floor, bool) or not isinstance(floor, (int, float)) or not floor >= 0:
         raise ValueError(f'admission: urgent_floor_mb must be a non-negative number of MiB, got {floor!r}')
@@ -373,6 +393,8 @@ def connect(db_path, begin_retries=0, owner_actor=None):
         conn.execute('ALTER TABLE cards ADD COLUMN tag TEXT')
     if 'reminder' not in card_columns:
         conn.execute('ALTER TABLE cards ADD COLUMN reminder TEXT')
+    if 'urgent' not in card_columns:
+        conn.execute('ALTER TABLE cards ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0')
     indexes = conn.execute('PRAGMA index_list(runs)').fetchall()
     old_unique = any(i['origin'] == 'u' and
                      [c['name'] for c in conn.execute(f"PRAGMA index_info({i['name']})")] == ['card_id', 'round', 'role']

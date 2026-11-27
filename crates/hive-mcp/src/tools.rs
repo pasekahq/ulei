@@ -275,6 +275,18 @@ fn create(input: HiveCreateInput) -> Result<Call, Refusal> {
         }
     }
     timing(&input)?;
+    if input.urgent == Some(true)
+        && (input
+            .kind
+            .is_some_and(|k| k != HiveCreateInputKind::OwnerTask)
+            || input.every.is_some()
+            || input.cron.is_some()
+            || input.reminder.is_some())
+    {
+        return refuse(
+            "urgent applies only to an owner_task card run by a head: no series or reminder",
+        );
+    }
     if let Some(text) = &input.reminder {
         reminder_text("reminder", text)?;
         if input.accept_review.is_some()
@@ -678,6 +690,9 @@ pub fn argv(call: &Call, settings: &Settings) -> Vec<String> {
             }
             if c.review == Some(true) {
                 args.push("--review".into());
+            }
+            if c.urgent == Some(true) {
+                args.push("--urgent".into());
             }
             if settings.hold || c.hold == Some(true) {
                 args.push("--hold".into());
@@ -1286,6 +1301,7 @@ fn create_schema() -> Value {
             "source": {"type": "string", "description": "Where the request came from (`--source`), such as `msg:<id>`, `issue:<n>` or `manual`.", "pattern": LABEL},
             "kind": {"type": "string", "description": "Card class (`--kind`); default `owner_task`. Leave it out with `every` or `cron`: a series is `series_run`.", "enum": ["owner_task", "system", "followup"]},
             "review": {"type": "boolean", "description": "Independent review by the other vendor (`--review`). Off by default; only `review: true` turns it on, never `accept_review`, `kind` or `step`. Set it for code cards (pull requests, code changes) first, for complex research that needs a second check, and for anything else the author decides to review; small errands (look, switch, check a status) go without."},
+            "urgent": {"type": "boolean", "description": "The owner waits for this result now (`--urgent`): the card runs on the hive's urgent lane, past its IO gate and above its concurrency, at most two such cards at once. Only for a card of the owner's own request on the main chat; the engine refuses it on any other turn (ADR-0103). Only with kind `owner_task` (the default) and a head: not with `every`, `cron` or `reminder`."},
             "hold": {"type": "boolean", "description": "Park the card until the owner runs `hive.py release`. Not with `not_before`, `every` or `cron`."},
             "owner_visible": {"type": "boolean", "description": "Notify the owner about the result; default by class. A series (`series_run`) reports only news unless this is true."},
             "idem_key": {"type": "string", "description": "Idempotency key of the request: a second create with it returns the first card.", "pattern": LABEL},
@@ -1309,7 +1325,7 @@ fn create_schema() -> Value {
 fn description(name: &str) -> &'static str {
     match name {
         "hive_create" => {
-            "Delegate a task to the hive: create a card that a hive head carries out; its result comes back to you through the owner inbox. Give exactly one of `acceptance` (a bash check, exit 0 = done) and `accept_review` (criteria a judge checks the report against). The hive is also the scheduler. A reminder (\"remind me tomorrow at 9\") is one card with `reminder` the exact text the owner gets, `not_before` set to that time with its offset, such as `2026-11-27T09:00:00+03:00`, and `acceptance` `true`; no head runs, and at that time you get a `reminder_due` event to send it with `hive_reminder`. A watch (\"check every 15 minutes until evening\") is a series: `every` `15m` with `until` the evening's time (or `max_runs`), or `cron` such as `*/15 9-18 * * *` with `tz` such as `Europe/Moscow`; leave `kind` out. A series reports only news (a result line `RESULT: ... [NEWS]`) unless `owner_visible` is true; its own card waits in state `blocked` and makes one card per period, and `hive_cancel` on it ends the series. Answers the card id, its state and class."
+            "Delegate a task to the hive: create a card that a hive head carries out; its result comes back to you through the owner inbox. Give exactly one of `acceptance` (a bash check, exit 0 = done) and `accept_review` (criteria a judge checks the report against). The hive is also the scheduler. A reminder (\"remind me tomorrow at 9\") is one card with `reminder` the exact text the owner gets, `not_before` set to that time with its offset, such as `2026-11-27T09:00:00+03:00`, and `acceptance` `true`; no head runs, and at that time you get a `reminder_due` event to send it with `hive_reminder`. A watch (\"check every 15 minutes until evening\") is a series: `every` `15m` with `until` the evening's time (or `max_runs`), or `cron` such as `*/15 9-18 * * *` with `tz` such as `Europe/Moscow`; leave `kind` out. A series reports only news (a result line `RESULT: ... [NEWS]`) unless `owner_visible` is true; its own card waits in state `blocked` and makes one card per period, and `hive_cancel` on it ends the series. Set `urgent` only when the owner, in this turn on the main chat, waits for the result now: it runs ahead of and above the other cards. Answers the card id, its state and class."
         }
         "hive_list" => {
             "List hive cards, newest first: optionally of one state or class, the children of an epic, the followups of a card, the cards an actor created, those on the board or hidden from it (series runs, schedule rules), and with a text in the title or goal. Use it before `hive_create` to find a card the new one would duplicate."
@@ -1331,7 +1347,7 @@ fn description(name: &str) -> &'static str {
             "Look inside a hive card, read-only, as of now: every round with its runs (worker or reviewer, model, effort, unit, start, end, outcome, report), the gate's result, the judge's or reviewer's verdict and reason (why a round was sent back); the live heads (systemd unit, the command each waits on and for how long, its last actions with their times, the units it started, the pull requests and CI runs it waits on with their checks; command lines and actions have credentials masked); the workspace's repositories (branch, last commit, latest pull request); where the card waits (board column, queue position, who holds the slots, hold, backoff, blockers, budget); its chain (parent, children, followup_of, followups, blockers); steers with their text and delivery; whether its result reached your inbox and your ACK; the workspace's files for `hive_file`. `waiting_on` is the one-line answer to «is it working or stuck»."
         }
         "hive_health" => {
-            "The hive as a whole, read-only, as of now: config limits (slots, urgent reserve, the ladder of models and efforts per step, vendors), whether the dispatcher ticks and its last tick, every run holding a slot (series runs and reviewers too), the launch queue, every series with its schedule and next start, cooldowns, and the outbox of events for you with their inbox status."
+            "The hive as a whole, read-only, as of now: config limits (slots, the urgent lane of at most two cards above them, the ladder of models and efforts per step, vendors), whether the dispatcher ticks and its last tick, every run holding a slot (series runs and reviewers too), the launch queue, every series with its schedule and next start, cooldowns, and the outbox of events for you with their inbox status."
         }
         "hive_file" => {
             "Read a file of a hive card's workspace, read-only: a path from `hive_inspect`'s `files`, such as `REPORT.md` or `ev/<name>`, a directory to list it, or `@out/<name>` for a results file the card's goal names. Up to 256 KiB per call; `offset` reads on."
@@ -1453,6 +1469,46 @@ mod tests {
         assert!(!args_of("hive_create", &judged, false).contains(&"--review".to_owned()));
         judged["review"] = json!(true);
         assert!(args_of("hive_create", &judged, false).contains(&"--review".to_owned()));
+    }
+
+    #[test]
+    fn urgent_true_alone_becomes_the_urgent_flag() {
+        let urgent = args_of(
+            "hive_create",
+            &with(&json!({"step": 3, "urgent": true})),
+            false,
+        );
+        assert!(urgent.contains(&"--urgent".to_owned()));
+        assert!(urgent.contains(&"--kind=owner_task".to_owned()));
+        for plain in [with(&json!({"urgent": false})), base()] {
+            assert!(
+                !args_of("hive_create", &plain, false)
+                    .iter()
+                    .any(|a| a.contains("urgent"))
+            );
+        }
+    }
+
+    #[test]
+    fn urgent_is_refused_off_an_owner_task_run_by_a_head() {
+        for extra in [
+            json!({"kind": "system"}),
+            json!({"kind": "followup"}),
+            json!({"every": "15m", "max_runs": 2}),
+            json!({"cron": "0 9 * * *"}),
+            json!({"reminder": "r", "acceptance": "true", "not_before": "2026-11-27T09:00:00Z"}),
+        ] {
+            let mut args = with(&extra);
+            args["urgent"] = json!(true);
+            assert!(
+                refused("hive_create", &args).starts_with("urgent applies only"),
+                "{extra}"
+            );
+            args["urgent"] = json!(false);
+            assert!(parse("hive_create", &args).unwrap().is_ok(), "{extra}");
+        }
+        let text = refused("hive_create", &with(&json!({"urgent": "yes"})));
+        assert!(text.contains("invalid arguments"), "{text}");
     }
 
     #[test]
@@ -2503,7 +2559,7 @@ mod tests {
         let inspect = parse("hive_inspect", &json!({"card_id": "h_0123abcd"}))
             .unwrap()
             .unwrap();
-        let snap = json!({"version": 1, "card_id": "h_0123abcd",
+        let snap = json!({"version": 2, "card_id": "h_0123abcd",
             "card": {"state": "running", "round": 2, "title": "T", "result": null},
             "rounds": [{"runs": [{"report": "RESULT: first"}]}, {"runs": [{"report": null}]}],
             "heads": {"heads": [{"waiting_on": {"command": "until gh pr checks 7;\n  do sleep 30; done",

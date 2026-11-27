@@ -149,6 +149,7 @@ fn c2_fixtures_match_the_types() {
     roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.reminder_text.json");
     roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.series_cron.json");
     roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.series_every.json");
+    roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.urgent.json");
     roundtrip::<c::HiveCreateOutput>("c2/valid/HiveCreateOutput.created.json");
     roundtrip::<c::HiveCreateOutput>("c2/valid/HiveCreateOutput.series.json");
     roundtrip::<c::HiveFileInput>("c2/valid/HiveFileInput.report.json");

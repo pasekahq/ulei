@@ -521,7 +521,7 @@ fn items_arrive_under_the_manifest_name_and_a_second_run_continues_from_the_curs
     let (options, launcher) = call.split_once(" -- ").expect("launcher after --");
     assert!(
         options.starts_with(&format!(
-            "systemd-run --user --wait --pipe --collect --unit=ulei-connector-test-{at} --property=NoNewPrivileges=yes "
+            "systemd-run --user --wait --pipe --collect --unit=ulei-connector-test-{at} --slice=background.slice --property=NoNewPrivileges=yes "
         )),
         "{options}"
     );

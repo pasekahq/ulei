@@ -50,6 +50,9 @@ BREAK_CHARS = 2000
 SHOWN_PROCESSES = 3
 SHOWN_CMDLINE = 100
 STOP_UNIT_TIMEOUT_S = 30
+# The slices of the head classes, shipped in deploy/systemd (ADR-0103).
+HEADS_SLICE = 'hive-heads.slice'
+URGENT_SLICE = 'hive-urgent.slice'
 # The workspace rule for a long step: start it detached, write no result line and end the turn.
 RESULT_LINE_RE = re.compile(r'[\s\ufeff*#>_`]*RESULT\s*:', re.I)
 # «RESULT: disputed ...»: the worker says the task itself is wrong (its premise, a required artifact, its acceptance)
@@ -92,37 +95,34 @@ class Dispatcher:
         self._floors_ok = False
         self._nudged_at = None
 
-    def admission_limit(self, ceiling, urgent):
-        """Count below which a launch fits one ceiling: urgent_reserve under it for non-urgent, over it for urgent."""
-        reserve = self.cfg['admission']['urgent_reserve']
-        return ceiling + reserve if urgent else ceiling - reserve
+    def urgent_cards(self):
+        """The cards holding an active local run claimed on the urgent lane."""
+        return {r[0] for r in self.conn.execute(f"""SELECT DISTINCT r.card_id FROM runs r JOIN cards c ON c.id=r.card_id
+            WHERE r.status IN ('starting','running') AND r.vendor IS NOT c.executor AND {api.URGENT_RUN}""")}
 
-    def cap_bypass(self, urgent, pool_active, pool_ceiling):
-        """'cap' when an urgent launch is admitted at a count where a non-urgent one would be refused, else None.
-        Called under the claim's write lock, before the new run is inserted."""
-        if not urgent:
-            return None
-        counts = [(pool_active, pool_ceiling)]
-        res = self.cfg.get('resources', {})
-        if res.get('enabled', False):
-            counts.append((self.local_active(), res.get('max_local_runs', 2)))
-        return 'cap' if any(active >= self.admission_limit(ceiling, False) for active, ceiling in counts) else None
+    def urgent_room(self, card_id):
+        """Room for a run of an urgent card: its card already holds an urgent run or fewer than URGENT_MAX cards do,
+        and with [resources] enabled this tick's RAM and disk floors (urgent_floor_mb, min_free_mb) allow one more
+        run. The IO PSI gate, its cooldown and every ceiling do not apply; nothing running is paused."""
+        cards = self.urgent_cards()
+        if card_id not in cards and len(cards) >= api.URGENT_MAX:
+            return False
+        if not self.cfg.get('resources', {}).get('enabled', False):
+            return True
+        self.resource_room()
+        return self.local_active(all_runs=True) < self._urgent_host_limit
 
-    def pressure_bypass(self, urgent):
-        """'pressure' when an urgent head or script launch passes the closed host gate on its hard floors, else None.
-        Valid after resource_room() sampled this tick; at most urgent_reserve such runs are active at once."""
+    def urgent_bypass(self, pool_active, pool_ceiling):
+        """What an urgent launch passes that holds an ordinary one: 'pressure' when the host gate admits no ordinary
+        run, else 'cap' when the pool or the shared max_local_runs is full, else None. Called under the claim's
+        write lock, before the new run is inserted, after urgent_room() sampled this tick."""
         res = self.cfg.get('resources', {})
-        if not urgent or not res.get('enabled', False):
-            return None
+        if not res.get('enabled', False):
+            return 'cap' if pool_active >= pool_ceiling else None
         active = self.local_active()
-        if active < self._host_limit or active >= min(self._urgent_host_limit,
-                                                      self.admission_limit(res.get('max_local_runs', 2), True)):
-            return None
-        held = self.conn.execute('''SELECT count(*) FROM runs r JOIN events e ON e.card_id=r.card_id
-            AND e.kind='claimed' AND json_extract(e.data, '$.run')=r.id
-            WHERE r.status IN ('starting','running') AND json_extract(e.data, '$.bypass')='pressure'
-            ''').fetchone()[0]
-        return 'pressure' if held < self.cfg['admission']['urgent_reserve'] else None
+        if active >= self._host_limit:
+            return 'pressure'
+        return 'cap' if pool_active >= pool_ceiling or active >= res.get('max_local_runs', 2) else None
 
     def record_urgent(self, card_id, run_id, bypass):
         """Inside the claim tx: keep the last urgent admission and the gate reasons it bypassed in resource_gate."""
@@ -133,14 +133,17 @@ class Dispatcher:
                                'bypassed': gate['reason'] if bypass == 'pressure' else None}
         store.meta_set(self.conn, 'resource_gate', gate)
 
-    def local_active(self):
-        """Local runs and detached gate jobs in the shared max_local_runs pool."""
-        active = self.conn.execute('''SELECT count(*) FROM runs r JOIN cards c ON c.id=r.card_id
-            WHERE r.status IN ('starting','running') AND r.vendor IS NOT c.executor''').fetchone()[0]
+    def local_active(self, all_runs=False):
+        """Local runs and detached gate jobs in the shared max_local_runs pool; the urgent runs above it only with
+        all_runs."""
+        urgent = '' if all_runs else f'AND NOT {api.URGENT_RUN}'
+        active = self.conn.execute(f"""SELECT count(*) FROM runs r JOIN cards c ON c.id=r.card_id
+            WHERE r.status IN ('starting','running') AND r.vendor IS NOT c.executor {urgent}""").fetchone()[0]
         return active + self.conn.execute('SELECT count(*) FROM gate_jobs').fetchone()[0]
 
-    def resource_room(self, urgent=False):
-        """One shared pool for heads, scripts AND detached acceptance checks.
+    def resource_room(self):
+        """Room for an ordinary run in one shared pool of heads, scripts AND detached acceptance checks: below
+        max_local_runs and the memory slots of an open host gate. Samples the host once per tick.
 
         Existing runs drain naturally under pressure. No publishing/reaping or
         external job polling is suspended. Admission is only called outside tx.
@@ -172,9 +175,9 @@ class Dispatcher:
             with store.tx(self.conn):
                 store.meta_set(self.conn, 'resource_gate', state)
             self._host_limit = active + slots
-            self._urgent_host_limit = active + urgent_slots
+            self._urgent_host_limit = self.local_active(all_runs=True) + urgent_slots
             self._floors_ok = bool(slots or urgent_slots)  # RAM/disk hard floors hold (soft PSI may be closed)
-        return active < min(self.admission_limit(cfg.get('max_local_runs', 2), urgent), self._host_limit)
+        return active < min(cfg.get('max_local_runs', 2), self._host_limit)
 
     # ── entry ──────────────────────────────────────────────────────────────
     def tick(self):
@@ -304,8 +307,8 @@ class Dispatcher:
         ionice idle; it skips the soft PSI/cooldown gate and the pool count but still honours the RAM/disk
         hard floors."""
         if not self.fast_gate(c):
-            return self.resource_room(api.admission_class(c, self.cfg) == 'urgent')
-        return self.resource_room(True) or self._floors_ok
+            return self.resource_room()
+        return self.resource_room() or self._floors_ok
 
     def advance_series(self, now):
         """Per recurring card: free queued instances whose predecessor failed, create at most one instance for the
@@ -1568,20 +1571,26 @@ class Dispatcher:
 
     # ── launching ──────────────────────────────────────────────────────────
     def active_runs(self, lane):
-        """Head runs holding a slot of the lane; an external executor run (vendor = card executor) holds none."""
-        return self.conn.execute("""SELECT count(*) FROM runs r JOIN cards c ON c.id=r.card_id
-                                    WHERE r.status IN ('starting','running') AND c.lane=? AND r.vendor IS NOT c.executor AND c.script IS NULL""",
-                                 (lane,)).fetchone()[0]
+        """Head runs holding a slot of the lane; an external executor run (vendor = card executor) and an urgent run
+        hold none."""
+        return self.conn.execute(f"""SELECT count(*) FROM runs r JOIN cards c ON c.id=r.card_id
+                                    WHERE r.status IN ('starting','running') AND c.lane=? AND r.vendor IS NOT c.executor
+                                    AND c.script IS NULL AND NOT {api.URGENT_RUN}""", (lane,)).fetchone()[0]
 
     def active_scripts(self):
-        return self.conn.execute("SELECT count(*) FROM runs WHERE vendor='script' AND status IN ('starting','running')").fetchone()[0]
+        """Script runs holding a slot of script_concurrency; an urgent run holds none."""
+        return self.conn.execute(f"""SELECT count(*) FROM runs r WHERE vendor='script' AND status IN ('starting','running')
+                                    AND NOT {api.URGENT_RUN}""").fetchone()[0]
 
-    def launch_room(self, urgent):
+    def launch_room(self, c):
+        """Room for the next run of card c: the urgent lane for an urgent card, else the shared pool."""
+        if api.admission_class(c, self.cfg) == 'urgent':
+            return self.urgent_room(c['id'])
         # A detached gate can finish between two candidates. Once a higher-class
         # candidate was refused, defer lower classes to the next tick as well.
         if getattr(self, '_launch_exhausted', False) and getattr(self, '_launching', False):
             return False
-        room = self.resource_room(urgent) or self.pressure_bypass(urgent) is not None
+        room = self.resource_room()
         if not room and getattr(self, '_launching', False):
             self._launch_exhausted = True
         return room
@@ -1624,7 +1633,7 @@ class Dispatcher:
             else:
                 self.wait_for_executor(c, c['executor'], reason)
         for lane in lanes(self.cfg):
-            free = self.admission_limit(lane.slots, urgent) - self.active_runs(lane.name)
+            free = api.URGENT_MAX if urgent else lane.slots - self.active_runs(lane.name)
             if free <= 0:
                 continue
             # reviewers first within a class: they finish cards
@@ -1667,7 +1676,7 @@ class Dispatcher:
                                    (now,)).fetchall():
             if api.admission_class(c, self.cfg) != cls:
                 continue
-            if active >= self.admission_limit(self.cfg.get('script_concurrency', 4), urgent):
+            if not urgent and active >= self.cfg.get('script_concurrency', 4):
                 break
             rid = self.start_script(c)
             if rid:
@@ -1700,7 +1709,7 @@ class Dispatcher:
         return n
 
     def start_script(self, c):
-        if not self.launch_room(api.admission_class(c, self.cfg) == 'urgent'):
+        if not self.launch_room(c):
             return None
         from .script import command
         workdir = heads.prepare_workspace(self.cfg, c)
@@ -1718,8 +1727,8 @@ class Dispatcher:
                 return None
             admitted_at = self.clock()
             urgent = api.admission_class(cur, self.cfg) == 'urgent'
-            bypass = self.pressure_bypass(urgent) or self.cap_bypass(urgent, self.active_scripts(),
-                                                                     self.cfg.get('script_concurrency', 4))
+            bypass = (self.urgent_bypass(self.active_scripts(), self.cfg.get('script_concurrency', 4))
+                      if urgent else None)
             if self.expire_script_window(cur, admitted_at):
                 return None
             if cur['eligible_from'] is not None and admitted_at < cur['eligible_from']:
@@ -1746,7 +1755,7 @@ class Dispatcher:
         return rid
 
     def start_run(self, c, limits, member=None, synthesis=False, executor_reason=None):
-        if not self.launch_room(api.admission_class(c, self.cfg) == 'urgent'):
+        if not self.launch_room(c):
             return None
         role = 'reviewer' if c['state'] == 'review' else 'worker'
         if c['tag'] is not None:
@@ -1872,7 +1881,7 @@ class Dispatcher:
                 if (latest is not None and not latest['handled']) or not self.panel_ready(cur):
                     return None
                 allowed, _ = heads.allowed_vendors(self.conn, self.cfg, cur['step'], limits, self.clock(), tag=cur['tag'])
-                if lane_active >= self.admission_limit(slots, urgent) or vendor not in allowed:
+                if (not urgent and lane_active >= slots) or vendor not in allowed:
                     return None
                 claim['member'] = store.SYNTHESIS
                 feedback = cur['feedback']
@@ -1884,7 +1893,7 @@ class Dispatcher:
                 if latest is not None and (not latest['handled'] or self.panel_success(latest)):
                     return None
                 allowed, _ = heads.allowed_vendors(self.conn, self.cfg, cur['step'], limits, self.clock(), tag=cur['tag'])
-                if lane_active >= self.admission_limit(slots, urgent) or vendor not in allowed:
+                if (not urgent and lane_active >= slots) or vendor not in allowed:
                     return None
                 claim['member'] = member['label']
                 feedback = cur['feedback']
@@ -1907,7 +1916,7 @@ class Dispatcher:
                 w = self.conn.execute("SELECT report FROM runs WHERE card_id=? AND round=? AND role='worker' ORDER BY id DESC", (c['id'], c['round'])).fetchone()
                 g = self.conn.execute('SELECT * FROM gates WHERE card_id=? AND round=?', (c['id'], c['round'])).fetchone()
                 prompt = heads.reviewer_prompt(cur, round_no, w['report'] if w else '', g or {'exit_code': None, 'output': ''})
-            bypass = self.pressure_bypass(urgent) or self.cap_bypass(urgent, lane_active, slots)
+            bypass = self.urgent_bypass(lane_active, slots) if urgent else None
             try:
                 rcur = self.conn.execute("""INSERT INTO runs(card_id,round,role,vendor,model,effort,step,task_type,prompt,status,started_at,run_dir,member,report_file)
                                             VALUES(?,?,?,?,?,?,?,?,?,'starting',?,?,?,?)""",
@@ -2183,33 +2192,36 @@ class Dispatcher:
                 store.event(self.conn, c['id'], 'executor_wait', wait)
 
     def head_io_limits(self):
-        """systemd-run properties capping a head's disk throughput, or [] when resources.head_io_device is unset.
-        They act only where the io controller is delegated to the user manager (Delegate=io on user@.service);
-        elsewhere systemd accepts and ignores them."""
+        """systemd-run properties capping one head's read and write IOPS on resources.head_io_device, one per key set.
+        They act only where the io controller is delegated to the user manager; elsewhere systemd ignores them."""
         res = self.cfg.get('resources', {})
-        device = res.get('head_io_device')
-        if not device:
-            return []
         props = []
-        for key, prop in (('head_io_write_max', 'IOWriteBandwidthMax'), ('head_io_read_max', 'IOReadBandwidthMax')):
-            if res.get(key):
-                props += ['-p', f'{prop}={device} {res[key]}']
+        for key, prop in zip(store.HEAD_IO_IOPS, ('IOReadIOPSMax', 'IOWriteIOPSMax')):
+            if key in res:
+                props += ['-p', f"{prop}={res['head_io_device']} {res[key]}"]
         return props
 
     def spawn(self, run_id, workdir):
+        """Start the runner of the claimed run_id. Under systemd its unit runs in HEADS_SLICE at idle IO class and
+        nice 10, or for a run claimed on the urgent lane in URGENT_SLICE with CPUWeight=1000 and the best-effort IO
+        class at its highest level; the popen launcher detaches it, at idle IO class and nice 10 unless urgent."""
+        urgent = self.conn.execute(f'SELECT {api.URGENT_RUN} FROM runs r WHERE r.id=?', (run_id,)).fetchone()[0]
         runner = [sys.executable, '-m', 'hive.runner', '--db', self.cfg['db'], '--run-id', str(run_id),
                   '--config', self.cfg['_path']]
         if self.launcher == 'systemd':
             unit = f'hive-run-{run_id}'
-            subprocess.run(['systemd-run', '--user', '--quiet', '--collect', f'--unit={unit}',
+            lane = ([f'--slice={URGENT_SLICE}', '-p', 'CPUWeight=1000', '-p', 'IOSchedulingClass=best-effort',
+                     '-p', 'IOSchedulingPriority=0'] if urgent else
+                    [f'--slice={HEADS_SLICE}', '-p', 'Nice=10', '-p', 'IOSchedulingClass=idle'])
+            subprocess.run(['systemd-run', '--user', '--quiet', '--collect', f'--unit={unit}', *lane,
                             f'--working-directory={workdir}', f'--setenv=PYTHONPATH={REPO}',
-                            '-p', 'KillMode=control-group', '-p', 'Nice=10',
-                            '-p', 'IOSchedulingClass=idle', '-p', 'IOWeight=10',
+                            '-p', 'KillMode=control-group',
                             '-p', 'MemoryHigh=768M', '-p', 'MemoryMax=1280M',
                             *self.head_io_limits(),
                             '--'] + runner, check=True, capture_output=True, timeout=30)
             return unit
-        subprocess.Popen(resources.background(runner), cwd=str(workdir), env=dict(os.environ, PYTHONPATH=str(REPO)),
+        subprocess.Popen(runner if urgent else resources.background(runner), cwd=str(workdir),
+                         env=dict(os.environ, PYTHONPATH=str(REPO)),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
         return None

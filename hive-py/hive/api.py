@@ -204,14 +204,20 @@ def owner_card(card):
 
 
 ADMISSION_CLASSES = ('urgent', 'owner', 'followup', 'priority', 'background')
+# The urgent lane: at most this many urgent cards hold local runs at once, all above the ceilings.
+URGENT_MAX = 2
+# SQL: the run of alias r was claimed on the urgent lane.
+URGENT_RUN = """EXISTS (SELECT 1 FROM events e WHERE e.card_id=r.card_id AND e.kind='claimed'
+    AND json_extract(e.data, '$.run')=r.id AND json_extract(e.data, '$.admission_class')='urgent')"""
 
 
 def admission_class(card, cfg):
-    """The card's admission class; the dispatcher launches classes in ADMISSION_CLASSES order in every pool."""
+    """The card's admission class; the dispatcher launches classes in ADMISSION_CLASSES order in every pool. An owner
+    card created urgent is `urgent` at any step while queued or in review, as is a card of an urgent source."""
     adm = cfg['admission']
     def sourced(sources):
         return card['source'] in sources or any(card['source'] == s + ':conditional' for s in sources)
-    if owner_card(card) and card['step'] <= adm['urgent_max_step'] and card['state'] in ('queued', 'review'):
+    if owner_card(card) and card['urgent'] and card['state'] in ('queued', 'review'):
         return 'urgent'
     if sourced(adm['urgent_sources']):
         return 'urgent'
@@ -328,11 +334,12 @@ def create(conn, *, title, goal, acceptance=None, step, source, created_by, revi
            assignee=None, on_unavailable='wait', executors=(), every=None, max_runs=None, until=None,
            overlap=None, model=None, effort=None, cfg=None, panel=None, executor=None,
            cron=None, tz=None, misfire=None, start_window=None, script=None, script_timeout=None, deliver=None, gate_timeout=None,
-           card_class=None, owner_visible=None, followup_of=None, tag=None, reminder=None):
+           card_class=None, owner_visible=None, followup_of=None, tag=None, reminder=None, urgent=False):
     """Return (card_id, created), inserting a validated card and its initial dependency or schedule waits atomically.
     A model pin resolves vendor and effort from cfg (or the loaded config); assignee alone uses executors.
     An external executor must be configured under [executors.*] in cfg and excludes every head pin.
     A `reminder` text makes a reminder: no head, due at not_before or each period of its schedule.
+    `urgent` admits a one-off owner_task head card on the urgent lane; whoever may set it is decided before the hive.
     Idempotency is decided by the UNIQUE key inside the transaction."""
     if isinstance(blocked_by, str) or not isinstance(blocked_by, (list, tuple)):
         raise CardError('blocked_by must be a list or tuple of card ids')
@@ -430,6 +437,12 @@ def create(conn, *, title, goal, acceptance=None, step, source, created_by, revi
         raise CardError('card_class required: use --kind owner_task|series_run|system|followup; unknown source')
     if kind == 'recurring' and card_class != 'series_run':
         raise CardError('recurring cards require series_run class')
+    if not isinstance(urgent, bool):
+        raise CardError('urgent must be a boolean')
+    if urgent and (card_class != 'owner_task' or kind != 'task' or script is not None or reminder is not None
+                   or executor is not None):
+        raise CardError('urgent applies only to an owner_task card run by a head: no epic, series, script, reminder '
+                        'or external executor')
     if owner_visible is None:
         owner_visible = card_class == 'owner_task'
     if not isinstance(owner_visible, bool):
@@ -453,7 +466,7 @@ def create(conn, *, title, goal, acceptance=None, step, source, created_by, revi
                   idem_key=idem_key, priority=int(priority) if priority is not None else (100 if card_class == 'owner_task' and kind == 'task' else 0), assignee=assignee, on_unavailable=on_unavailable,
                   model=model, effort=effort, panel=json.dumps(members) if members is not None else None,
                   executor=executor, script=script, script_timeout=script_timeout, gate_timeout=gate_timeout,
-                  deliver=deliver or 'owner-inbox', tag=tag, reminder=reminder)
+                  deliver=deliver or 'owner-inbox', tag=tag, reminder=reminder, urgent=int(urgent))
     with store.tx(conn):
         cid, created = insert_card(conn, card_id or 'h_' + secrets.token_hex(4), fields, blocked_by, parent, optional, now)
         if created and followup_of is not None:
@@ -479,7 +492,7 @@ def insert_card(conn, cid, fields, blocked_by, parent, optional, now):
         raise
     kind, created_by = fields['kind'], fields['created_by']
     store.event(conn, cid, 'created', {'by': created_by, 'source': fields['source'], 'step': fields['step'],
-                                      'review': bool(fields['review']), 'kind': kind, 'card_class': fields['card_class'], 'owner_visible': bool(fields['owner_visible']), 'assignee': fields['assignee'],
+                                      'review': bool(fields['review']), 'kind': kind, 'card_class': fields['card_class'], 'owner_visible': bool(fields['owner_visible']), 'urgent': bool(fields['urgent']), 'assignee': fields['assignee'],
                                       'on_unavailable': fields['on_unavailable'], 'executor': fields['executor'],
                                       'model': fields['model'], 'effort': fields['effort'],
                                       'panel': json.loads(fields['panel']) if fields['panel'] else None}, actor=created_by)
@@ -874,7 +887,7 @@ def get(conn, card_id):
 
 
 def listing(conn, states=None, limit=200):
-    q = """SELECT c.id,c.kind,c.card_class,c.owner_visible,c.state,c.wait_reason,c.step,c.review,c.round,c.title,c.created_by,c.source,
+    q = """SELECT c.id,c.kind,c.card_class,c.owner_visible,c.urgent,c.state,c.wait_reason,c.step,c.review,c.round,c.title,c.created_by,c.source,
                   c.assignee,c.executor,c.on_unavailable,c.model,c.effort,c.panel,c.tag,c.created_at,c.updated_at,l.target_id AS parent,
                   ls.target_id AS series,c.series_period
            FROM cards c LEFT JOIN links l ON l.card_id=c.id AND l.kind='parent'

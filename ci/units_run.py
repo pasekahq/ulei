@@ -81,11 +81,12 @@ UNITS = (
     GARDEN,
 )
 # The units on the path of an owner turn, in `ulei.slice` without IO limits (ADR-0042 section 11);
-# the connector runner and the night gardener stay in the manager's default slice.
+# the connector runner in the background class (ADR-0103).
 INTERACTIVE = (
     "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", MEMORY, HIVE_MCP, GARDEN,
 )
 SLICE = "ulei.slice"
+BACKGROUND = "background.slice"
 # The keys whose paths each daemon writes (ADR-0042 section 3).
 WRITES = {
     "ulei-inbox.service": ("inbox.root", "inbox.socket"),
@@ -417,10 +418,15 @@ def check_process(unit: str, pid: str) -> str:
 
 def check_slice(unit: str, cgroup: str) -> str:
     """An interactive ``unit``'s process, in cgroup ``cgroup``, runs in `ulei.slice`, whose io.max
-    holds no limit (ADR-0042 section 11)."""
+    holds no limit (ADR-0042 section 11); the connector runner's in `background.slice`
+    (ADR-0103)."""
+    parent = Path(cgroup).parent
+    if unit == CONNECTORS:
+        if parent.name != BACKGROUND:
+            raise Failure(f"{unit}: cgroup {cgroup} is not in {BACKGROUND}")
+        return f"in {BACKGROUND}"
     if unit not in INTERACTIVE:
         return f"cgroup {cgroup}"
-    parent = Path(cgroup).parent
     if parent.name != SLICE:
         slice_ = show(unit, "Slice")["Slice"]
         raise Failure(f"{unit}: cgroup {cgroup} is not in {SLICE}, Slice= is {slice_}")
