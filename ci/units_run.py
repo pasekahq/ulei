@@ -1189,6 +1189,11 @@ def system_checks(notices: Notices, work: Path, bindir: Path) -> bool:
     dirs = layout()
     if dirs["state"].exists():
         shutil.rmtree(dirs["state"])
+    # The unit's namespace needs its ReadWritePaths and BindPaths to exist before its
+    # ExecStartPre runs; on the host the user units' StateDirectory and RuntimeDirectory made them
+    # (the cutover runbook runs the units in 6.1, before 6.3 installs this one).
+    for made in (dirs["state"] / "engine", dirs["runtime"]):
+        made.mkdir(mode=0o700, parents=True, exist_ok=True)
     fake_qb = FakeQb(dirs["qb"])
     fake_qb.start()
     title = "system ulei-engine.service: qb gateway re-created"
