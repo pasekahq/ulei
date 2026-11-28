@@ -1,0 +1,44 @@
+# Relays each connection of ulei-qb-proxy.socket to the qb gateway's socket as <ULEI_USER>
+# (ADR-0069 section 2). It connects by path per connection, so a gateway whose directory and
+# socket were deleted and made again is reached at its next connection. The path is the engine's
+# qb.socket.
+#
+# Fill <ULEI_USER> and <ULEI_UID> (sed, docs/runbooks/mvp-pilot-cutover.md part 6) and install as
+# /etc/systemd/system/ulei-qb-proxy.service (root, 0644); ulei-qb-proxy.socket starts it.
+[Unit]
+Description=qb gateway proxy of the ulei engine (system unit of <ULEI_USER>)
+Requires=ulei-qb-proxy.socket
+After=ulei-qb-proxy.socket
+
+[Service]
+User=<ULEI_USER>
+Group=<ULEI_USER>
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd /run/user/<ULEI_UID>/qb-gateway/gateway.sock
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+# Read-only, not hidden: the gateway's socket lies under /run/user, which "yes" would empty.
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+CapabilityBoundingSet=
+UMask=0077
+MemoryMax=64M
+TasksMax=16

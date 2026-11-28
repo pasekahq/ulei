@@ -7,8 +7,9 @@
 # changes.
 #
 # Fill <ULEI_USER>, <ULEI_UID> and <ULEI_HOME> (sed, docs/runbooks/mvp-pilot-cutover.md part 6),
-# install as /etc/systemd/system/ulei-engine.service (root, 0644), and install
-# system/user-engine-off.conf so that the user unit of the same name never starts beside it.
+# install as /etc/systemd/system/ulei-engine.service (root, 0644) with ulei-qb-proxy.socket and
+# ulei-qb-proxy.service, and install system/user-engine-off.conf so that the user unit of the same
+# name never starts beside it.
 # The rest is the user unit's (deploy/systemd/ulei-engine.service): same restart, limits and
 # filters. The other ulei units stay user units: they reach this one over its socket.
 [Unit]
@@ -17,6 +18,8 @@ StartLimitIntervalSec=0
 # The runtime directory /run/user/<ULEI_UID> and the qb gateway's user unit.
 Wants=user@<ULEI_UID>.service
 After=user@<ULEI_UID>.service
+Requires=ulei-qb-proxy.socket
+After=ulei-qb-proxy.socket
 
 [Service]
 Type=exec
@@ -42,11 +45,13 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=<ULEI_HOME>/.local/state/ulei/engine
 PrivateTmp=yes
-# Of the account's runtime directory only the ulei sockets (written) and the qb gateway's socket
-# directory (connected to): no user bus, no systemd socket, no agent sockets of other tools.
+# Of the account's runtime directory only the ulei sockets (written) and, at the qb gateway's
+# socket directory, the stable directory of ulei-qb-proxy.socket (connected to): no user bus, no
+# systemd socket, no agent sockets of other tools. A bind pins its source directory, so a bind of
+# the gateway's own directory would lose the gateway once that directory is made again.
 TemporaryFileSystem=/run/user/<ULEI_UID>:ro
 BindPaths=/run/user/<ULEI_UID>/ulei
-BindReadOnlyPaths=/run/user/<ULEI_UID>/qb-gateway
+BindReadOnlyPaths=/run/ulei-qb-proxy:/run/user/<ULEI_UID>/qb-gateway
 # As ../ulei-engine.service.d/10-deny-secrets.conf; add the host's own paths in a
 # drop-in (systemctl edit ulei-engine.service).
 InaccessiblePaths=-<ULEI_HOME>/.ssh -<ULEI_HOME>/.gnupg -<ULEI_HOME>/.netrc -<ULEI_HOME>/.git-credentials -<ULEI_HOME>/.config/gh -<ULEI_HOME>/.docker -<ULEI_HOME>/.aws -<ULEI_HOME>/.claude -<ULEI_HOME>/.codex -<ULEI_HOME>/.config/qb

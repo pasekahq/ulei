@@ -1151,17 +1151,23 @@ other tokens). Then check as in 6.4.
 As root, from `<ULEI_CHECKOUT>`, with `<ULEI_HOME>` the home of `<ULEI_USER>`:
 
 ```sh
-sed -e 's/<ULEI_USER>/<the account>/g; s/<ULEI_UID>/<its uid>/g; s#<ULEI_HOME>#<its home>#g' \
-  deploy/systemd/system/ulei-engine.service > /etc/systemd/system/ulei-engine.service
-grep -n '<' /etc/systemd/system/ulei-engine.service   # prints nothing: no placeholder left
+for f in ulei-engine.service ulei-qb-proxy.socket ulei-qb-proxy.service; do
+  sed -e 's/<ULEI_USER>/<the account>/g; s/<ULEI_UID>/<its uid>/g; s#<ULEI_HOME>#<its home>#g' \
+    "deploy/systemd/system/$f" > "/etc/systemd/system/$f"
+done
+grep -n '<' /etc/systemd/system/ulei-engine.service /etc/systemd/system/ulei-qb-proxy.*   # prints nothing
 mkdir -p /etc/systemd/system/ulei-engine.service.d
 printf '[Service]\nInaccessiblePaths=-%s\n' '<LIVE_BOT_TOKEN_FILE>' \
   > /etc/systemd/system/ulei-engine.service.d/10-host.conf
-systemd-analyze verify /etc/systemd/system/ulei-engine.service
+systemd-analyze verify /etc/systemd/system/ulei-engine.service /etc/systemd/system/ulei-qb-proxy.service
 ```
 
-Add every other secret path of the host to `10-host.conf`. Then, as `<ULEI_USER>`, skip the user
-unit of the same name and hand the socket over:
+The engine reaches the qb gateway through `ulei-qb-proxy.socket`, which its unit requires and
+starts (ADR-0069 section 4): `qb.socket` stays the gateway's path
+`/run/user/<ULEI_UID>/qb-gateway/gateway.sock`, and the proxy connects to that path, so a gateway
+restart that deletes and makes its directory again needs no engine restart. Add every other secret
+path of the host to `10-host.conf`. Then, as `<ULEI_USER>`, skip the user unit of the same name
+and hand the socket over:
 
 ```sh
 d=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-engine.service.d
@@ -1187,8 +1193,13 @@ log is then `journalctl -u ulei-engine` (as root or a member of `adm`), not `--u
 status` reads the same socket. `deploy/install.sh` keeps upgrading the binary; restart the engine
 as root after an upgrade.
 
-Roll back: as root `systemctl disable --now ulei-engine.service`, remove the unit and its
-`.d` directory, `systemctl daemon-reload`; as `<ULEI_USER>` remove `90-system-unit.conf` and the
+The three installed files are filled copies. After a change of any of them in `<ULEI_CHECKOUT>`,
+run the `sed` loop above again as root, then `systemctl daemon-reload && systemctl stop
+ulei-qb-proxy.service && systemctl restart ulei-qb-proxy.socket ulei-engine.service`.
+
+Roll back: as root `systemctl disable --now ulei-engine.service ulei-qb-proxy.socket
+ulei-qb-proxy.service`, remove the three units and the engine's `.d` directory, `systemctl
+daemon-reload`; as `<ULEI_USER>` remove `90-system-unit.conf` and the
 six `90-system-engine.conf`, `systemctl --user daemon-reload && systemctl --user start
 ulei-engine.service && systemctl --user restart ulei-inbox.service ulei-tg.service`.
 

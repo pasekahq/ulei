@@ -52,9 +52,10 @@ before it drops to that account, so it needs no user namespace and no change of 
 sysctl or AppArmor, and it touches no other unit. Against the user unit it:
 
 - keeps the restart, limits, filters and the deny list of section 1;
-- shows of `/run/user/<uid>` only the ulei socket directory (written) and the qb gateway's socket
-  directory (`TemporaryFileSystem=` plus `BindPaths=`), so no bus, no systemd socket and no other
-  tool's socket is reachable;
+- shows of `/run/user/<uid>` only the ulei socket directory (written) and, at the qb gateway's
+  socket directory, the stable directory of the gateway proxy of section 4
+  (`TemporaryFileSystem=` plus `BindPaths=`), so no bus, no systemd socket and no other tool's
+  socket is reachable;
 - adds what only the system manager applies: `ProtectKernel*`, `ProtectControlGroups`,
   `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`, `PrivateDevices` and an empty
   capability bounding set (offline exposure 1.6 against the user unit's 5.8);
@@ -75,7 +76,9 @@ clears `ProtectSystem`, `ProtectHome`, `PrivateTmp` and `ReadWritePaths`, which 
 host in no case, so the two units run without the user namespace and connect.
 
 The file has placeholders (`<ULEI_USER>`, `<ULEI_UID>`, `<ULEI_HOME>`): a system unit's `%h` and
-`%U` are root's, whatever `User=` says. CI does not run it; the runbook checks it on the host.
+`%U` are root's, whatever `User=` says. The CI job `systemd-units` fills them for the runner's
+account, installs it with the proxy of section 4 and runs its turns (`ci/units_run.py system`);
+the runbook checks it on the host.
 
 ### 3. The engine unit
 
@@ -87,10 +90,44 @@ The file has placeholders (`<ULEI_USER>`, `<ULEI_UID>`, `<ULEI_HOME>`): a system
   with its one stderr line; a journal it cannot open, a failed bind, ready line or `accept` stay
   exit 1 and restart. `ulei-engine run` keeps exit 1.
 
+### 4. The qb gateway across a re-created directory
+
+The engine opens a new connection to `qb.socket` for every request, by path. The qb gateway's
+unit may delete its runtime directory with the socket and make both again while the engine runs,
+and the engine's next turn must reach the new socket without an engine restart. In the user unit
+`/run/user/<uid>` is the host's own directory, read-only, so the path finds the new socket. In the
+system unit a bind of the gateway's directory pins the directory it found at start: once that
+directory is deleted the engine sees it empty until the unit restarts. The options were:
+
+- Bind the whole runtime directory read-only. Every socket in it becomes reachable (the user bus,
+  `systemd/private`, other tools' agents) and needs an `InaccessiblePaths=` entry each, a list
+  that only names what is known; and a mask over an entry the host deletes and makes again (the
+  user manager's own sockets after its restart) is gone in the unit's namespace from then on.
+- The engine retries a failed connect for a bounded time, with one journal line naming
+  `qb.socket`. Inside a pinned directory no retry finds the new socket; it covers only the seconds
+  a gateway restart takes, which neither unit needs for this case.
+- A stable bind point, chosen. `deploy/systemd/system/ulei-qb-proxy.socket` listens on
+  `/run/ulei-qb-proxy/gateway.sock`, a directory of root that the gateway's unit never touches,
+  owned by and only open to the ulei account. `ulei-qb-proxy.service`, which it starts as that
+  account, runs `systemd-socket-proxyd` with the gateway's socket path, the path `qb.socket` names,
+  and connects by that path for each connection, so it reaches a re-made directory at once. The
+  engine's system unit requires the socket and binds `/run/ulei-qb-proxy` over
+  `/run/user/<uid>/qb-gateway`, so `qb.socket` keeps its value and the runtime directory still
+  shows nothing else. The cost is one more process on the host and one relay per request; while
+  the gateway is down the proxy accepts and closes the connection, so a turn then fails on a
+  closed connection rather than on `ENOENT` or `ECONNREFUSED`, with the same `failed` outcome.
+
+The user unit keeps its view and needs no proxy. CI runs both units across a deleted and re-made
+gateway directory: `ci/units_run.py sandbox` the user unit, `ci/units_run.py system` the system
+unit with its proxy.
+
 ## Consequences
 
 - With either unit, a tool reading a secret path gets `EACCES` (or `ENOENT` for the hidden buses).
 - Part 6 of the cutover runbook: case (b) is a no-go for the engine in the user unit and a go
   with the system unit; the check reads the probe of section 1 from inside the engine's unit.
+- Case (b) installs the gateway proxy's socket and service beside the engine's system unit, each
+  a copy with the placeholders filled (runbook 6.3); a change of any of the three files in the
+  repository reaches the host only when the operator fills and installs them again.
 - `ulei-inbox` and `ulei-tg` keep their user units and their exit 1 on a refused config; under
   case (b) their namespace options stay inert (they run no tool on the owner's behalf).
