@@ -639,6 +639,15 @@ jobs:
         run: |
           python3 ci/connectors_e2e.py "$RUNNER_TEMP/release" "$RUNNER_TEMP/release/ulei-memory" \
             "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-e2e.XXXXXX)"
+      # ADR-0069 section 2: the engine's system unit with its qb gateway proxy, filled for the
+      # runner's account and installed with sudo, keeps reaching the fake qb across a re-created
+      # gateway directory; the step removes the units again.
+      - name: Engine system unit across a re-created gateway directory
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: |
+          python3 ci/units_run.py system \
+            "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)" target/debug
       # ADR-0103: the IO classes measured on this runner. Last, because it restarts the user
       # manager with the io controller delegated. It reports the probe reads of the urgent and
       # background classes under load and the disk's scheduler, and fails only when the capped
