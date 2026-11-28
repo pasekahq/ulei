@@ -42,10 +42,13 @@ pid and no restart; then SIGABRT, what a panic raises under ``panic = "abort"``,
 ``ulei-engine`` restarted with the owner session's turn in flight and the session idle in
 ``ulei status``, and ``ulei-tg`` restarted.
 
-MODE ``system`` installs with ``sudo`` the engine's system unit and its gateway proxy of
-``deploy/systemd/system`` with their placeholders filled for the runner's account (ADR-0069
-section 2), starts the engine there with the fake qb at the gateway's path and runs the same
-turns across a re-created gateway directory, then removes the units.
+MODE ``system`` installs with ``sudo`` the system units of ``deploy/systemd/system`` with their
+placeholders filled for the runner's account (ADR-0069 section 4) and starts the engine there
+with the fake qb at the gateway's path, twice: first the units of the base revision ``BASE_SHA``
+(the engine's and, where the base has them, the gateway proxy's; the commit fetched when the
+checkout lacks it), whose turn after the re-created gateway directory is recorded whatever its
+outcome; then this checkout's engine unit and gateway proxy, which must pass the same turns as
+the user unit. A base that cannot be set up fails the mode; the units are removed after each run.
 
 The passed checks are folded into four notices (one in MODE ``system``), one line per check with
 its measured value; a failed check is an error annotation of its own. Every check whose units
@@ -613,8 +616,8 @@ def engine_abort(
     )
 
 
-def turn_completed(values: dict[str, str | int | bool], prompt: str) -> str:
-    """Submits ``prompt`` as a turn of GATEWAY_SESSION; the turn once it ended `completed`."""
+def turn_ended(values: dict[str, str | int | bool], prompt: str) -> dict:
+    """Submits ``prompt`` as a turn of GATEWAY_SESSION; its C6 report once it ended."""
     socket_path = str(values["engine.c6_socket"])
     submitted, _ = call(socket_path, "submit_turn", {"session": GATEWAY_SESSION, "prompt": prompt})
     if not submitted["accepted"]:
@@ -625,10 +628,24 @@ def turn_completed(values: dict[str, str | int | bool], prompt: str) -> str:
         report = call(socket_path, "status", {"session": GATEWAY_SESSION, "turn": turn})[0]
         return [report["turn"]] if report["turn"]["state"] == "ended" else []
 
-    report = poll(f"end of turn {turn}", TURN_TIMEOUT, ended)[0]
+    return poll(f"end of turn {turn}", TURN_TIMEOUT, ended)[0]
+
+
+def turn_completed(values: dict[str, str | int | bool], prompt: str) -> str:
+    """Submits ``prompt`` as a turn of GATEWAY_SESSION; the turn once it ended `completed`."""
+    report = turn_ended(values, prompt)
     if report["outcome"] != "completed":
-        raise Failure(f"turn {turn} ended {report['outcome']}: {report.get('line', 'no line')}")
-    return turn
+        raise Failure(
+            f"turn {report['turn']} ended {report['outcome']}: {report.get('line', 'no line')}"
+        )
+    return report["turn"]
+
+
+def recreate(qb: FakeQb) -> None:
+    """Stops the fake qb, deletes its directory with the socket, makes both again and serves."""
+    qb.stop()
+    shutil.rmtree(qb.path.parent)
+    qb.start()
 
 
 def gateway_recreated(
@@ -641,9 +658,7 @@ def gateway_recreated(
     qb.answer = True
     try:
         first = turn_completed(values, "gateway probe before")
-        qb.stop()
-        shutil.rmtree(qb.path.parent)
-        qb.start()
+        recreate(qb)
         second = turn_completed(values, "gateway probe after")
     finally:
         qb.answer = False
@@ -654,6 +669,27 @@ def gateway_recreated(
         f"turn {first} completed; fake qb stopped, {qb.path.parent} deleted and made again with "
         f"its socket, fake qb serving; turn {second} completed; pid {after['MainPID']} kept, "
         f"NRestarts 0"
+    )
+
+
+def gateway_lost(qb: FakeQb, values: dict[str, str | int | bool]) -> str:
+    """The turns of ``gateway_recreated`` under a unit that may lose the gateway: the first must
+    end `completed`; the second's outcome and line, whatever it is."""
+    qb.answer = True
+    try:
+        first = turn_completed(values, "gateway probe before")
+        recreate(qb)
+        second = turn_ended(values, "gateway probe after")
+    finally:
+        qb.answer = False
+    if second["outcome"] == "completed":
+        return (
+            f"turn {first} completed; turn {second['turn']} completed too, so this unit already "
+            f"keeps the gateway across a re-created directory"
+        )
+    return (
+        f"turn {first} completed; turn {second['turn']} {second['outcome']} "
+        f"({second.get('line', 'no line')})"
     )
 
 
@@ -668,17 +704,43 @@ def system_journal() -> str:
     return " | ".join(lines) if lines else f"empty, journalctl exit {done.returncode}"
 
 
-def install_system(home: Path) -> None:
-    """Installs SYSTEM_UNITS filled for the runner's account as part 6.3 of the cutover runbook
-    does, with the account's own group made when it has none."""
+def git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=ROOT, capture_output=True, text=True, check=False, timeout=120
+    )
+
+
+def base_units() -> tuple[str, dict[str, str]]:
+    """The base revision ``BASE_SHA`` and its shipped system units by name: the engine's, which
+    it must have, and those of the gateway proxy it has. The commit is fetched when the shallow
+    checkout lacks it."""
+    base = os.environ.get("BASE_SHA", "")
+    if not base.strip("0"):
+        raise Failure(f"BASE_SHA is {base!r}: no base revision to run the system unit of")
+    if git("cat-file", "-e", f"{base}^{{commit}}").returncode != 0:
+        fetched = git("fetch", "--no-tags", "--depth=1", "origin", base)
+        if fetched.returncode != 0:
+            raise Failure(f"git fetch origin {base}: {fetched.stderr.strip()}")
+    units = {}
+    for name in SYSTEM_UNITS:
+        shown = git("show", f"{base}:deploy/systemd/system/{name}")
+        if shown.returncode == 0:
+            units[name] = shown.stdout
+        elif name == "ulei-engine.service":
+            raise Failure(f"git show {base}:deploy/systemd/system/{name}: {shown.stderr.strip()}")
+    return base, units
+
+
+def install_system(home: Path, units: dict[str, str]) -> None:
+    """Installs ``units``, unit texts by name, filled for the runner's account as part 6.3 of the
+    cutover runbook does, with the account's own group made when it has none."""
     account = pwd.getpwuid(os.getuid()).pw_name
     try:
         grp.getgrnam(account)
     except KeyError:
         root(["groupadd", account])
     fills = {"<ULEI_USER>": account, "<ULEI_UID>": str(os.getuid()), "<ULEI_HOME>": str(home)}
-    for name in SYSTEM_UNITS:
-        text = (SYSTEM_DIR / name).read_text(encoding="utf-8")
+    for name, text in units.items():
         for placeholder, value in fills.items():
             text = text.replace(placeholder, value)
         if "<ULEI_" in text:
@@ -703,8 +765,8 @@ def root(command: list[str], stdin: str | None = None) -> None:
         raise Failure(f"sudo {' '.join(command)}: exit {done.returncode} {done.stderr.strip()}")
 
 
-def system_engine(qb: FakeQb, values: dict[str, str | int | bool]) -> str:
-    """Starts the engine's system unit, waits for C6 on its socket and runs the gateway check."""
+def system_engine(check: Callable[[], str], values: dict[str, str | int | bool]) -> str:
+    """Starts the engine's system unit, waits for C6 on its socket and runs ``check``."""
     unit = "ulei-engine.service"
     done = system_ctl("start", unit)
     if done.returncode != 0:
@@ -726,10 +788,27 @@ def system_engine(qb: FakeQb, values: dict[str, str | int | bool]) -> str:
 
     poll("C6 status on engine.c6_socket", START_TIMEOUT, answered)
     try:
-        recreated = gateway_recreated(qb, values, unit, system=True)
+        result = check()
     except Failure as e:
         raise Failure(f"{e}; journal: {system_journal()}") from None
-    return f"system unit, pid {pid}: {recreated}"
+    return f"pid {pid}: {result}"
+
+
+def base_and_candidate(qb: FakeQb, values: dict[str, str | int | bool], home: Path) -> str:
+    """The gateway turns under the base revision's system units, whose second turn may fail, then
+    under this checkout's, whose second turn must complete."""
+    base, units = base_units()
+    install_system(home, units)
+    try:
+        lost = system_engine(lambda: gateway_lost(qb, values), values)
+    finally:
+        remove_system()
+    install_system(home, {name: (SYSTEM_DIR / name).read_text(encoding="utf-8")
+                          for name in SYSTEM_UNITS})
+    kept = system_engine(
+        lambda: gateway_recreated(qb, values, "ulei-engine.service", system=True), values
+    )
+    return f"base {base[:12]} ({', '.join(units)}), {lost}; candidate, {kept}"
 
 
 def tg_abort(ulei: Path, config: Path) -> str:
@@ -1184,8 +1263,8 @@ def run(mode: str, work: Path, bindir: Path) -> bool:
 
 
 def system_checks(notices: Notices, work: Path, bindir: Path) -> bool:
-    """The engine's system unit and its gateway proxy, installed for the runner's account, with
-    the fake qb at the gateway's path: turns across a re-created gateway directory."""
+    """The base revision's and this checkout's system units, installed for the runner's account,
+    with the fake qb at the gateway's path: turns across a re-created gateway directory."""
     dirs = layout()
     if dirs["state"].exists():
         shutil.rmtree(dirs["state"])
@@ -1200,8 +1279,9 @@ def system_checks(notices: Notices, work: Path, bindir: Path) -> bool:
     try:
         values = settings(dirs, free_port(), dirs["qb"], Bed(bindir, work), bindir)
         write_config(dirs, values)
-        install_system(dirs["home"])
-        return notices.check(title, title, lambda: system_engine(fake_qb, values))
+        return notices.check(
+            title, title, lambda: base_and_candidate(fake_qb, values, dirs["home"]),
+        )
     finally:
         remove_system()
         fake_qb.close()
